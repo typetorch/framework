@@ -17,6 +17,7 @@ import { runningModules } from "../runtime/registry";
 import { bump, popIn, popOut } from "../ui";
 import { ExplorerPersist, mountExplorer } from "./explorer";
 import {
+	copyText,
 	DEV_REQUEST,
 	DEV_RESPONSE,
 	DEVLOGS_MAX_BYTES,
@@ -934,7 +935,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	};
 
 	// Claude: a Claude Code style chat (devtools/claude-ui.ts); "Dex path" sends the explorer's selection.
-	const renderClaude = (tab: TabContext) => renderClaudeChat(tab, { kernel, call, dexSelection: () => dexSelection });
+	const renderClaude = (tab: TabContext) => renderClaudeChat(tab, { kernel, call, dexSelection: () => dexSelection, copyText });
 
 	/** Keys: a tab name, or "Tab/Sub" for tabs with sub-tabs. */
 	const RENDER: Record<string, (tab: TabContext) => void> = {
