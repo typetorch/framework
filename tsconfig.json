@@ -1,0 +1,27 @@
+{
+	"compilerOptions": {
+		// required
+		"allowSyntheticDefaultImports": true,
+		"downlevelIteration": true,
+		"module": "commonjs",
+		"moduleResolution": "Node",
+		"noLib": true,
+		"resolveJsonModule": true,
+		"experimentalDecorators": true,
+		"forceConsistentCasingInFileNames": true,
+		"moduleDetection": "force",
+		"strict": true,
+		"target": "ESNext",
+		"typeRoots": ["node_modules/@rbxts", "node_modules/@flamework"],
+		// package
+		"declaration": true,
+		"rootDir": "src",
+		"outDir": "out",
+		"incremental": true,
+		"tsBuildInfoFile": "out/tsconfig.tsbuildinfo",
+		// Debug macros first (same order as hopeful-river). No Flamework transformer here: the framework only
+		// declares macros; they expand in the game's compile.
+		"plugins": [{ "transform": "rbxts-transform-debug", "environmentRequires": {} }]
+	},
+	"include": ["./src/**/*.ts"]
+}

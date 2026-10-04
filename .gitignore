@@ -1,0 +1,9 @@
+node_modules/
+out/
+*.tsbuildinfo
+*.tgz
+# secrets
+.env
+.env.*
+# private working notes (kept locally, never pushed)
+CHANGELOG.md
