@@ -53,8 +53,8 @@ function clock(unix: number): string {
 /**
  * Kernel 0.3 signing (status().signing / rejected; nothing on older kernels). Shared with Artifact > Signing.
  * - a key change without a rekey hint before it: error (a rotation the user may not have done);
- * - no trusted prod head (nothing to boot until a signed deploy), the fallback key revoked, or no trust root on a
- *   signed-only server: error;
+ * - booted an unverified prod head (the boot fail-safe), no trusted prod head, the fallback key revoked, or no trust
+ *   root on a signed-only server: error;
  * - fallback-only mode (the key asset never loaded): warn; refusals: warn with the last reason;
  * - a key change after a rekey hint: info.
  */
@@ -62,7 +62,10 @@ export function signingIssues(status: KernelStatus): HealthIssue[] {
 	const issues = new Array<HealthIssue>();
 	const signing = status.signing;
 	if (signing === undefined) return issues;
-	if (status.noTrustedHead === true) {
+	if (status.unverified === true) {
+		// The boot fail-safe ran an unsigned stored head (the next signed deploy replaces or vouches for it).
+		issues.push({ level: "error", title: "Booted an unverified prod head", detail: "No signed head at boot. Deploy prod signed." });
+	} else if (status.noTrustedHead === true) {
 		issues.push({ level: "error", title: "No trusted prod head", detail: "Waiting for a signed deploy." });
 	}
 	if (signing.lastChangeAt !== undefined) {

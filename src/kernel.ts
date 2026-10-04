@@ -127,6 +127,8 @@ export interface KeyTrust {
 	bootstrap?: Record<string, { assetId: number; seq: number; artifactId?: string }>;
 	/** See KernelStatus.noTrustedHead. */
 	noTrustedHead?: boolean;
+	/** See KernelStatus.unverified. */
+	unverified?: boolean;
 	rejected: Rejections;
 	/** The last 10 refusals, oldest first. */
 	refusals: Refusal[];
@@ -369,6 +371,11 @@ export interface KernelStatus {
 	 * It runs nothing new until a signed deploy arrives; it keeps polling and re-reading the keys.
 	 */
 	noTrustedHead?: boolean;
+	/**
+	 * Kernel 0.3+ boot fail-safe: no verified head loaded at boot, so this server booted an UNVERIFIED stored head (still
+	 * prod channel, modules only). Updates stay strictly verified; the next signed deploy replaces or vouches for it.
+	 */
+	unverified?: boolean;
 }
 
 export interface ServerKernel {

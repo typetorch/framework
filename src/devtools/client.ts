@@ -488,7 +488,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				target.field(branch, `#${head.seq}  ${head.artifactId ?? `asset-${head.assetId}`}`);
 			}
 		}
-		if (keys.noTrustedHead === true) target.field("Head", "No trusted prod head", COLORS.bad);
+		if (keys.unverified === true) target.field("Head", "Unverified (boot fail-safe)", COLORS.bad);
+		else if (keys.noTrustedHead === true) target.field("Head", "No trusted prod head", COLORS.bad);
 	};
 
 	const renderArtifact = ({ page, trove: tabTrove }: TabContext) => {
