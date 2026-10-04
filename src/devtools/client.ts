@@ -35,9 +35,11 @@ import {
 import { describeState } from "./state";
 import {
 	addButton,
+	chevron,
 	buttonRow,
 	COLORS,
 	corner,
+	fixedRow,
 	escapeRich,
 	make,
 	pad,
@@ -46,7 +48,8 @@ import {
 	playerSelector,
 	scrolling,
 	searchBox,
-	spacer,
+	sideButton,
+	SIDE_BUTTON,
 	style,
 	tag,
 	upButton,
@@ -175,8 +178,6 @@ interface MenuState {
 	tab: string;
 	/** tab -> selected sub-tab */
 	sub?: Record<string, string>;
-	/** Sound after a hot swap on dev-channel servers (default on). */
-	reloadSound?: boolean;
 	/** Window rectangle in pixels; undefined = the centered default. */
 	window?: Rect;
 }
@@ -296,6 +297,15 @@ interface Ui {
 	body: Frame;
 	content: ScrollingFrame;
 	tabButtons: Map<TabName, TextButton>;
+	/** Sidebar groups (tabs with sub-tabs): children shown indented under the tab while it is selected. */
+	groups: Map<TabName, SidebarGroup>;
+}
+
+interface SidebarGroup {
+	frame: Frame;
+	collapsed: Frame;
+	expanded: Frame;
+	children: Map<string, TextButton>;
 }
 
 interface Waiter {
@@ -373,13 +383,11 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		return ReplicatedStorage.FindFirstChild("TypeTorch")?.GetAttribute("Channel");
 	};
 
-	/** After a hot swap (client generation > 1) on a dev-channel server, for devs, unless turned off. */
-	const playReloadSound = (force = false) => {
-		if (!force) {
-			if (kernel.generation <= 1 || state.reloadSound === false || effectiveChannel() !== "dev") return;
-			const [ok, info] = pcall(() => kernel.devStatus());
-			if (!ok || !typeIs(info, "table") || info.dev !== true) return;
-		}
+	/** After a hot swap (client generation > 1) on a dev-channel server, for devs. No setting. */
+	const playReloadSound = () => {
+		if (kernel.generation <= 1 || effectiveChannel() !== "dev") return;
+		const [ok, info] = pcall(() => kernel.devStatus());
+		if (!ok || !typeIs(info, "table") || info.dev !== true) return;
 		const sound = trove.add(make("Sound", { Name: "TypeTorchReload", SoundId: RELOAD_SOUND, Volume: 0.5 }));
 		sound.Parent = SoundService;
 		SoundService.PlayLocalSound(sound);
@@ -435,20 +443,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	};
 
 	// Server > Status
-	const renderServer = ({ page, trove: tabTrove, toolbar }: TabContext) => {
-		const bar = toolbar();
-		const soundButton = addButton(bar, "", () => {
-			state.reloadSound = state.reloadSound === false;
-			paintSound();
-			if (state.reloadSound) playReloadSound(true); // preview
-		});
-		const paintSound = () => {
-			const on = state.reloadSound !== false;
-			soundButton.Text = on ? "Reload sound: on" : "Reload sound: off";
-			paintSelected(soundButton, on, COLORS.info);
-		};
-		paintSound();
-
+	const renderServer = ({ page, trove: tabTrove }: TabContext) => {
 		const body = page.group();
 		body.text("Loading...", COLORS.dim);
 		every(tabTrove, REFRESH, () => {
@@ -1093,43 +1088,43 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			return;
 		}
 
-		// Session line, with Unpair on the right once paired.
-		const sessionRow = page.place(
-			make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y }),
-		);
-		const sessionLine = style(make("TextLabel", { BackgroundTransparency: 1 }, sessionRow), "Checking session...", 15, COLORS.dim);
-		sessionLine.Size = new UDim2(1, -96, 0, 32);
-		sessionLine.AutomaticSize = Enum.AutomaticSize.Y;
-		sessionLine.TextYAlignment = Enum.TextYAlignment.Center;
-		const unpairButton = style(
-			make("TextButton", { AutoButtonColor: true, Visible: false }, sessionRow),
-			"Unpair",
+		// Every row here is a fixed-height Frame with a scale-sized left part and a fixed-width button pinned right
+		// (fixedRow + sideButton): nothing can reach past the content's right edge at any window size.
+		const sideGap = -(SIDE_BUTTON + 8);
+
+		// Row 1: session status (one line) + Unpair once paired.
+		const sessionRow = page.place(fixedRow());
+		const sessionLine = style(
+			make("TextLabel", { BackgroundTransparency: 1 }, sessionRow),
+			"Checking session...",
 			15,
-			COLORS.text,
+			COLORS.dim,
 			Enum.Font.BuilderSansMedium,
 		);
-		unpairButton.TextXAlignment = Enum.TextXAlignment.Center;
-		unpairButton.TextWrapped = false;
-		unpairButton.BackgroundColor3 = COLORS.button;
-		unpairButton.AnchorPoint = new Vector2(1, 0);
-		unpairButton.Position = UDim2.fromScale(1, 0);
-		unpairButton.Size = UDim2.fromOffset(88, 32);
-		corner(unpairButton, 6);
+		sessionLine.TextWrapped = false;
+		sessionLine.TextTruncate = Enum.TextTruncate.AtEnd;
+		sessionLine.Size = UDim2.fromScale(1, 1);
+		const unpairButton = sideButton(sessionRow, "Unpair");
+		unpairButton.Visible = false;
+		const showUnpair = (visible: boolean) => {
+			unpairButton.Visible = visible;
+			sessionLine.Size = new UDim2(1, visible ? sideGap : 0, 1, 0);
+		};
+		const hint = page.text("", COLORS.dim);
+		hint.Visible = false;
 
 		// Pairing (allowed, not paired yet): a masked code box. A TextBox can't mask, so its real text is invisible
 		// (TextTransparency 1) under a label that shows one dot per character.
 		const pairing = page.group(6);
 		pairing.frame.Visible = false;
-		const codeRow = pairing.place(
-			make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, 34) }),
-		);
+		const codeRow = pairing.place(fixedRow());
 		const codeBox = style(make("TextBox", { ClearTextOnFocus: false }, codeRow), "", 15, COLORS.text, Enum.Font.Code);
 		codeBox.TextTransparency = 1;
 		codeBox.PlaceholderText = "";
 		codeBox.TextWrapped = false;
 		codeBox.ClipsDescendants = true;
 		codeBox.BackgroundColor3 = COLORS.row;
-		codeBox.Size = new UDim2(1, -96, 1, 0);
+		codeBox.Size = new UDim2(1, sideGap, 1, 0);
 		corner(codeBox, 6);
 		pad(codeBox, 0, 8);
 		const mask = style(make("TextLabel", { BackgroundTransparency: 1, Interactable: false }, codeBox), "", 15, COLORS.dim, Enum.Font.Code);
@@ -1143,14 +1138,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		};
 		paintMask();
 		tabTrove.connect(codeBox.GetPropertyChangedSignal("Text"), paintMask);
-		const pairButton = style(make("TextButton", { AutoButtonColor: true }, codeRow), "Pair", 15, COLORS.dark, Enum.Font.BuilderSansMedium);
-		pairButton.TextXAlignment = Enum.TextXAlignment.Center;
-		pairButton.TextWrapped = false;
-		pairButton.BackgroundColor3 = COLORS.accent;
-		pairButton.AnchorPoint = new Vector2(1, 0);
-		pairButton.Position = UDim2.fromScale(1, 0);
-		pairButton.Size = UDim2.fromOffset(88, 34);
-		corner(pairButton, 6);
+		const pairButton = sideButton(codeRow, "Pair", COLORS.accent, COLORS.dark);
 		pairing.text("Paste the pairing code printed by typetorch-dev-server", COLORS.dim);
 		const pairResult = pairing.text("", COLORS.dim);
 		pairResult.Visible = false;
@@ -1165,21 +1153,42 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		composer.frame.Visible = false;
 		const list = page.group(8);
 
-		const box = composer.input("Describe a change", 120, true);
+		const box = composer.input("Describe a change", 110, true);
 		box.Text = claudeDraft;
 		tabTrove.connect(box.GetPropertyChangedSignal("Text"), () => (claudeDraft = box.Text));
-		const actions = composer.buttons();
-		const pathToggle = addButton(actions, "Dex path", () => {
+		// Row: [Dex path] [Errors] on the left (half of the left part each, capped), Send pinned right.
+		const actions = composer.place(fixedRow());
+		const toggles = make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, sideGap, 1, 0) }, actions);
+		make(
+			"UIListLayout",
+			{ FillDirection: Enum.FillDirection.Horizontal, SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 6) },
+			toggles,
+		);
+		const toggle = (text: string, order: number, onClick: () => void) => {
+			const button = style(make("TextButton", { AutoButtonColor: true }), text, 15, COLORS.text, Enum.Font.BuilderSansMedium);
+			button.TextXAlignment = Enum.TextXAlignment.Center;
+			button.TextWrapped = false;
+			button.TextTruncate = Enum.TextTruncate.AtEnd;
+			button.Size = new UDim2(0.5, -3, 1, 0);
+			button.LayoutOrder = order;
+			make("UISizeConstraint", { MaxSize: new Vector2(130, math.huge) }, button);
+			corner(button, 6);
+			pad(button, 0, 6);
+			button.Parent = toggles;
+			button.Activated.Connect(onClick);
+			return button;
+		};
+		const pathToggle = toggle("Dex path", 1, () => {
 			attachPath = !attachPath;
 			paintSelected(pathToggle, attachPath, COLORS.info);
 		});
-		const errorsToggle = addButton(actions, "Errors", () => {
+		const errorsToggle = toggle("Errors", 2, () => {
 			attachErrors = !attachErrors;
 			paintSelected(errorsToggle, attachErrors, COLORS.info);
 		});
 		paintSelected(pathToggle, attachPath, COLORS.info);
 		paintSelected(errorsToggle, attachErrors, COLORS.info);
-		spacer(actions);
+		const sendButton = sideButton(actions, "Send", COLORS.accent, COLORS.dark);
 		const result = composer.text("", COLORS.dim);
 		result.Visible = false;
 		const showResult = (text: string, color: Color3) => {
@@ -1229,7 +1238,9 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				for (let index = math.max(0, log.size() - 3); index < log.size(); index++) {
 					card.text(log[index], COLORS.dim, true);
 				}
-				if (request.mine && !request.finished) addButton(card.buttons(), "Cancel", () => cancel(request.id), COLORS.bad);
+				if (request.mine && !request.finished) {
+					sideButton(card.place(fixedRow()), "Cancel", COLORS.bad, COLORS.dark).Activated.Connect(() => cancel(request.id));
+				}
 			}
 		};
 
@@ -1242,23 +1253,28 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			}
 			const session = reply as ClaudeSessionView;
 			const paired = session.paired === true;
+			let hintText = "";
 			if (!session.available) {
-				sessionLine.Text = claudeError("not_connected");
+				sessionLine.Text = "Not connected";
 				sessionLine.TextColor3 = COLORS.warn;
+				hintText = "Start `typetorch remote-claude` on this branch";
 			} else if (!session.allowed) {
-				sessionLine.Text = `Session ${session.label}: ${claudeError("not_allowed")}`;
+				sessionLine.Text = `Connected · ${session.label} · not allowed`;
 				sessionLine.TextColor3 = COLORS.warn;
+				hintText = "You are not on the session's user list";
 			} else if (!paired) {
-				sessionLine.Text = `Session ${session.label}: not paired`;
+				sessionLine.Text = `Connected · ${session.label} · not paired`;
 				sessionLine.TextColor3 = COLORS.warn;
 			} else {
-				sessionLine.Text = `Session ${session.label} on ${str(session.branch)}`;
+				sessionLine.Text = `Connected · ${session.label} · ${str(session.branch)}`;
 				sessionLine.TextColor3 = COLORS.good;
 			}
+			hint.Text = hintText;
+			hint.Visible = hintText !== "";
 			const usable = session.available && session.allowed;
 			pairing.frame.Visible = usable && !paired;
 			composer.frame.Visible = usable && paired;
-			unpairButton.Visible = usable && paired;
+			showUnpair(usable && paired);
 			requests = session.requests;
 			drawList();
 		};
@@ -1340,20 +1356,15 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				if (ok && answer.error === "needs_pairing") refreshSession();
 			}
 		};
-		addButton(
-			actions,
-			"Send",
-			() => {
-				if (sending) return;
-				sending = true;
-				spawnIn(tabTrove, () => {
-					const [ok, err] = pcall(send);
-					sending = false;
-					if (!ok) showResult(`Failed: ${err}`, COLORS.bad);
-				});
-			},
-			COLORS.accent,
-		);
+		sendButton.Activated.Connect(() => {
+			if (sending) return;
+			sending = true;
+			spawnIn(tabTrove, () => {
+				const [ok, err] = pcall(send);
+				sending = false;
+				if (!ok) showResult(`Failed: ${err}`, COLORS.bad);
+			});
+		});
 
 		// The session every 10 s; active requests every 2.5 s in between (only while this tab is open).
 		let tick = 0;
@@ -1387,31 +1398,39 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		if (!ui || !tabTrove) return;
 		tabTrove.clean();
 		state.tab = name;
-		for (const [tab, button] of ui.tabButtons) {
-			button.BackgroundColor3 = tab === name ? COLORS.accent : COLORS.header;
-			button.TextColor3 = tab === name ? COLORS.dark : COLORS.text;
-		}
 		const body = ui.body;
 		const tabSubs = SUBTABS[name];
 		let key: string = name;
+		let chosen: string | undefined;
 		if (tabSubs) {
-			let chosen = sub ?? subs[name];
+			chosen = sub ?? subs[name];
 			if (chosen === undefined || !tabSubs.includes(chosen)) chosen = tabSubs[0];
 			subs[name] = chosen;
 			key = `${name}/${chosen}`;
-			const subBar = tabTrove.add(buttonRow());
-			subBar.Name = "SubTabs";
-			subBar.LayoutOrder = 1;
-			subBar.BackgroundTransparency = 0;
-			subBar.BackgroundColor3 = COLORS.header;
-			pad(subBar, 6, 10);
-			for (const subName of tabSubs) {
-				paintSelected(
-					addButton(subBar, subName, () => selectTab(name, subName)),
-					subName === chosen,
-				);
+		}
+		// Sidebar: plain tabs fill when selected; a group header only tints (its active child fills); only the
+		// selected group is expanded.
+		for (const [tab, button] of ui.tabButtons) {
+			const selected = tab === name;
+			if (ui.groups.has(tab)) {
+				button.BackgroundColor3 = selected ? COLORS.row : COLORS.header;
+				button.TextColor3 = selected ? COLORS.accent : COLORS.text;
+			} else {
+				button.BackgroundColor3 = selected ? COLORS.accent : COLORS.header;
+				button.TextColor3 = selected ? COLORS.dark : COLORS.text;
 			}
-			subBar.Parent = body;
+		}
+		for (const [tab, group] of ui.groups) {
+			const expanded = tab === name;
+			group.frame.Visible = expanded;
+			group.collapsed.Visible = !expanded;
+			group.expanded.Visible = expanded;
+			for (const [child, button] of group.children) {
+				const active = expanded && child === chosen;
+				button.BackgroundTransparency = active ? 0 : 1;
+				button.TextColor3 = active ? COLORS.dark : COLORS.dim;
+				button.Font = active ? Enum.Font.BuilderSansBold : Enum.Font.BuilderSansMedium;
+			}
 		}
 		ui.content.CanvasPosition = Vector2.zero;
 		const page = Page.mount(ui.content);
@@ -1531,26 +1550,79 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		corner(closeButton, 6);
 		closeButton.Activated.Connect(close);
 
+		// Sidebar (script-free ScrollingFrame): tabs, and for tabs with sub-tabs an indented group of children right
+		// under them (visible while that tab is selected). Clicking a group header opens its first child.
 		const tabs = scrolling(window, {
 			Name: "Tabs",
 			Position: UDim2.fromOffset(0, HEADER),
 			Size: new UDim2(0, TAB_WIDTH, 1, -HEADER),
-			ScrollBarThickness: 0,
+			ScrollBarThickness: 3,
 		});
 		verticalList(tabs, 4);
 		pad(tabs, 8, 8);
 		const tabButtons = new Map<TabName, TextButton>();
+		const groups = new Map<TabName, SidebarGroup>();
 		TABS.forEach((name, index) => {
 			const button = style(make("TextButton", { AutoButtonColor: true }), name, 15, COLORS.text, Enum.Font.BuilderSansMedium);
 			button.BackgroundColor3 = COLORS.header;
 			button.TextWrapped = false;
+			button.TextTruncate = Enum.TextTruncate.AtEnd;
 			button.Size = new UDim2(1, 0, 0, 36);
-			button.LayoutOrder = index;
+			button.LayoutOrder = index * 2;
 			corner(button, 6);
 			pad(button, 0, 10);
 			button.Parent = tabs;
-			button.Activated.Connect(() => selectTab(name));
 			tabButtons.set(name, button);
+			const children = SUBTABS[name];
+			if (!children) {
+				button.Activated.Connect(() => selectTab(name));
+				return;
+			}
+			button.Activated.Connect(() => selectTab(name, children[0]));
+			// Expand indicator: a thin chevron drawn from Frames (right = collapsed, down = expanded).
+			const icon = make(
+				"Frame",
+				{
+					BackgroundTransparency: 1,
+					AnchorPoint: new Vector2(1, 0.5),
+					Position: UDim2.fromScale(1, 0.5),
+					Size: UDim2.fromOffset(12, 12),
+				},
+				button,
+			);
+			const collapsed = chevron(icon, "right", COLORS.dim, 2);
+			const expanded = chevron(icon, "down", COLORS.dim, 2);
+			expanded.Visible = false;
+			const frame = make(
+				"Frame",
+				{
+					Name: `${name}Group`,
+					BackgroundTransparency: 1,
+					Size: UDim2.fromScale(1, 0),
+					AutomaticSize: Enum.AutomaticSize.Y,
+					LayoutOrder: index * 2 + 1,
+					Visible: false,
+				},
+				tabs,
+			);
+			verticalList(frame, 2);
+			make("UIPadding", { PaddingLeft: new UDim(0, 14) }, frame);
+			const childButtons = new Map<string, TextButton>();
+			children.forEach((child, childIndex) => {
+				const childButton = style(make("TextButton", { AutoButtonColor: true }), child, 14, COLORS.dim, Enum.Font.BuilderSansMedium);
+				childButton.BackgroundColor3 = COLORS.accent;
+				childButton.BackgroundTransparency = 1;
+				childButton.TextWrapped = false;
+				childButton.TextTruncate = Enum.TextTruncate.AtEnd;
+				childButton.Size = new UDim2(1, 0, 0, 32);
+				childButton.LayoutOrder = childIndex;
+				corner(childButton, 6);
+				pad(childButton, 0, 10);
+				childButton.Parent = frame;
+				childButton.Activated.Connect(() => selectTab(name, child));
+				childButtons.set(child, childButton);
+			});
+			groups.set(name, { frame, collapsed, expanded, children: childButtons });
 		});
 
 		// Right of the tabs: [sub-tabs] [toolbar] [content] [footer]. The bars come and go with the tab; the content
@@ -1684,7 +1756,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			if (mouseUp || input === drag.input) drag = undefined;
 		});
 
-		return { gui, toggle, window, body, content, tabButtons };
+		return { gui, toggle, window, body, content, tabButtons, groups };
 	};
 
 	open = () => {

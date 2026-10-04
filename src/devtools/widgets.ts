@@ -161,7 +161,39 @@ export function spacer(row: Instance): Frame {
 	return gap;
 }
 
-/** A square icon button with an "up" chevron drawn from two rotated Frames (no glyphs). */
+export type ChevronDirection = "up" | "down" | "right";
+
+/**
+ * A chevron drawn from two rotated Frames (no glyphs), filling `parent` (give it a square size). Returns its holder,
+ * so callers can show or hide it.
+ */
+export function chevron(parent: Instance, direction: ChevronDirection, color = COLORS.text, thickness = 3): Frame {
+	const holder = make("Frame", { Name: "Chevron", BackgroundTransparency: 1, Size: UDim2.fromScale(1, 1) }, parent);
+	// side -1 / +1 = the two arms. Up: arms left/right meeting at the top; down: meeting at the bottom; right: arms
+	// top/bottom meeting at the right.
+	for (const side of [-1, 1]) {
+		const horizontalPair = direction !== "right";
+		const rotation = direction === "up" ? side * 45 : -side * 45;
+		const arm = make(
+			"Frame",
+			{
+				BackgroundColor3: color,
+				BorderSizePixel: 0,
+				AnchorPoint: new Vector2(0.5, 0.5),
+				Position: horizontalPair
+					? new UDim2(0.5 + side * 0.09, 0, 0.5, 0)
+					: new UDim2(0.5, 0, 0.5 + side * 0.09, 0),
+				Size: new UDim2(0.3, 0, 0, thickness),
+				Rotation: rotation,
+			},
+			holder,
+		);
+		corner(arm, 2);
+	}
+	return holder;
+}
+
+/** A square icon button with an "up" chevron (no glyphs). */
 export function upButton(row: Instance, onClick: () => void): TextButton {
 	const button = make("TextButton", {
 		Name: "Up",
@@ -174,25 +206,36 @@ export function upButton(row: Instance, onClick: () => void): TextButton {
 	});
 	make("UIAspectRatioConstraint", { AspectRatio: 1 }, button);
 	corner(button, 6);
-	// Two arms meeting at the top: the left one rises to the right (-45), the right one falls to the right (+45).
-	for (const side of [-1, 1]) {
-		const arm = make(
-			"Frame",
-			{
-				BackgroundColor3: COLORS.text,
-				BorderSizePixel: 0,
-				AnchorPoint: new Vector2(0.5, 0.5),
-				Position: new UDim2(0.5 + side * 0.09, 0, 0.5, 0),
-				Size: new UDim2(0.3, 0, 0, 3),
-				Rotation: side * 45,
-			},
-			button,
-		);
-		corner(arm, 2);
-	}
+	chevron(button, "up");
 	button.Parent = row;
 	button.Activated.Connect(onClick);
 	return button;
+}
+
+/** Width of the right-hand button of a two-part row (sideButton). */
+export const SIDE_BUTTON = 76;
+
+/**
+ * A fixed-width button pinned to the right edge of `row` (a Frame with a fixed height). The row's left part must be
+ * sized `UDim2(1, -(SIDE_BUTTON + 8), ...)` so the two never overlap at any width.
+ */
+export function sideButton(row: Instance, text: string, color = COLORS.button, textColor = COLORS.text): TextButton {
+	const button = style(make("TextButton", { AutoButtonColor: true }), text, 15, textColor, Enum.Font.BuilderSansMedium);
+	button.TextXAlignment = Enum.TextXAlignment.Center;
+	button.TextWrapped = false;
+	button.TextTruncate = Enum.TextTruncate.AtEnd;
+	button.BackgroundColor3 = color;
+	button.AnchorPoint = new Vector2(1, 0);
+	button.Position = UDim2.fromScale(1, 0);
+	button.Size = new UDim2(0, SIDE_BUTTON, 1, 0);
+	corner(button, 6);
+	button.Parent = row;
+	return button;
+}
+
+/** A fixed-height row for "left part + sideButton" layouts (no AutomaticSize, no flex: it can't outgrow its parent). */
+export function fixedRow(height = BUTTON_HEIGHT): Frame {
+	return make("Frame", { BackgroundTransparency: 1, BorderSizePixel: 0, Size: new UDim2(1, 0, 0, height) });
 }
 
 /** A single-line text box that takes the rest of a buttonRow's line. */
