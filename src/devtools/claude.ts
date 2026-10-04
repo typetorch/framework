@@ -474,6 +474,8 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		return false;
 	};
 	let warnedUrlChange = false;
+	/** The newest announcement of another session, held back while devs here are paired to the current one. */
+	let heldBack: Session | undefined;
 	// Every announcement (broadcast or MemoryStore share) goes through here: see TUNNEL BINDING in the header.
 	const onMessage = (raw: unknown, fromBroadcast = true) => {
 		let data = raw;
@@ -506,12 +508,17 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 			}
 			return;
 		}
-		// Another session id doesn't push out a live session that devs here are paired with.
-		const current = store.session;
-		if (current !== undefined && current.sid !== sid && current.exp > os.time() && pairedTo(current.sid)) return;
 		const users = new Array<number>();
 		for (const [, user] of pairs(message.u as object)) {
 			if (typeIs(user, "number") && user > 0 && user % 1 === 0 && users.size() < 100) users.push(user);
+		}
+		// Another session id doesn't push out a live session that devs here are paired with. It's kept as `heldBack`:
+		// a dev who pastes a code for its tunnel adopts it at once (claude.pair), instead of waiting for the old session
+		// to expire after a dev-server restart.
+		const current = store.session;
+		if (current !== undefined && current.sid !== sid && current.exp > os.time() && pairedTo(current.sid)) {
+			heldBack = { sid, branch, users, url, exp };
+			return;
 		}
 		if (bound === undefined) {
 			if (boundUrls.size() >= MAX_BOUND_SIDS) {
@@ -752,7 +759,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	// Pairing: trade the code printed by typetorch-dev-server for this player's tokens. The code is never logged.
 	ops.set("claude.pair", (player, payload) => {
 		if (kernel.channel !== "dev") return fail("prod_channel");
-		const session = activeSession();
+		let session = activeSession();
 		if (!session) return fail("not_connected");
 		if (!session.users.includes(player.UserId)) return fail("not_allowed");
 		const raw = typeIs(payload, "table") ? (payload as { code?: unknown }).code : payload;
@@ -766,9 +773,30 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		if (code === undefined) return fail("bad_code");
 		// The code's last 4 symbols fingerprint the tunnel it was printed for (security audit H1): a code for another URL
 		// is never sent anywhere, so a re-announced or spoofed session can't collect it.
-		if (codeFingerprint(code.sub(1, CODE_SECRET_LENGTH), hostOf(session.url)) !== code.sub(CODE_SECRET_LENGTH + 1)) {
-			$warn(`[remote-claude] ${player.Name} entered a pairing code for another tunnel; it was not sent`);
-			return fail("code_mismatch");
+		const fitsTunnel = (candidate: Session) =>
+			codeFingerprint(code.sub(1, CODE_SECRET_LENGTH), hostOf(candidate.url)) === code.sub(CODE_SECRET_LENGTH + 1);
+		if (!fitsTunnel(session)) {
+			// A held-back newer session (the dev-server restarted) whose tunnel this code was printed for: the code
+			// proves the dev has the newest code from the dev machine, so adopt that session now.
+			const candidate = heldBack;
+			const bound = candidate !== undefined ? boundUrls.get(candidate.sid) : undefined;
+			if (
+				candidate !== undefined &&
+				candidate.exp > os.time() &&
+				candidate.users.includes(player.UserId) &&
+				(bound === undefined || bound === candidate.url) &&
+				fitsTunnel(candidate)
+			) {
+				heldBack = undefined;
+				boundUrls.set(candidate.sid, candidate.url);
+				forgetOtherSessions(candidate.sid);
+				store.session = candidate;
+				shareSession({ v: 1, s: candidate.sid, b: candidate.branch, u: candidate.users, url: candidate.url, exp: candidate.exp });
+				session = candidate;
+			} else {
+				$warn(`[remote-claude] ${player.Name} entered a pairing code for another tunnel; it was not sent`);
+				return fail("code_mismatch");
+			}
 		}
 		while (exchanging.has(player.UserId)) task.wait(0.1);
 		exchanging.add(player.UserId);
