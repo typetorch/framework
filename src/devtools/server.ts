@@ -24,6 +24,7 @@ import { describeState } from "./state";
 import type { ServerFacts } from "./health";
 import { ArtifactNotes, notesFromAttribute, parseArtifactNotes } from "./artifact-notes";
 import { loadstringAvailable } from "./claude-tools";
+import { kernelHasExperiments, NEEDS_KERNEL_AB } from "./ab";
 
 function isAssetId(value: unknown): value is number {
 	return typeIs(value, "number") && value > 0 && value % 1 === 0 && value < 2 ** 53;
@@ -45,11 +46,11 @@ export const NEEDS_KERNEL_02 = "kernel 0.2 needed for artifacts";
 let loadstringWorks: boolean | undefined;
 
 /** Place settings the Status page warns about (health.ts). loadstring is probed once per generation. */
-function serverFacts(): ServerFacts {
+function serverFacts(kernel: ServerKernel): ServerFacts {
 	if (loadstringWorks === undefined) {
 		loadstringWorks = loadstringAvailable();
 	}
-	return { loadstring: loadstringWorks, http: HttpService.HttpEnabled };
+	return { loadstring: loadstringWorks, http: HttpService.HttpEnabled, experiments: kernelHasExperiments(kernel) };
 }
 
 const LOG_KINDS = new Set(["output", "info", "warning", "error"]);
@@ -146,7 +147,7 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 				initMs: running.initSeconds !== undefined ? math.floor(running.initSeconds * 1000) : undefined,
 			}),
 		);
-		return { server: kernel.status(), artifact: kernel.artifact, modules, you: kernel.devInfo(player), facts: serverFacts() };
+		return { server: kernel.status(), artifact: kernel.artifact, modules, you: kernel.devInfo(player), facts: serverFacts(kernel) };
 	});
 	ops.set("logs", (_, payload) => kernel.logs(typeIs(payload, "number") ? payload : undefined, 200));
 	ops.set("branches", () => kernel.branches());
@@ -220,11 +221,23 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 		return notes;
 	});
 	// Pin this server to a known artifact. The kernel re-checks everything (dev, server type, admin, channel).
+	// payload: assetId, or { assetId, experiment: true } (kernel 0.2.3+: an A/B experiment, owner/admin; any channel on
+	// public servers, which stay prod).
 	ops.set("pin", (player, payload) => {
-		assert(isAssetId(payload), "bad asset id");
+		let assetId: unknown = payload;
+		let experiment = false;
+		if (typeIs(payload, "table")) {
+			const request = payload as { assetId?: unknown; experiment?: unknown };
+			assetId = request.assetId;
+			assert(request.experiment === undefined || typeIs(request.experiment, "boolean"), "bad request");
+			experiment = request.experiment === true;
+		}
+		assert(isAssetId(assetId), "bad asset id");
 		if (!kernelHasArtifacts(kernel)) error(NEEDS_KERNEL_02, 0);
+		// Older kernels would ignore the option and refuse dev-channel artifacts (or pin a prod one for good).
+		if (experiment && !kernelHasExperiments(kernel)) error(NEEDS_KERNEL_AB, 0);
 		takeSwap();
-		return kernel.pinArtifact!(player, payload);
+		return experiment ? kernel.pinArtifact!(player, assetId, { experiment: true }) : kernel.pinArtifact!(player, assetId);
 	});
 	ops.set("net", () => {
 		const stats = new Array<NetStat>();

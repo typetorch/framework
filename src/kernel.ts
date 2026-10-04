@@ -139,6 +139,27 @@ export interface SwapReport {
 	rollbackTo?: string;
 	/** Kernel 0.2+: set by pinArtifact when the server now holds the pinned artifact. */
 	pinned?: boolean;
+	/** Kernel 0.2.3+: the pin is an A/B experiment. */
+	experiment?: boolean;
+}
+
+/** Kernel 0.2.3+: an A/B experiment pin on this server (see devtools/ab.ts). */
+export interface ExperimentInfo {
+	readonly artifactId: string;
+	readonly assetId: number;
+	/** User id of the owner or admin who started it (from this server or a TypeTorch/pin message). */
+	readonly by?: number;
+	/** os.time() when it started. */
+	readonly since: number;
+}
+
+/** Kernel 0.2.3+: options of `pinArtifact`. */
+export interface PinOptions {
+	/**
+	 * An A/B experiment (owner/admin only): any known artifact, any channel, public servers too (they stay "prod").
+	 * Never stored; holds until the next deploy of the branch, `unpin`, or the server closing.
+	 */
+	experiment?: boolean;
 }
 
 export interface NewServerReport {
@@ -161,6 +182,8 @@ export interface ArtifactEntry {
 	/** ISO time of the deploy. */
 	at?: string;
 	rollback?: boolean;
+	/** Kernel 0.2.3+: the deploy went to this percent of servers only (`ro`). */
+	rollout?: number;
 	/** The current head of its branch. */
 	live: boolean;
 	/** This server's current generation. */
@@ -210,6 +233,12 @@ export interface KernelStatus {
 	memoryMb: number;
 	luaHeapKb: number;
 	appliedSeq: number;
+	/** Kernel 0.2.3+: set while this server runs an A/B experiment pin. */
+	experiment?: ExperimentInfo;
+	/** Kernel 0.2.3+: this server's bucket (0-99) for rollouts and random pins (it takes `ro`/`pct` above it). */
+	rolloutBucket?: number;
+	/** Kernel 0.2.3+: the last TypeTorch/pin message this server acted on. */
+	lastPin?: { assetId?: number; unpin?: boolean; by: number; pct?: number; listed: boolean; receivedMs: number; sentMs: number; ok?: boolean; error?: string };
 }
 
 export interface ServerKernel {
@@ -253,9 +282,10 @@ export interface ServerKernel {
 	artifacts?(): ArtifactEntry[];
 	/**
 	 * Swap this server to a known artifact and hold it until a newer deploy of its branch. Devs on private/reserved/
-	 * studio servers; on public servers only owner/admin and only prod-channel artifacts.
+	 * studio servers; on public servers only owner/admin and only prod-channel artifacts. Kernel 0.2.3+:
+	 * `{ experiment: true }` (owner/admin) allows any channel on public servers too (older kernels ignore options).
 	 */
-	pinArtifact?(player: Player, assetId: number): SwapReport;
+	pinArtifact?(player: Player, assetId: number, options?: PinOptions): SwapReport;
 
 	// Kernel 0.2.2+ (additive, same kernelApi). Game code uses them through `TypeTorch` (src/typetorch.ts).
 	/** How this generation started. The kernel's own table: it sets `swapSeconds` once the swap finished. */
@@ -268,6 +298,12 @@ export interface ServerKernel {
 	onDevChanged?(handler: (player: Player, info: DevInfo) => void): void;
 	/** Reload this server to its branch head; the owner or admins only (checked by the kernel). */
 	requestReload?(player: Player): SwapReport;
+
+	// Kernel 0.2.3+ (additive): A/B experiments. `experiment` doubles as the feature test (devtools/ab.ts).
+	/** The running experiment pin, if any. */
+	experiment?(): ExperimentInfo | undefined;
+	/** End this server's experiment (back to its branch head). Owner/admin on public servers, devs elsewhere. */
+	unpin?(player: Player): SwapReport;
 }
 
 export interface ClientKernel {

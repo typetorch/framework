@@ -37,6 +37,7 @@ import { renderNetworkInspector } from "./network-inspector";
 import { describeState } from "./state";
 import type { ArtifactNotes } from "./artifact-notes";
 import { badgeLevel, checkHealth, HealthIssue, HealthLevel, ServerFacts } from "./health";
+import { NEEDS_KERNEL_AB } from "./ab";
 import {
 	addButton,
 	chevron,
@@ -200,7 +201,7 @@ function ms(value: unknown): string {
 }
 
 function swapText(ok: boolean, reply: unknown): [string, Color3] {
-	if (!ok) return [`Failed: ${str(reply)}`, COLORS.bad];
+	if (!ok) return [reply === NEEDS_KERNEL_AB ? "Needs kernel 0.2.3" : `Failed: ${str(reply)}`, COLORS.bad];
 	if (!typeIs(reply, "table")) return ["Done", COLORS.good];
 	const report = reply as SwapReport;
 	if (report.ok) return [report.generation !== undefined ? `Running ${report.generation}` : "Done", COLORS.good];
@@ -757,6 +758,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			artifacts?: ArtifactEntry[];
 			/** Why the artifact list is missing (kernel 0.1.0, or an error). */
 			artifactsNote?: string;
+			/** The kernel has A/B experiment pins (0.2.3+). */
+			experiments?: boolean;
 		}
 		let data: Picker | undefined;
 		const expanded = new Set<string>();
@@ -842,7 +845,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				}
 				body.field("Running", artifactText);
 				const pinned = status.pinned === true;
-				body.field("Pinned", pinned ? "yes, until the next deploy" : "no", pinned ? COLORS.warn : COLORS.text);
+				const pinText = status.experiment !== undefined ? "A/B experiment, until the next deploy" : pinned ? "yes, until the next deploy" : "no";
+				body.field("Pinned", pinText, pinned ? COLORS.warn : COLORS.text);
 			} else {
 				body.text("Status unavailable", COLORS.bad);
 			}
@@ -886,6 +890,9 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				return;
 			}
 			if (artifacts.size() === 0) body.text("None yet", COLORS.dim);
+			// Owner/admin on a public server load in place as an A/B experiment (kernel 0.2.3+).
+			const abInPlace = isPublic && isAdmin && data.experiments === true;
+			if (isPublic && isAdmin && !abInPlace) body.text("A/B needs kernel 0.2.3", COLORS.dim);
 			const order = new Array<string>();
 			const groups = new Map<string, ArtifactEntry[]>();
 			for (const entry of artifacts) {
@@ -906,8 +913,12 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 					if (!showAll && index >= ARTIFACTS_PER_BRANCH) return;
 					const short = entry.commit ?? entry.artifactId ?? `asset ${entry.assetId}`;
 					let title = `<b>${entry.seq !== undefined ? `#${entry.seq}  ` : ""}${escapeRich(short)}</b>`;
-					if (entry.running) title += tag(status?.pinned === true ? "RUNNING, PINNED" : "RUNNING", COLORS.good);
+					if (entry.running) {
+						const how = status?.experiment !== undefined ? "RUNNING, A/B" : status?.pinned === true ? "RUNNING, PINNED" : "RUNNING";
+						title += tag(how, COLORS.good);
+					}
 					if (entry.live) title += tag("LIVE", COLORS.info);
+					if (entry.rollout !== undefined) title += tag(`${entry.rollout}%`, COLORS.info);
 					if (entry.rollback) title += tag("ROLLBACK", COLORS.warn);
 					const detail = escapeRich(`${entry.artifactId ?? `asset-${entry.assetId}`}  ${ago(entry.at)}`);
 					if (entry.running || serverType === undefined) {
@@ -915,9 +926,9 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 						return;
 					}
 					// Mirrors the kernel's rules (it re-checks): any dev loads on private/reserved/studio servers; on a
-					// public server only owner/admin, and only prod-channel artifacts. Otherwise open a reserved server
-					// pinned to it.
-					const canLoad = !isPublic || (isAdmin && entry.channel === "prod");
+					// public server only owner/admin: any artifact as an A/B experiment (kernel 0.2.3+), else only
+					// prod-channel ones. Everyone else opens a reserved server pinned to it (only they move).
+					const canLoad = !isPublic || (isAdmin && (abInPlace || entry.channel === "prod"));
 					// A dev-channel artifact on a prod-channel server: a dark "Dev channel" button instead of the orange
 					// Load, so it isn't loaded by mistake. Still works (tap twice); switching the branch first is the
 					// usual way.
@@ -931,9 +942,11 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 								if (!armed) {
 									armed = true;
 									button.Text = "Confirm";
+									// Public: the whole server moves, so say so before the second tap.
+									if (isPublic) setResult(`Everyone on this server runs ${short}`, COLORS.warn);
 									return;
 								}
-								act(`Loading ${short}`, "pin", entry.assetId);
+								act(`Loading ${short}`, "pin", abInPlace ? { assetId: entry.assetId, experiment: true } : entry.assetId);
 							},
 						});
 						expandable(loadRow, entry.assetId);
@@ -979,6 +992,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				if (!artifactsOk) fresh.artifactsNote = `Failed: ${str(artifactsReply)}`;
 				else if (reply.supported !== true) fresh.artifactsNote = "Kernel 0.2 needed for artifacts";
 				else fresh.artifacts = reply.list ?? [];
+				if (statusOk && typeIs(statusReply, "table")) fresh.experiments = (statusReply as StatusReply).facts?.experiments === true;
 				data = fresh;
 				draw();
 			});

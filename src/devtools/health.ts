@@ -1,7 +1,7 @@
 import type { KernelStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
-export const LATEST_KERNEL = "0.2.2";
+export const LATEST_KERNEL = "0.2.3";
 /** The oldest kernel API this framework runs on. */
 export const REQUIRED_KERNEL_API = 1;
 /** Auto-rollbacks newer than this (seconds) are reported. */
@@ -24,6 +24,8 @@ export interface ServerFacts {
 	loadstring?: boolean;
 	/** HttpService.HttpEnabled; remote-claude needs it. */
 	http?: boolean;
+	/** The kernel has A/B experiment pins (0.2.3+, devtools/ab.ts). */
+	experiments?: boolean;
 }
 
 /** "0.2.0" < "0.2.1"; missing parts count as 0, non-numbers as 0. */
@@ -84,7 +86,9 @@ export function checkHealth(status: KernelStatus, facts?: ServerFacts): HealthIs
 	if (facts?.loadstring === false && status.channel === "dev") {
 		issues.push({ level: "info", title: "run_luau off", detail: "LoadStringEnabled is off in this place." });
 	}
-	if (status.pinned === true) {
+	if (status.experiment !== undefined) {
+		issues.push({ level: "info", title: "A/B experiment", detail: `${status.experiment.artifactId} until the next deploy` });
+	} else if (status.pinned === true) {
 		issues.push({ level: "info", title: "Pinned", detail: "Holds this artifact until the next deploy." });
 	}
 	const rank = { error: 0, warn: 1, info: 2 };
