@@ -108,10 +108,10 @@ const OTHER_LOG_ERRORS: Record<string, string> = {
 	rate_limited: "Slow down",
 };
 
-const TABS = ["Artifact", "Modules", "Server", "Admin", "Logs", "Dex", "Network", "State", "Claude"] as const;
+const TABS = ["Artifact", "Modules", "Server", "Admin", "Logs", "Dex", "Network", "Claude"] as const;
 type TabName = (typeof TABS)[number];
 /** Tabs with sub-tabs (a segmented bar on top of the content); the first one is the default. */
-const SUBTABS: Partial<Record<TabName, readonly string[]>> = { Server: ["Status", "Branch"], Admin: ["Players", "Servers", "Bans"], Network: ["Packets", "Stats"] };
+const SUBTABS: Partial<Record<TabName, readonly string[]>> = { Modules: ["Overview", "State"], Server: ["Status", "Branch"], Admin: ["Players", "Servers", "Bans"], Network: ["Packets", "Stats"] };
 
 interface StatusReply {
 	server: KernelStatus;
@@ -350,6 +350,10 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		state.tab = "Server";
 		subs.Server = "Branch";
 	}
+	if (state.tab === "State") {
+		state.tab = "Modules";
+		subs.Modules = "State";
+	}
 
 	// Requests ------------------------------------------------------------------------------------------------------
 	// Random start: a response addressed to the previous generation can't match one of ours after a swap.
@@ -492,33 +496,53 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		else if (keys.noTrustedHead === true) target.field("Head", "No trusted prod head", COLORS.bad);
 	};
 
-	const renderModules = ({ page, trove: tabTrove }: TabContext) => {
-		const server = page.group();
-		server.text("Loading server...", COLORS.dim);
-		page.section("Client modules");
-		if (runningModules.size() === 0) page.text("None", COLORS.dim);
-		for (const running of runningModules) {
-			const init = running.initSeconds !== undefined ? `init ${ms(running.initSeconds)}` : "no onInit";
-			const deps = running.dependencies.size() > 0 ? `, needs ${running.dependencies.join(", ")}` : "";
-			page.field(running.name, init + deps);
-		}
-		spawnIn(tabTrove, () => {
-			const [ok, reply] = call("status");
-			server.clear();
-			server.section("Server modules");
-			if (!ok || !typeIs(reply, "table")) {
-				server.text(`Failed: ${str(reply)}`, COLORS.bad);
+	// Modules > Overview / State: one realm at a time (Server | Client toolbar, like Logs), refreshed every REFRESH s.
+	// Overview: each module in load order with its init time, lifecycle hooks and dependencies. State: the persist store
+	// (what survives swaps). Server data comes from the "state" op, client data from this client (describeState).
+	let modulesRealm: "server" | "client" = "server";
+	const renderModulesView = (tab: TabContext, draw: (target: Page, summary: StateSummary) => void) => {
+		const bar = tab.toolbar();
+		const buttons = new Map<string, TextButton>();
+		const body = tab.page.group();
+		const refresh = () => {
+			for (const [realm, button] of buttons) paintSelected(button, realm === modulesRealm);
+			if (modulesRealm === "client") {
+				body.clear();
+				draw(body, describeState());
 				return;
 			}
-			const modules = (reply as StatusReply).modules;
-			if (modules.size() === 0) server.text("None", COLORS.dim);
+			const [ok, reply] = call("state");
+			if (modulesRealm !== "server") return;
+			body.clear();
+			if (ok && typeIs(reply, "table")) draw(body, reply as StateSummary);
+			else body.text(`Failed: ${str(reply)}`, COLORS.bad);
+		};
+		const pick = (realm: "server" | "client") => {
+			modulesRealm = realm;
+			spawnIn(tab.trove, refresh);
+		};
+		buttons.set("server", addButton(bar, "Server", () => pick("server")));
+		buttons.set("client", addButton(bar, "Client", () => pick("client")));
+		every(tab.trove, REFRESH, refresh);
+	};
+	const renderModulesOverview = (tab: TabContext) =>
+		renderModulesView(tab, (target, summary) => {
+			const modules = [...summary.modules];
+			modules.sort((a, b) => (a.loadOrder ?? 0) < (b.loadOrder ?? 0));
+			if (modules.size() === 0) target.text("None", COLORS.dim);
 			for (const mod of modules) {
-				const init = mod.initMs !== undefined ? `init ${mod.initMs} ms` : "no onInit";
-				const deps = mod.dependencies.size() > 0 ? `, needs ${mod.dependencies.join(", ")}` : "";
-				server.field(mod.name, init + deps);
+				const parts = new Array<string>();
+				parts.push(mod.initMs !== undefined ? `init ${mod.initMs} ms` : "no onInit");
+				if (mod.hooks.size() > 0) parts.push(mod.hooks.join(", "));
+				if (mod.dependencies.size() > 0) parts.push(`needs ${mod.dependencies.join(", ")}`);
+				target.field(mod.name, parts.join("  ·  "));
 			}
 		});
-	};
+	const renderModulesState = (tab: TabContext) =>
+		renderModulesView(tab, (target, summary) => {
+			if (summary.persist.size() === 0) target.text("Nothing persisted", COLORS.dim);
+			for (const entry of summary.persist) target.field(entry.key, `${entry.entries} entries  ${entry.preview}`);
+		});
 
 	const renderArtifact = ({ page, trove: tabTrove }: TabContext) => {
 		page.section("Client");
@@ -1107,40 +1131,14 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		load();
 	};
 
-	const renderState = ({ page, trove: tabTrove }: TabContext) => {
-		const drawSide = (target: Page, title: string, summary: StateSummary) => {
-			target.section(`${title} modules`);
-			if (summary.modules.size() === 0) target.text("None", COLORS.dim);
-			for (const mod of summary.modules) {
-				const hooks = mod.hooks.size() > 0 ? mod.hooks.join(", ") : "no hooks";
-				const deps = mod.dependencies.size() > 0 ? `; needs ${mod.dependencies.join(", ")}` : "";
-				target.field(mod.name, `${hooks}${deps}`);
-			}
-			target.section(`${title} persist`);
-			if (summary.persist.size() === 0) target.text("None", COLORS.dim);
-			for (const entry of summary.persist) {
-				target.field(entry.key, `${entry.entries} entries  ${entry.preview}`);
-			}
-		};
-		const server = page.group();
-		const client = page.group();
-		every(tabTrove, REFRESH, () => {
-			const [ok, reply] = call("state");
-			server.clear();
-			if (ok && typeIs(reply, "table")) drawSide(server, "Server", reply as StateSummary);
-			else server.text(`Server: ${str(reply)}`, COLORS.bad);
-			client.clear();
-			drawSide(client, "Client", describeState());
-		});
-	};
-
 	// Claude: a Claude Code style chat (devtools/claude-ui.ts); "Dex path" sends the explorer's selection.
 	const renderClaude = (tab: TabContext) => renderClaudeChat(tab, { kernel, call, dexSelection: () => dexSelection, copyText, imageInbox });
 
 	/** Keys: a tab name, or "Tab/Sub" for tabs with sub-tabs. */
 	const RENDER: Record<string, (tab: TabContext) => void> = {
 		Artifact: renderArtifact,
-		Modules: renderModules,
+		"Modules/Overview": renderModulesOverview,
+		"Modules/State": renderModulesState,
 		"Server/Status": renderServer,
 		"Server/Branch": renderBranch,
 		...adminTabs({ kernel, call }),
@@ -1148,7 +1146,6 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		Dex: renderDex,
 		"Network/Packets": (tab) => renderNetworkInspector(tab, { kernel, dispatcher, call }),
 		"Network/Stats": renderNetwork,
-		State: renderState,
 		Claude: renderClaude,
 	};
 
