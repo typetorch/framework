@@ -14,6 +14,10 @@ import type {
 	ClaudeProposal,
 	ClaudeRequestView,
 	ClaudeSessionView,
+	ClaudeToolboxApproval,
+	ClaudeToolboxInsert,
+	ClaudeToolboxOptions,
+	ClaudeToolboxTile,
 } from "./protocol";
 import { formatLogHistory } from "./claude-tools";
 import {
@@ -48,8 +52,12 @@ import { chevron, COLORS, corner, escapeRich, hex, make, pad, SIDE_BUTTON, sideB
  *     Dex path / My logs / Server logs context toggles (shown as chips when on), Player logs... (another player's client
  *     logs, picked from a list) and Screenshot (claude-images.ts: capture, crop view, pickup on the dev machine or the
  *     upload fallback; a "Capturing..." / "Uploading..." chip, then a thumbnail chip with a remove button; the user's
- *     bubble shows the thumbnails), the Live / Code mode toggle (each user bubble shows the mode it was sent in) and a
- *     round Send button that becomes Stop while a run is active;
+ *     bubble shows the thumbnails), Toolbox (plans/14: an accent chip; Claude may use the Creator Store for that one
+ *     message, and the chip clears after the send), the Live / Code mode toggle (each user bubble shows the mode it was
+ *     sent in) and a round Send button that becomes Stop while a run is active;
+ *   - Creator Store results (`toolbox_results`) are a grid of thumbnail tiles in the reply; each toolbox insert waits
+ *     for an approval card (snapshot, what loaded, what is removed, Anchor, Keep scripts off by default, Insert / Deny),
+ *     and an inserted asset gets a small card with Remove;
  *   - images Claude shows (`image` events) are fetched to this client and drawn with an EditableImage; tap to enlarge.
  *   - tool calls are one line with a short result; tapping one shows its input and output (game-data wrappers removed,
  *     JSON pretty-printed); results are paired with their calls by tool_use id;
@@ -156,6 +164,11 @@ interface ChatState {
 	playerLogs?: { userId: number; name: string };
 	/** Sent screenshots by attachment id (the newest 30): the user bubbles show them again after a swap. */
 	shots?: Map<string, { taken: TakenCapture; crop?: Crop; at: number }>;
+	/**
+	 * "Toolbox" picked in the "+" menu for the next message (plans/14): Claude may use the Creator Store for that message
+	 * only. Part of the draft (survives a swap while typing); cleared by every send.
+	 */
+	toolbox?: boolean;
 }
 
 /** Strips RichText tags and entities: the text a label shows. */
@@ -539,7 +552,42 @@ function toolLine(event: ClaudeEvent): string {
 	if (tool === "find") return "Searched the game";
 	if (tool === "game_status") return "Checked server status";
 	if (tool === "screenshot") return "Screenshot";
+	if (tool === "toolbox_search") return "Searched the Toolbox";
+	if (tool === "toolbox_insert") return "Toolbox insert";
+	if (tool === "toolbox_add") return "Added a Toolbox asset";
 	return tool !== "" ? tool : event.text;
+}
+
+// Toolbox (plans/14) -----------------------------------------------------------------------------------------------------
+
+/** A Creator Store thumbnail (no HTTP: the engine resolves rbxthumb). */
+function toolboxThumb(id: number, size: 150 | 420 = 150): string {
+	return `rbxthumb://type=Asset&id=${id}&w=${size}&h=${size}`;
+}
+
+/** 7000 → "7k", 1250000 → "1.3M". */
+function compactNumber(value: number): string {
+	if (value >= 1e6) return `${math.floor(value / 1e5) / 10}M`;
+	if (value >= 1e3) return `${math.floor(value / 100) / 10}k`.gsub("%.0k", "k")[0];
+	return tostring(math.floor(value));
+}
+
+/** The verified-creator check: two Frames in a small circle (no glyph characters). */
+function verifiedMark(parent: Instance, order: number, color = COLORS.info) {
+	const badge = make("Frame", { BackgroundColor3: color, BorderSizePixel: 0, Size: UDim2.fromOffset(12, 12), LayoutOrder: order }, parent);
+	corner(badge, 6);
+	make("Frame", { BackgroundColor3: COLORS.dark, BorderSizePixel: 0, Position: UDim2.fromOffset(2, 6), Size: UDim2.fromOffset(4, 2), Rotation: 45 }, badge);
+	make("Frame", { BackgroundColor3: COLORS.dark, BorderSizePixel: 0, Position: UDim2.fromOffset(4, 5), Size: UDim2.fromOffset(7, 2), Rotation: -50 }, badge);
+	return badge;
+}
+
+/** One short line of tile facts: "0 scripts" (good) or "2 scripts" (warn), and the vote share. */
+function toolboxFacts(tile: { scripts?: number; upPercent?: number; seconds?: number; type: string }): string {
+	const parts = new Array<string>();
+	if (tile.scripts !== undefined) parts.push(`<font color="${hex(tile.scripts === 0 ? COLORS.good : COLORS.warn)}">${tile.scripts} scripts</font>`);
+	if (tile.seconds !== undefined) parts.push(`${tile.seconds}s`);
+	if (tile.upPercent !== undefined) parts.push(`${tile.upPercent}%`);
+	return parts.join("  ");
 }
 
 /** A glyph drawn from Frames for the "+" menu (no emojis or font glyphs). */
@@ -574,6 +622,15 @@ function menuIcon(parent: Instance, kind: string, color: Color3) {
 		corner(shoulders, 3);
 		bar(12, 4, 4, 2);
 		bar(12, 9, 4, 2);
+	} else if (kind === "toolbox") {
+		// A toolbox: a stroked body with a handle bar on top and a latch.
+		const handle = make("Frame", { BackgroundTransparency: 1, Position: UDim2.fromOffset(5, 1), Size: UDim2.fromOffset(6, 5) }, box);
+		corner(handle, 2);
+		make("UIStroke", { Color: color, Thickness: 2, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, handle);
+		const body = make("Frame", { BackgroundTransparency: 1, Position: UDim2.fromOffset(0, 5), Size: UDim2.fromOffset(16, 10) }, box);
+		corner(body, 2);
+		make("UIStroke", { Color: color, Thickness: 2, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, body);
+		bar(7, 8, 2, 4);
 	} else {
 		// A camera: a body and a lens.
 		const body = make("Frame", { BackgroundTransparency: 1, Position: UDim2.fromOffset(0, 3), Size: UDim2.fromOffset(16, 11) }, box);
@@ -616,7 +673,8 @@ type Segment =
 	| ToolSegment
 	| ProposalCard
 	| { kind: "note"; line: TextLabel }
-	| { kind: "image"; frame: Frame };
+	| { kind: "image"; frame: Frame }
+	| { kind: "toolbox"; frame: Frame };
 
 const DETAIL_CHARS = 1500;
 
@@ -1032,6 +1090,8 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		action?: () => void;
 		/** The chip's text when the toggle is on (default: the name). */
 		chip?: () => string;
+		/** The chip is accent-colored with the item's icon (Toolbox: it unlocks tools, not just context). */
+		accent?: boolean;
 		disabled?: boolean;
 	}
 	let screenshot: () => void = () => {};
@@ -1051,6 +1111,8 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 			chip: () => `Logs: ${state.playerLogs?.name ?? "?"}`,
 		},
 		{ name: "Screenshot", icon: "camera", action: () => screenshot() },
+		// Creator Store for the next message only (plans/14): without it Claude gets no toolbox tools at all.
+		{ name: "Toolbox", icon: "toolbox", get: () => state.toolbox === true, set: (on) => (state.toolbox = on ? true : undefined), accent: true },
 	];
 	const MENU_WIDTH = 210;
 	const MENU_ROW = 36;
@@ -1206,7 +1268,15 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 			if (!on) return;
 			count += 1;
 			const chip = chipFrame(index);
-			chipText(chip, item.chip?.() ?? item.name);
+			const text = chipText(chip, item.chip?.() ?? item.name);
+			if (item.accent) {
+				chip.BackgroundColor3 = COLORS.accent;
+				text.TextColor3 = COLORS.dark;
+				// The item's glyph in front of the text (menuIcon positions itself; a holder keeps it in the chip's layout).
+				const glyph = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromOffset(16, 24), LayoutOrder: 0 }, chip);
+				const icon = menuIcon(glyph, item.icon, COLORS.dark);
+				icon.Position = new UDim2(0, 0, 0.5, 0);
+			}
 			removeButton(chip, 2, () => {
 				item.set?.(false);
 				paintToggles();
@@ -1642,6 +1712,112 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		paintProposal(message);
 	};
 
+	/**
+	 * Creator Store results (toolbox_results): a grid of up to 6 tiles inside the reply (no ScrollingFrame of its own; the
+	 * transcript scrolls). Cells keep their shape through a UIAspectRatioConstraint on the grid; 2 columns on narrow
+	 * panels, 3 on wide ones. A tap shows the asset's id and details in one selectable line.
+	 */
+	const addToolboxResults = (message: Message, tiles: ClaudeToolboxTile[]) => {
+		if (tiles.size() === 0) return addNote(message, "No Toolbox results", DIMMER);
+		const frame = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: message.segments.size() + 1 }, message.reply);
+		message.segments.push({ kind: "toolbox", frame });
+		make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 6) }, frame);
+		const grid = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: 1 }, frame);
+		const layout = make("UIGridLayout", { SortOrder: Enum.SortOrder.LayoutOrder, CellPadding: UDim2.fromOffset(6, 6), CellSize: new UDim2(1 / 3, -4, 0, 200) }, grid);
+		make("UIAspectRatioConstraint", { AspectRatio: 0.66, DominantAxis: Enum.DominantAxis.Width }, layout);
+		let columns = 0;
+		const fitColumns = () => {
+			const wanted = grid.AbsoluteSize.X > 0 && grid.AbsoluteSize.X < 380 ? 2 : 3;
+			if (wanted === columns) return;
+			columns = wanted;
+			layout.CellSize = new UDim2(1 / wanted, -math.ceil((6 * (wanted - 1)) / wanted), 0, 200);
+		};
+		fitColumns();
+		trove.connect(grid.GetPropertyChangedSignal("AbsoluteSize"), fitColumns);
+		const detail = label("", DIMMER, SMALL, false);
+		detail.LayoutOrder = 2;
+		detail.Visible = false;
+		detail.Parent = frame;
+		let shownId: number | undefined;
+		makeSelectable(detail, () => (shownId !== undefined ? tostring(shownId) : ""));
+		tiles.forEach((tile, index) => {
+			if (index >= 6) return;
+			const cell = make("TextButton", { AutoButtonColor: false, Text: "", BackgroundColor3: COLORS.row, BorderSizePixel: 0, ClipsDescendants: true, LayoutOrder: index }, grid);
+			corner(cell, 8);
+			pad(cell, 4, 4);
+			make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 2) }, cell);
+			const thumb = make("ImageLabel", { BackgroundColor3: CODE_BG, BorderSizePixel: 0, Size: UDim2.fromScale(1, 1), Image: toolboxThumb(tile.id), ScaleType: Enum.ScaleType.Fit, LayoutOrder: 1 }, cell);
+			make("UIAspectRatioConstraint", { AspectRatio: 1, DominantAxis: Enum.DominantAxis.Width }, thumb);
+			corner(thumb, 6);
+			const line = (text: string, color: Color3, order: number, rich = false) => {
+				const result = style(make("TextLabel", { BackgroundTransparency: 1, RichText: rich, LayoutOrder: order }, cell), text, 13, color, FONT);
+				result.TextWrapped = false;
+				result.TextTruncate = Enum.TextTruncate.AtEnd;
+				result.Size = new UDim2(1, 0, 0, 15);
+				return result;
+			};
+			line(stripEmoji(tile.name), COLORS.text, 2);
+			const creator = make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, 15), LayoutOrder: 3 }, cell);
+			make("UIListLayout", { FillDirection: Enum.FillDirection.Horizontal, VerticalAlignment: Enum.VerticalAlignment.Center, SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 3) }, creator);
+			if (tile.verified) verifiedMark(creator, 1);
+			const who = style(make("TextLabel", { BackgroundTransparency: 1, LayoutOrder: 2 }, creator), stripEmoji(tile.creator), 13, tile.verified ? COLORS.dim : COLORS.warn, FONT);
+			who.TextWrapped = false;
+			who.TextTruncate = Enum.TextTruncate.AtEnd;
+			who.Size = new UDim2(1, tile.verified ? -15 : 0, 1, 0);
+			line(toolboxFacts(tile), DIMMER, 4, true);
+			trove.connect(cell.Activated, () => {
+				shownId = tile.id;
+				const parts = [`${tile.type} ${tile.id}`];
+				if (tile.triangles !== undefined) parts.push(`${compactNumber(tile.triangles)} tris`);
+				if (tile.voteCount !== undefined) parts.push(`${compactNumber(tile.voteCount)} votes`);
+				if (!tile.verified) parts.push("unverified");
+				detail.Text = parts.join(" · ");
+				detail.Visible = true;
+			});
+		});
+	};
+
+	/** A toolbox insert that is in the server now: thumbnail, where it went, Remove (its inserter only). */
+	const insertCards = new Map<string, Frame>();
+	const addInsertedCard = (message: Message, insert: ClaudeToolboxInsert) => {
+		if (insertCards.has(insert.insertId)) return;
+		const frame = make(
+			"Frame",
+			{ BackgroundColor3: COLORS.header, BorderSizePixel: 0, Size: new UDim2(1, 0, 0, 56), LayoutOrder: message.segments.size() + 1 },
+			message.reply,
+		);
+		message.segments.push({ kind: "toolbox", frame });
+		insertCards.set(insert.insertId, frame);
+		corner(frame, 10);
+		make("UIStroke", { Color: COLORS.stroke, Thickness: 1, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, frame);
+		const thumb = make("ImageLabel", { BackgroundColor3: CODE_BG, BorderSizePixel: 0, Position: UDim2.fromOffset(8, 8), Size: UDim2.fromOffset(40, 40), Image: toolboxThumb(insert.assetId) }, frame);
+		make("UIAspectRatioConstraint", { AspectRatio: 1 }, thumb);
+		corner(thumb, 6);
+		const title = style(make("TextLabel", { BackgroundTransparency: 1, Position: UDim2.fromOffset(56, 9), Size: new UDim2(1, -150, 0, LINE) }, frame), `Inserted ${stripEmoji(insert.name)}`, SMALL, COLORS.text, FONT);
+		title.TextWrapped = false;
+		title.TextTruncate = Enum.TextTruncate.AtEnd;
+		const where = style(make("TextLabel", { BackgroundTransparency: 1, Position: UDim2.fromOffset(56, 29), Size: new UDim2(1, -150, 0, LINE) }, frame), stripEmoji(insert.path), 13, DIMMER, FONT);
+		where.TextWrapped = false;
+		where.TextTruncate = Enum.TextTruncate.AtEnd;
+		const remove = style(make("TextButton", { AutoButtonColor: true, AnchorPoint: new Vector2(1, 0.5), Position: new UDim2(1, -10, 0.5, 0), Size: UDim2.fromOffset(80, 30) }, frame), "Remove", SMALL, COLORS.bad, Enum.Font.BuilderSansMedium);
+		remove.TextXAlignment = Enum.TextXAlignment.Center;
+		remove.BackgroundColor3 = COLORS.button;
+		corner(remove, 8);
+		trove.connect(remove.Activated, () =>
+			spawn(() => {
+				remove.Visible = false;
+				const [ok, reply] = call("claude.toolboxRemove", { insertId: insert.insertId });
+				const answer = (typeIs(reply, "table") ? reply : {}) as { ok?: boolean; error?: string };
+				if (!ok || answer.ok !== true) {
+					remove.Visible = true;
+					return notify(errorText(ok ? answer.error : reply), COLORS.bad);
+				}
+				title.Text = `Removed ${stripEmoji(insert.name)}`;
+				title.TextColor3 = DIMMER;
+			}),
+		);
+	};
+
 	/** Applies new events to a message: text streams into its block, tools become one line, errors one red line. */
 	const applyEvents = (message: Message, events: ClaudeEvent[]) => {
 		for (const event of events) {
@@ -1743,6 +1919,8 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 				addProposalCard(message, event);
 			} else if (event.kind === "image" && event.image !== undefined) {
 				addImageBlock(message, event.image);
+			} else if (event.kind === "toolbox_results" && event.tiles !== undefined) {
+				addToolboxResults(message, event.tiles);
 			} else if (event.kind === "error") {
 				addNote(message, errorText(event.text), COLORS.bad);
 			} else if (event.kind === "status" && event.state === undefined) {
@@ -1814,6 +1992,7 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		copyButtons.clear();
 		for (const [, card] of approvalCards) card.Destroy();
 		approvalCards.clear();
+		insertCards.clear(); // their frames went with the messages
 		active = undefined;
 		paintComposer();
 		paintEmpty();
@@ -1866,22 +2045,165 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 	};
 
 	// run_luau approvals: one card per snippet waiting for this dev, under the transcript.
-	const decide = (id: string, decision: string) =>
+	const decide = (id: string, decision: string, options?: ClaudeToolboxOptions) =>
 		spawn(() => {
 			const card = approvalCards.get(id);
 			if (card) {
 				approvalCards.delete(id);
 				card.Destroy();
 			}
-			const [ok, reply] = call("claude.approve", { id, decision });
+			const [ok, reply] = call("claude.approve", options ? { id, decision, options } : { id, decision });
 			const answer = (typeIs(reply, "table") ? reply : {}) as { ok?: boolean; error?: string };
 			if (!ok || answer.ok !== true) notify(errorText(ok ? answer.error : reply), COLORS.warn);
 		});
+
+	/** A rounded button for the approval cards. */
+	const cardButton = (parent: Instance, text: string, color: Color3, textColor: Color3, index: number, onClick: () => void) => {
+		const b = style(make("TextButton", { AutoButtonColor: true, LayoutOrder: index }), text, SMALL, textColor, Enum.Font.BuilderSansMedium);
+		b.TextXAlignment = Enum.TextXAlignment.Center;
+		b.TextWrapped = false;
+		b.BackgroundColor3 = color;
+		b.Size = UDim2.fromOffset(0, ROUND);
+		b.AutomaticSize = Enum.AutomaticSize.X;
+		corner(b, 8);
+		pad(b, 0, 12);
+		b.Parent = parent;
+		trove.connect(b.Activated, onClick);
+		return b;
+	};
+
+	/** A checkbox row (a stroked box with a Frame-drawn check). */
+	const checkRow = (parent: Instance, text: string, order: number, get: () => boolean, set: (on: boolean) => void, onChange?: () => void) => {
+		const row = make("TextButton", { AutoButtonColor: false, Text: "", BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, 26), LayoutOrder: order }, parent);
+		const box = make("Frame", { BackgroundTransparency: 1, AnchorPoint: new Vector2(0, 0.5), Position: new UDim2(0, 0, 0.5, 0), Size: UDim2.fromOffset(18, 18) }, row);
+		corner(box, 4);
+		make("UIStroke", { Color: COLORS.dim, Thickness: 2, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, box);
+		const check = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 1) }, box);
+		make("Frame", { BackgroundColor3: COLORS.accent, BorderSizePixel: 0, Position: UDim2.fromOffset(2, 9), Size: UDim2.fromOffset(6, 2), Rotation: 45 }, check);
+		make("Frame", { BackgroundColor3: COLORS.accent, BorderSizePixel: 0, Position: UDim2.fromOffset(5, 7), Size: UDim2.fromOffset(11, 2), Rotation: -50 }, check);
+		const caption = style(make("TextLabel", { BackgroundTransparency: 1, Position: UDim2.fromOffset(28, 0), Size: new UDim2(1, -28, 1, 0) }, row), text, SMALL, COLORS.text, FONT);
+		caption.TextWrapped = false;
+		const paint = () => (check.Visible = get());
+		paint();
+		trove.connect(row.Activated, () => {
+			set(!get());
+			paint();
+			onChange?.();
+		});
+		return row;
+	};
+
+	/**
+	 * A toolbox insert waiting for this dev (plans/14): the dev machine's snapshot (name, creator, verified, votes), this
+	 * server's scan of what loaded, warnings, Anchor and an off-by-default "Keep scripts", then Insert / Deny. No
+	 * "always": every insert is its own decision.
+	 */
+	const toolboxApprovalCard = (approval: ClaudeApproval, info: ClaudeToolboxApproval): Frame => {
+		order += 1;
+		const card = make(
+			"Frame",
+			{ BackgroundColor3: COLORS.header, BorderSizePixel: 0, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: order + 1_000_000 },
+			list,
+		);
+		corner(card, 12);
+		make("UIStroke", { Color: COLORS.accent, Thickness: 1, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, card);
+		pad(card, 10, 12);
+		make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 6) }, card);
+		const asset = info.asset;
+		const head = make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, 72), LayoutOrder: 1 }, card);
+		const thumb = make("ImageLabel", { BackgroundColor3: CODE_BG, BorderSizePixel: 0, Size: UDim2.fromOffset(72, 72), Image: toolboxThumb(asset.id) }, head);
+		make("UIAspectRatioConstraint", { AspectRatio: 1 }, thumb);
+		corner(thumb, 8);
+		const facts = make("Frame", { BackgroundTransparency: 1, Position: UDim2.fromOffset(82, 2), Size: new UDim2(1, -82, 1, -2) }, head);
+		make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 3) }, facts);
+		const oneLine = (text: string, color: Color3, order_: number, rich = true) => {
+			const result = label(text, color, SMALL, rich);
+			result.TextWrapped = false;
+			result.TextTruncate = Enum.TextTruncate.AtEnd;
+			result.AutomaticSize = Enum.AutomaticSize.None;
+			result.Size = new UDim2(1, 0, 0, LINE);
+			result.LayoutOrder = order_;
+			return result;
+		};
+		oneLine(`<b>Insert ${escapeRich(stripEmoji(asset.name))}?</b>`, COLORS.text, 1).Parent = facts;
+		const creatorRow = make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, LINE), LayoutOrder: 2 }, facts);
+		make("UIListLayout", { FillDirection: Enum.FillDirection.Horizontal, VerticalAlignment: Enum.VerticalAlignment.Center, SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 4) }, creatorRow);
+		const creator = style(make("TextLabel", { BackgroundTransparency: 1, LayoutOrder: 1 }, creatorRow), stripEmoji(asset.creator), SMALL, asset.verified ? COLORS.dim : COLORS.warn, FONT);
+		creator.TextWrapped = false;
+		creator.Size = UDim2.fromOffset(0, LINE);
+		creator.AutomaticSize = Enum.AutomaticSize.X;
+		if (asset.verified) verifiedMark(creatorRow, 2);
+		if (asset.upPercent !== undefined) {
+			const votes = style(make("TextLabel", { BackgroundTransparency: 1, LayoutOrder: 3 }, creatorRow), `${asset.upPercent}%${asset.voteCount !== undefined ? ` · ${compactNumber(asset.voteCount)}` : ""}`, SMALL, DIMMER, FONT);
+			votes.TextWrapped = false;
+			votes.Size = UDim2.fromOffset(0, LINE);
+			votes.AutomaticSize = Enum.AutomaticSize.X;
+		}
+		oneLine(`${asset.type} ${asset.id}${asset.triangles !== undefined ? ` · ${compactNumber(asset.triangles)} tris` : ""}`, DIMMER, 3, false).Parent = facts;
+		let row = 2;
+		const fact = (name: string, value: string, color = DIMMER) => {
+			row += 1;
+			const line = label(`<font color="${hex(DIMMER)}">${name}</font>  ${value}`, color, SMALL, true);
+			line.LayoutOrder = row;
+			line.Parent = card;
+			return line;
+		};
+		if (info.found) fact("Found", `${info.found.parts} parts · ${info.found.meshParts} MeshParts · ${info.found.scripts} scripts`, COLORS.text);
+		const options: ClaudeToolboxOptions = { anchor: true, keepScripts: false };
+		const removes = () => {
+			const r = info.removes;
+			if (!r) return "";
+			const parts = new Array<string>();
+			if (r.scripts > 0 && !options.keepScripts) parts.push(`${r.scripts} scripts`);
+			if (r.remotes > 0) parts.push(`${r.remotes} remotes`);
+			if (r.other > 0) parts.push(`${r.other} other`);
+			return parts.size() > 0 ? parts.join(" · ") : "nothing";
+		};
+		const removesLine = info.removes ? fact("Removes", removes(), COLORS.text) : undefined;
+		fact("Goes to", escapeRich(info.goesTo), COLORS.text);
+		for (const warning of info.warnings) {
+			row += 1;
+			const line = label(escapeRich(warning), COLORS.warn, SMALL, false);
+			line.LayoutOrder = row;
+			line.Parent = card;
+		}
+		if (info.reason !== undefined) {
+			// Claude's reason: context, not an instruction.
+			row += 1;
+			const line = label(`<i>${escapeRich(stripEmoji(info.reason))}</i>`, DIMMER, SMALL, true);
+			line.LayoutOrder = row;
+			line.Parent = card;
+		}
+		checkRow(card, "Anchor", (row += 1), () => options.anchor, (on) => (options.anchor = on));
+		if (info.keepable !== undefined && info.keepable.size() > 0) {
+			// Off by default (spike T4). Game code can't read Script.Source: only names and places can be shown.
+			const kept = label(escapeRich(info.keepable.join("\n")), COLORS.warn, 13, true);
+			checkRow(card, "Keep scripts (sandboxed)", (row += 1), () => options.keepScripts, (on) => (options.keepScripts = on), () => {
+				kept.Visible = options.keepScripts;
+				if (removesLine) removesLine.Text = `<font color="${hex(DIMMER)}">Removes</font>  ${removes()}`;
+			});
+			kept.LayoutOrder = (row += 1);
+			kept.Visible = false;
+			kept.Parent = card;
+		}
+		const buttons = make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, ROUND), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: (row += 1) }, card);
+		make("UIListLayout", { FillDirection: Enum.FillDirection.Horizontal, SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 6), Wraps: true }, buttons);
+		cardButton(buttons, "Insert", COLORS.accent, COLORS.dark, 1, () => decide(approval.id, "insert", { anchor: options.anchor, keepScripts: options.keepScripts }));
+		cardButton(buttons, "Deny", COLORS.button, COLORS.bad, 2, () => decide(approval.id, "deny", { anchor: options.anchor, keepScripts: false }));
+		return card;
+	};
+
 	const showApprovals = (approvals: ClaudeApproval[]) => {
 		const wanted = new Set<string>();
 		for (const approval of approvals) {
 			wanted.add(approval.id);
 			if (approvalCards.has(approval.id)) continue;
+			if (approval.kind === "toolbox" && approval.toolbox !== undefined) {
+				const toolboxCard = toolboxApprovalCard(approval, approval.toolbox);
+				popIn(toolboxCard);
+				approvalCards.set(approval.id, toolboxCard);
+				continue;
+			}
 			order += 1;
 			const card = make(
 				"Frame",
@@ -1971,6 +2293,7 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 			failures = 0;
 			showApprovals(answer.approvals ?? []);
 			applyEvents(message, answer.events ?? []);
+			for (const insert of answer.inserts ?? []) addInsertedCard(message, insert);
 			message.cursor = math.max(message.cursor, answer.next ?? message.cursor);
 			message.state = answer.state ?? message.state;
 			message.commit = answer.commit ?? message.commit;
@@ -2145,6 +2468,9 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 			// "My logs": this client's whole log history (all kinds, timestamps), newest ~64 KB. The server caps it again.
 			if (state.attachMyLogs === true) request.clientLogs = formatLogHistory(kernel.logs(undefined, 2000));
 			if (state.attachServerLogs === true) request.serverLogs = true;
+			// "Toolbox": the Creator Store for this message only.
+			const toolbox = state.toolbox === true;
+			if (toolbox) request.toolbox = true;
 			const myView = view;
 			const [ok, reply] = call("claude.prompt", request);
 			sending = false;
@@ -2170,6 +2496,8 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 			notify("");
 			box.Text = "";
 			state.draft = "";
+			// The Toolbox chip is one-shot: the next message needs it picked again (plans/14 Q2).
+			if (toolbox) state.toolbox = undefined;
 			// The screenshots went with this message: off the composer, remembered for its bubble (the newest 30).
 			shots = shots.filter((shot) => !sentShots.includes(shot));
 			state.shots ??= new Map();

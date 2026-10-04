@@ -29,9 +29,11 @@ import type {
 	ClaudeProposal,
 	ClaudeRequestView,
 	ClaudeSessionView,
+	ClaudeToolboxOptions,
 	DevOp,
 } from "./protocol";
 import { CLAUDE_IMAGE_CHUNK, cleanAttachmentIds, cleanCrop, cleanImageMeta, decodeImageChunk } from "./claude-images";
+import { ToolboxGate, cleanTiles, insertsFor, newToolboxStore, removeToolboxInsert, toolboxInsert, type ToolboxAsk, type ToolboxStore } from "./toolbox-server";
 import { CODE_ALPHABET, CODE_LENGTH, CODE_SECRET_LENGTH, codeFingerprint, sha256 } from "./sha256";
 
 /**
@@ -67,6 +69,12 @@ import { CODE_ALPHABET, CODE_LENGTH, CODE_SECRET_LENGTH, codeFingerprint, sha256
  * when no poll is open.
  * run_luau needs the dev's approval in their chat (or "always" for that chat) and LoadStringEnabled; every run is
  * logged (description and outcome, never the code) and the last 20 are kept.
+ *
+ * TOOLBOX (plans/14): claude.prompt forwards `toolbox: true` only when the dev picked "Toolbox" in the "+" menu for that
+ * message, and records the prompt id (ToolboxGate). A toolbox_insert request is served only for such a prompt and only
+ * for an asset id that a toolbox_results event of the conversation carried through this server; each insert shows its
+ * own approval card (Insert / Deny, no "always"; claude.approve with {anchor, keepScripts}); toolbox-server.ts loads,
+ * sanitizes and places it. "claude.toolboxRemove" removes an insert (its inserter only).
  *
  * TUNNEL BINDING (security audit H1). Announcements come from MessagingService or the MemoryStore share, and anything
  * that can run code in this universe can write both, so every announcement goes through onMessage's checks:
@@ -112,7 +120,7 @@ const MAX_TOKEN = 4096;
 const PAIR_MAX = 5;
 const PAIR_WINDOW = 60;
 const FINISHED_STATES = new Set(["deployed", "discarded", "answered", "failed", "cancelled", "lost"]);
-const EVENT_KINDS = new Set<string>(["assistant_text", "tool_use", "tool_result", "status", "error", "deploy_proposal", "image"]);
+const EVENT_KINDS = new Set<string>(["assistant_text", "tool_use", "tool_result", "status", "error", "deploy_proposal", "image", "toolbox_results"]);
 const PROPOSAL_STATUSES = new Set<string>(["pending", "deploying", "deployed", "discarded", "expired", "failed"]);
 const MAX_PROPOSAL_FILES = 50;
 /** Session ids remembered with their URL (a sid is bound to the first URL heard for it). */
@@ -193,6 +201,8 @@ interface Store {
 	boundUrls?: Map<string, string>;
 	/** run_luau audit records written by this server (the <n> of audit/<date>/<JobId>/<n>). Added later. */
 	auditSeq?: number;
+	/** Creator Store gate (prompts sent with the Toolbox chip, relayed result ids) and inserts (plans/14). Added later. */
+	toolbox?: ToolboxStore;
 }
 
 /** What the dev's server-side tools need from the devtools server. */
@@ -263,6 +273,13 @@ function cleanEvent(raw: unknown): ClaudeEvent | undefined {
 		if (!image) return undefined;
 		event.image = image;
 		event.text = event.text.sub(1, 200);
+	}
+	if (kind === "toolbox_results") {
+		// Creator Store result cards: strangers' text, re-checked field by field (toolbox-server.ts cleanTile).
+		const tiles = cleanTiles(data.tiles);
+		if (!tiles) return undefined;
+		event.tiles = tiles;
+		event.text = event.text.sub(1, 120);
 	}
 	return event;
 }
@@ -377,6 +394,22 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	const store = kernel.persist<Store>(PERSIST_KEY, () => ({ requests: [], sent: new Map(), pairings: new Map() }));
 	if (store.pairings === undefined) store.pairings = new Map();
 	const pairings = store.pairings;
+	if (store.toolbox === undefined) store.toolbox = newToolboxStore();
+	const toolboxStore = store.toolbox;
+	/** Gate 2 of plans/14: prompts this server sent with the Toolbox chip, and the ids their searches returned. */
+	const toolboxGate = new ToolboxGate(toolboxStore);
+	/** Remembers the asset ids of relayed toolbox_results events for the prompt's conversation. */
+	const noteToolboxResults = (conversationId: string | undefined, promptId: string, events: ClaudeEvent[]) => {
+		for (const event of events) {
+			if (event.kind !== "toolbox_results" || !event.tiles) continue;
+			toolboxGate.rememberResults(conversationId ?? promptId, event.tiles.map((tile) => tile.id));
+		}
+	};
+	/** The player's toolbox inserts for a prompt still in the server (the inserted cards with Remove). */
+	const toolboxInsertsFor = (player: Player, promptId: string) => {
+		const list = insertsFor(toolboxStore, player.UserId, promptId);
+		return list.size() > 0 ? list : undefined;
+	};
 	/** run_luau snippets waiting for a player's approval (set up in the game tools section below). */
 	let approvalsFor: (player: Player) => ClaudeApproval[] | undefined = () => undefined;
 	/** What the long-poll brought per prompt: contiguous events from `start`, and the prompt's latest fields. */
@@ -807,9 +840,12 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 
 		recent.push(now);
 		store.sent.set(player.UserId, recent);
-		const body: { prompt: string; mode: ClaudeMode; context: typeof context; conversationId?: string; attachments?: string[] } = { prompt, mode, context };
+		const body: { prompt: string; mode: ClaudeMode; context: typeof context; conversationId?: string; attachments?: string[]; toolbox?: boolean } = { prompt, mode, context };
 		if (conversationId !== undefined) body.conversationId = conversationId;
 		if (attachments.size() > 0) body.attachments = attachments;
+		// The dev picked "Toolbox" in the "+" menu for this message (one message only; the client clears the chip).
+		const toolbox = request.toolbox === true;
+		if (toolbox) body.toolbox = true;
 		const result = authed(session, player.UserId, "POST", "/v1/prompts", body);
 		if (!result.ok) {
 			// The dev machine forgot the chat (it restarted): the client starts a new one.
@@ -835,6 +871,8 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		};
 		store.requests.push(record);
 		while (store.requests.size() > MAX_RECORDS) store.requests.shift();
+		// Only prompts sent with the chip may insert (a toolbox_insert for any other prompt id is refused unloaded).
+		if (toolbox) toolboxGate.allowPrompt(id);
 		return { ok: true, request: view(record, player) };
 	});
 
@@ -924,6 +962,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 				next: nextIndex,
 				more: nextIndex < cached.start + cached.events.size(),
 				approvals: approvalsFor(player),
+				inserts: toolboxInsertsFor(player, id),
 			};
 		}
 		const result = authed(session, player.UserId, "GET", `/v1/prompts/${id}?since=${since}`);
@@ -944,6 +983,8 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		if (partial && partial.fields === undefined) partial.fields = reply;
 		const state = shortString(reply.state, 20) ?? "queued";
 		const nextIndex = shortNumber(reply.next);
+		const events = cleanEvents(reply.events, MAX_EVENTS);
+		noteToolboxResults(isServerId(reply.conversationId) ? reply.conversationId : record?.conversationId, id, events);
 		return {
 			ok: true,
 			id,
@@ -957,10 +998,11 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 			costUsd: shortNumber(reply.costUsd),
 			mode: cleanMode(reply.mode),
 			proposal: cleanProposal(reply.proposal),
-			events: cleanEvents(reply.events, MAX_EVENTS),
+			events,
 			next: nextIndex !== undefined ? math.max(since, math.floor(nextIndex)) : since,
 			more: reply.more === true,
 			approvals: approvalsFor(player),
+			inserts: toolboxInsertsFor(player, id),
 		};
 	});
 
@@ -1010,6 +1052,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 			if (!isServerId(id) || !typeIs(prompt, "string")) continue;
 			const state = shortString(data.state, 20) ?? "queued";
 			let events = cleanEvents(data.events, 400);
+			noteToolboxResults(payload, id, events);
 			let size = 0;
 			for (const event of events) size += event.text.size();
 			if (size > budget) events = [];
@@ -1146,34 +1189,58 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		return list.size() > 0 ? list : undefined;
 	};
 
-	const settleApproval = (id: string, decision: string) => {
+	const settleApproval = (id: string, decision: string, options?: ClaudeToolboxOptions) => {
 		const pending = pendingApprovals.get(id);
 		if (!pending) return;
 		pendingApprovals.delete(id);
 		if (coroutine.status(pending.timeout) === "suspended") task.cancel(pending.timeout);
-		if (coroutine.status(pending.thread) === "suspended") task.spawn(pending.thread, decision);
+		if (coroutine.status(pending.thread) === "suspended") task.spawn(pending.thread, decision, options);
 	};
 
-	/** Asks the dev in their chat; yields until they answer or APPROVAL_SECONDS pass. "once" | "always" | "deny". */
-	const askApproval = (userId: number, approval: Omit<ClaudeApproval, "expiresIn">): string => {
+	/** Shows an approval card in the dev's chat; yields until they answer or APPROVAL_SECONDS pass ("timeout"). */
+	const ask = (userId: number, approval: Omit<ClaudeApproval, "expiresIn">): LuaTuple<[string, ClaudeToolboxOptions | undefined]> => {
 		const thread = coroutine.running();
 		const timeout = task.delay(APPROVAL_SECONDS, () => settleApproval(approval.id, "timeout"));
 		pendingApprovals.set(approval.id, { userId, approval: { ...approval, expiresIn: APPROVAL_SECONDS }, expiresAt: os.clock() + APPROVAL_SECONDS, thread, timeout });
-		return coroutine.yield()[0] as string;
+		// coroutine.yield returns the resumed values as a tuple: pack them.
+		const [decision, options] = coroutine.yield() as LuaTuple<[string, ClaudeToolboxOptions | undefined]>;
+		return $tuple(decision, options);
 	};
 
+	/** run_luau: "once" | "always" | "deny" | "timeout". */
+	const askApproval = (userId: number, approval: Omit<ClaudeApproval, "expiresIn">): string => ask(userId, { ...approval, kind: "luau" })[0];
+
+	/** A toolbox insert card (plans/14): "insert" | "deny" | "timeout", with the card's options. Never "always". */
+	const askToolbox = (userId: number, card: ToolboxAsk) =>
+		ask(userId, { id: card.id, kind: "toolbox", description: card.description, code: "", conversationId: card.conversationId, toolbox: card.toolbox });
+
 	ops.set("claude.approve", (player, payload) => {
-		const request = (typeIs(payload, "table") ? payload : {}) as { id?: unknown; decision?: unknown };
+		const request = (typeIs(payload, "table") ? payload : {}) as { id?: unknown; decision?: unknown; options?: unknown };
 		const id = request.id;
 		const decision = request.decision;
-		if (!typeIs(id, "string") || !typeIs(decision, "string") || !["once", "always", "deny"].includes(decision)) return fail("bad_request");
+		if (!typeIs(id, "string") || !typeIs(decision, "string")) return fail("bad_request");
 		const pending = pendingApprovals.get(id);
 		if (!pending || pending.userId !== player.UserId) return fail("not_found");
+		if (pending.approval.kind === "toolbox") {
+			// Each insert is its own decision: Insert or Deny only, never "once"/"always".
+			if (decision !== "insert" && decision !== "deny") return fail("bad_request");
+			const raw = (typeIs(request.options, "table") ? request.options : {}) as { anchor?: unknown; keepScripts?: unknown };
+			settleApproval(id, decision, { anchor: raw.anchor !== false, keepScripts: raw.keepScripts === true });
+			return { ok: true };
+		}
+		if (!["once", "always", "deny"].includes(decision)) return fail("bad_request");
 		if (decision === "always" && pending.approval.conversationId !== undefined) {
 			alwaysRun.set(`${player.UserId}:${pending.approval.conversationId}`, true);
 		}
 		settleApproval(id, decision);
 		return { ok: true };
+	});
+
+	// The inserted card's Remove: only the dev who inserted it, only on a dev-channel server.
+	ops.set("claude.toolboxRemove", (player, payload) => {
+		const request = (typeIs(payload, "table") ? payload : {}) as { insertId?: unknown };
+		if (!kernel.isDev(player)) return fail("not_allowed");
+		return removeToolboxInsert(player, request.insertId, toolboxStore, kernel.channel);
 	});
 
 	// Client-realm requests to the dev's own client (inspect / find on their DataModel).
@@ -1316,6 +1383,17 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 			const localId = typeIs(shot.localId, "string") && shot.localId.size() <= 128 && matches(shot.localId, "^[%w%._:/{}%-]+$") ? shot.localId : undefined;
 			return { ok: true, data: HttpService.JSONEncode({ captureTime: math.floor(shot.captureTime), localId, placeId: game.PlaceId }) };
 		}
+		if (tool === "toolbox_insert") {
+			// Creator Store insert (plans/14): chip-gated prompt, id from this conversation's relayed search, dev channel,
+			// a per-insert approval card (no "always"), load into nothing, sanitize, then parent (toolbox-server.ts).
+			return toolboxInsert(player, request, {
+				gate: toolboxGate,
+				store: toolboxStore,
+				channel: () => kernel.channel,
+				ask: (target, card) => askToolbox(target.UserId, card),
+				stillAllowed: (target) => target.Parent !== undefined && kernel.isDev(target) && kernel.channel === "dev",
+			});
+		}
 		if (tool === "run_luau") {
 			const code = request.args !== undefined && typeIs(args.code, "string") ? args.code : "";
 			const description = shortString(request.description, 120) ?? "luau";
@@ -1395,6 +1473,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 			if (entry.type === "event" && isServerId(entry.promptId)) {
 				const event = cleanEvent(entry.event);
 				if (!event) continue;
+				if (event.kind === "toolbox_results") noteToolboxResults(find(session, entry.promptId)?.conversationId, entry.promptId, [event]);
 				let cached = cache.get(entry.promptId);
 				if (cached && event.i !== cached.start + cached.events.size()) {
 					// A gap: drop it (reads fall back to HTTP for this prompt).
