@@ -73,6 +73,8 @@ const CLAUDE_POLL = 2.5;
 const MAX_LOG_ROWS = 300;
 const HEADER = 46;
 const TAB_WIDTH = 116;
+/** Gap between the body (right of the tabs) and the window's right and bottom borders. */
+const BODY_MARGIN = 8;
 /** Artifact rows shown per branch before "Show all". */
 const ARTIFACTS_PER_BRANCH = 6;
 const PERSIST_KEY = "typetorch/devtools";
@@ -1279,6 +1281,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		}
 		ui.content.CanvasPosition = Vector2.zero;
 		const page = Page.mount(ui.content);
+		pad(page.frame, 10, 10);
 		tabTrove.add(page.frame);
 		const toolbar = () => {
 			const row = tabTrove!.add(buttonRow());
@@ -1483,9 +1486,12 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			window,
 		);
 		verticalList(body, 0);
+		// Right/bottom margin, so scrollbars, buttons and fields never touch the window border.
+		make("UIPadding", { PaddingRight: new UDim(0, BODY_MARGIN), PaddingBottom: new UDim(0, BODY_MARGIN) }, body);
+		// No UIPadding on the ScrollingFrame itself: it shifts scale-width children without shrinking them, so they
+		// overflow the right edge. selectTab pads the Page inside it instead.
 		const content = scrolling(body, { Name: "Content", Size: UDim2.fromScale(1, 1), LayoutOrder: 3 });
 		make("UIFlexItem", { FlexMode: Enum.UIFlexMode.Fill }, content);
-		pad(content, 10, 10);
 
 		// Resize grip (bottom-right, touch-sized): two diagonal strokes.
 		const grip = make(

@@ -53,6 +53,7 @@ const SPLIT = TOUCH ? 16 : 10;
 /** Inner padding of both panes, so text never touches the edge or sits under the scrollbar. */
 const INSET = 10;
 const TREE_TOP = 4;
+const TREE_LEFT = 4;
 const AUTO_REFRESH = 3;
 const ICONS = "rbxasset://textures/ClassImages.PNG";
 const STALE = "explorer: stale";
@@ -269,8 +270,9 @@ export function mountExplorer(parent: GuiObject, deps: ExplorerDeps): () => void
 		);
 	const treePane = pane("Tree");
 	// The one ScrollingFrame that sets CanvasSize itself: rows x ROW px, drawn by a pool of reusable rows.
+	// No UIPadding on ScrollingFrames: it shifts scale-width children without shrinking them, so they overflow the
+	// right edge. Rows are inset by their own Position/Size instead (bind, makeSlot).
 	const tree = scroller(treePane, false);
-	make("UIPadding", { PaddingTop: new UDim(0, TREE_TOP), PaddingLeft: new UDim(0, 4), PaddingRight: new UDim(0, INSET) }, tree);
 	const splitter = make("TextButton", { Text: "", AutoButtonColor: false, BackgroundTransparency: 1 }, body);
 	const grip = make("Frame", { AnchorPoint: new Vector2(0.5, 0.5), Position: UDim2.fromScale(0.5, 0.5) }, splitter);
 	grip.BackgroundColor3 = COLORS.stroke;
@@ -279,7 +281,13 @@ export function mountExplorer(parent: GuiObject, deps: ExplorerDeps): () => void
 	const propsPane = pane("Properties");
 	// Script-free: AutomaticCanvasSize + a list layout.
 	const props = scroller(propsPane, true);
-	make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 2) }, props);
+	// The padding lives on a plain inner Frame (see the tree note above); rows go into propsList.
+	const propsList = make(
+		"Frame",
+		{ Name: "List", BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y },
+		props,
+	);
+	make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 2) }, propsList);
 	make(
 		"UIPadding",
 		{
@@ -288,7 +296,7 @@ export function mountExplorer(parent: GuiObject, deps: ExplorerDeps): () => void
 			PaddingLeft: new UDim(0, 8),
 			PaddingRight: new UDim(0, INSET),
 		},
-		props,
+		propsList,
 	);
 
 	const statusBar = make("Frame", { BackgroundTransparency: 1, AnchorPoint: new Vector2(0, 1) }, root);
@@ -380,7 +388,7 @@ export function mountExplorer(parent: GuiObject, deps: ExplorerDeps): () => void
 	const bind = (slot: Slot, entry: Entry, index: number) => {
 		slot.entry = entry;
 		slot.frame.Visible = true;
-		slot.frame.Position = UDim2.fromOffset(0, index * ROW);
+		slot.frame.Position = UDim2.fromOffset(TREE_LEFT, TREE_TOP + index * ROW);
 		const row = nodes.get(entry.id);
 		const plain = entry.more || entry.divider;
 		// Tree rows: indent + chevron column. Search results: flat, no chevrons.
@@ -512,7 +520,7 @@ export function mountExplorer(parent: GuiObject, deps: ExplorerDeps): () => void
 	const makeSlot = (): Slot => {
 		const frame = make("TextButton", { Text: "", AutoButtonColor: false, BorderSizePixel: 0, Visible: false }, tree);
 		frame.BackgroundColor3 = COLORS.selection;
-		frame.Size = new UDim2(1, 0, 0, ROW);
+		frame.Size = new UDim2(1, -(TREE_LEFT + INSET), 0, ROW);
 		const toggleButton = make("TextButton", { Text: "", BackgroundTransparency: 1, Size: UDim2.fromOffset(ROW, ROW) }, frame);
 		const bars = [bar(toggleButton, 7), bar(toggleButton, 7)];
 		const icon = make("ImageLabel", { BackgroundTransparency: 1, Image: ICONS, ImageRectSize: new Vector2(16, 16) }, frame);
@@ -720,7 +728,13 @@ export function mountExplorer(parent: GuiObject, deps: ExplorerDeps): () => void
 		return panel;
 	};
 	const listIn = (panel: Frame, automatic: boolean) => {
-		const list = scroller(panel as Frame, automatic);
+		const scroll = scroller(panel as Frame, automatic);
+		// Items go into a plain inner Frame that carries the padding (see the tree note).
+		const list = make(
+			"Frame",
+			{ Name: "List", BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y },
+			scroll,
+		);
 		make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 2) }, list);
 		make("UIPadding", { PaddingTop: new UDim(0, 4), PaddingBottom: new UDim(0, 4), PaddingLeft: new UDim(0, 4), PaddingRight: new UDim(0, 4) }, list);
 		return list;
@@ -829,7 +843,7 @@ export function mountExplorer(parent: GuiObject, deps: ExplorerDeps): () => void
 		const place = <T extends GuiObject>(gui: T): T => {
 			order += 1;
 			gui.LayoutOrder = order;
-			gui.Parent = props;
+			gui.Parent = propsList;
 			return propsTrove.add(gui);
 		};
 		const line = (height = PROP) => place(make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, height) }));
