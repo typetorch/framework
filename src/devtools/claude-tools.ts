@@ -188,6 +188,45 @@ export function playerList(): unknown[] {
 	});
 }
 
+/** "My logs" / "Server logs" attachments: about 64 KB each, newest lines kept. */
+export const LOG_ATTACH_BYTES = 64 * 1024;
+
+/**
+ * Log entries as text, one `[HH:MM:SS] kind text` line each (UTC), oldest first, keeping the newest lines that fit in
+ * `maxBytes`; a first line says how many older lines were dropped.
+ */
+export function formatLogHistory(entries: ReadonlyArray<{ t: number; kind: string; text: string }>, maxBytes = LOG_ATTACH_BYTES): string {
+	const lines = new Array<string>();
+	let bytes = 0;
+	let dropped = 0;
+	for (let index = entries.size() - 1; index >= 0; index--) {
+		const entry = entries[index];
+		const line = `[${os.date("!%H:%M:%S", entry.t)}] ${entry.kind} ${entry.text.gsub("[\r\n]+", " ")[0]}`;
+		if (bytes + line.size() + 1 > maxBytes - 64) {
+			dropped = index + 1;
+			break;
+		}
+		lines.push(line);
+		bytes += line.size() + 1;
+	}
+	const ordered = new Array<string>();
+	if (dropped > 0) ordered.push(`(${dropped} older lines dropped)`);
+	for (let index = lines.size() - 1; index >= 0; index--) ordered.push(lines[index]);
+	return ordered.join("\n");
+}
+
+/** A log text from a client, capped to its newest `maxBytes` (cut at a line start, with a note). */
+export function capLogText(text: string, maxBytes = LOG_ATTACH_BYTES): string {
+	const clean = text.gsub(string.char(0), "")[0];
+	if (clean.size() <= maxBytes) return clean;
+	let tail = clean.sub(clean.size() - maxBytes + 64);
+	const [newline] = tail.find("\n", 1, true);
+	if (newline !== undefined) tail = tail.sub(newline + 1);
+	// No line break: don't start in the middle of a UTF-8 character (continuation bytes are 0x80..0xBF).
+	while (tail.size() > 0 && string.byte(tail, 1)[0] >= 0x80 && string.byte(tail, 1)[0] < 0xc0) tail = tail.sub(2);
+	return `(older lines dropped)\n${tail}`;
+}
+
 /** True when this server may compile code (ServerScriptService.LoadStringEnabled). */
 export function loadstringAvailable(): boolean {
 	const [ok, fn] = pcall(() => loadstring("return 1")[0]);
@@ -202,9 +241,90 @@ export interface LuauResult {
 	ms: number;
 }
 
+/** Services a run_luau snippet can't get through `game` (security audit M4). */
+export const BLOCKED_SERVICES = new ReadonlySet<string>(["MessagingService", "DataStoreService", "MemoryStoreService", "HttpService"]);
+
+function blockedService(value: unknown): string | undefined {
+	return typeIs(value, "Instance") && BLOCKED_SERVICES.has(value.ClassName) ? value.ClassName : undefined;
+}
+
+function refuse(what: string): never {
+	error(`run_luau: ${what} is not available to snippets`, 3);
+}
+
+/** A method result with blocked services refused (one value) or filtered out (an array of instances). */
+function screened(value: unknown): unknown {
+	const blocked = blockedService(value);
+	if (blocked !== undefined) refuse(blocked);
+	if (typeIs(value, "table")) {
+		const list = value as defined[];
+		if (list.size() > 0 && typeIs(list[0], "Instance")) return list.filter((item) => blockedService(item) === undefined);
+	}
+	return value;
+}
+
 /**
- * Runs `code` in a fresh environment: `player`, `kernel`, `persist(key)`, a `print` / `warn` that also capture their
- * output (each line still goes to the server log with a "[claude]" prefix), and every global through __index.
+ * The `game` a snippet sees: every member of the real DataModel, except that GetService / FindService / service,
+ * direct indexing (game.HttpService) and child lookups never hand out MessagingService, DataStoreService,
+ * MemoryStoreService or HttpService (GetChildren-style lists leave them out). The real `game` is passed to every
+ * method. Defense in depth, not a sandbox: `workspace.Parent`, getfenv and other globals still reach the real game.
+ */
+export function guardedGame(): unknown {
+	const real = game as unknown as Record<string, unknown>;
+	const proxy = {};
+	const unwrap = (value: unknown) => (value === proxy ? game : value);
+	setmetatable(proxy, {
+		__index: (_: unknown, key: unknown) => {
+			if (typeIs(key, "string") && BLOCKED_SERVICES.has(key)) refuse(key);
+			const value = real[key as string];
+			if (typeIs(value, "function")) {
+				const method = value as (...args: unknown[]) => unknown;
+				return (_self: unknown, ...args: defined[]) => {
+					if ((key === "GetService" || key === "FindService" || key === "service" || key === "getService") && typeIs(args[0], "string")) {
+						if (BLOCKED_SERVICES.has(args[0])) refuse(args[0]);
+					}
+					// The proxy passed as an argument (game:IsAncestorOf(x) style) becomes the real game.
+					for (let index = 0; index < args.size(); index++) if (args[index] === proxy) args[index] = game;
+					return screened(method(game, ...args));
+				};
+			}
+			return screened(value);
+		},
+		__newindex: (_: unknown, key: unknown, value: unknown) => {
+			real[key as string] = unwrap(value);
+		},
+		__tostring: () => game.Name,
+	} as unknown as LuaMetatable<object>);
+	return proxy;
+}
+
+/** Folders whose ModuleScripts a snippet may not require: the kernel and the running generations. */
+function guardedRequire(): (module: unknown) => unknown {
+	const roots = (): Instance[] => {
+		const list = new Array<Instance>();
+		for (const [service, name] of [
+			["ServerScriptService", "TypeTorchKernel"],
+			["ServerStorage", "TypeTorch"],
+			["ReplicatedStorage", "TypeTorch"],
+			["ReplicatedStorage", "TypeTorchKernelShared"],
+		] as const) {
+			const folder = game.GetService(service).FindFirstChild(name);
+			if (folder) list.push(folder);
+		}
+		return list;
+	};
+	return (module: unknown) => {
+		if (typeIs(module, "Instance") && roots().some((root) => module === root || module.IsDescendantOf(root))) refuse("the TypeTorch kernel and its modules");
+		return (require as (module: unknown) => unknown)(module);
+	};
+}
+
+/**
+ * Runs `code` in a minimal environment (security audit M4): `player`, a `print` / `warn` that also capture their
+ * output (each line still goes to the server log with a "[claude]" prefix), a guarded `game`/`Game` (guardedGame) and
+ * `require` (no kernel or generation modules), and the other globals through __index. No `kernel` or `persist`.
+ * This is defense in depth, not a sandbox: loadstring code can still reach the real game (workspace.Parent, getfenv,
+ * shared modules) and from there everything; a real sandbox (a Luau-in-Luau VM) is planned (plans/12 batch D).
  * Gives up waiting after `timeoutSeconds` (a non-yielding infinite loop is only stopped by Roblox's script timeout).
  */
 export function runLuau(code: string, globals: Record<string, unknown>, timeoutSeconds: number): LuauResult {
@@ -220,9 +340,13 @@ export function runLuau(code: string, globals: Record<string, unknown>, timeoutS
 		if (kind === "warn") warn(`[claude] ${line}`);
 		else print(`[claude] ${line}`);
 	};
+	const sandboxGame = guardedGame();
 	const env = setmetatable(
 		{
 			...globals,
+			game: sandboxGame,
+			Game: sandboxGame,
+			require: guardedRequire(),
 			print: (...args: unknown[]) => capture("print", ...args),
 			warn: (...args: unknown[]) => capture("warn", ...args),
 		} as Record<string, unknown>,

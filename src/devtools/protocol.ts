@@ -87,21 +87,46 @@ export interface ClaudeSessionView {
 	requests: ClaudeRequestView[];
 }
 
+/** live: act on this server (run_luau with approval), no file edits; code: edit the branch, deploy after approval. */
+export type ClaudeMode = "live" | "code";
+
 /** What the client sends with op "claude.prompt". */
 export interface ClaudePromptRequest {
 	prompt: string;
+	/** Default "live". */
+	mode?: ClaudeMode;
 	/** Selected dex instance, e.g. "server game/Workspace/Coins". */
 	path?: string;
-	/** Attach the server's last errors. */
-	errors?: boolean;
-	/** The client's last errors. */
-	clientErrors?: string[];
+	/** "My logs": the client's log history as text (newest kept, about 64 KB; the server caps it again). */
+	clientLogs?: string;
+	/** "Server logs": attach this server's log history (gathered on the server). */
+	serverLogs?: boolean;
 	/** Continue this conversation (Claude resumes its session); absent = a new chat. */
 	conversationId?: string;
 }
 
-/** Terminal states: deployed | committed | answered | failed | cancelled (plus "lost" when the dev machine forgot it). */
-export type ClaudeEventKind = "assistant_text" | "tool_use" | "tool_result" | "status" | "error";
+/**
+ * Terminal states: deployed | discarded | committed | answered | failed | cancelled (plus "lost" when the dev machine
+ * forgot it). "proposed" (a code change waits for Deploy / Discard) and "building" are not terminal.
+ */
+export type ClaudeEventKind = "assistant_text" | "tool_use" | "tool_result" | "status" | "error" | "deploy_proposal";
+
+/** One changed file of a deploy proposal (-1 lines = binary). */
+export interface ClaudeFileChange {
+	path: string;
+	added: number;
+	removed: number;
+}
+
+/** A code change waiting for (or past) the requesting dev's Deploy / Discard. */
+export interface ClaudeProposal {
+	status: "pending" | "deploying" | "deployed" | "discarded" | "expired" | "failed";
+	commit: string;
+	/** Unix seconds. */
+	expiresAt: number;
+	files: ClaudeFileChange[];
+	error?: string;
+}
 
 /** One event of a prompt (dev-server GET /v1/prompts/:id?since=n), already redacted by the dev machine. */
 export interface ClaudeEvent {
@@ -116,6 +141,12 @@ export interface ClaudeEvent {
 	state?: string;
 	/** Game tools: the input (run_luau code) on tool_use, the full result on tool_result (capped). */
 	detail?: string;
+	/** tool_use / tool_result: the tool_use id that pairs a result with its call. */
+	ref?: string;
+	/** deploy_proposal: the commit, the changed files and when it expires (unix s). */
+	commit?: string;
+	files?: ClaudeFileChange[];
+	expiresAt?: number;
 }
 
 /** A run_luau snippet waiting for the requesting dev's approval (shown in their chat). */
@@ -150,6 +181,9 @@ export interface ClaudeEventsReply {
 	more?: boolean;
 	/** run_luau snippets waiting for this player's approval. */
 	approvals?: ClaudeApproval[];
+	mode?: ClaudeMode;
+	/** A code change waiting for (or past) Deploy / Discard. */
+	proposal?: ClaudeProposal;
 }
 
 export interface ClaudeConversationSummary {
@@ -164,6 +198,8 @@ export interface ClaudeMessage {
 	id: string;
 	prompt: string;
 	state: string;
+	mode?: ClaudeMode;
+	proposal?: ClaudeProposal;
 	finished: boolean;
 	summary?: string;
 	commit?: string;

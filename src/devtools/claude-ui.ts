@@ -1,4 +1,4 @@
-import { TextService, UserInputService } from "@rbxts/services";
+import { GuiService, HttpService, TextService, UserInputService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import type { ClientKernel } from "../kernel";
 import { popIn, popOut } from "../ui";
@@ -9,10 +9,13 @@ import type {
 	ClaudeEvent,
 	ClaudeEventsReply,
 	ClaudeMessage,
+	ClaudeMode,
 	ClaudePromptRequest,
+	ClaudeProposal,
 	ClaudeRequestView,
 	ClaudeSessionView,
 } from "./protocol";
+import { formatLogHistory } from "./claude-tools";
 import { chevron, COLORS, corner, escapeRich, hex, make, pad, SIDE_BUTTON, sideButton, style } from "./widgets";
 
 /**
@@ -25,8 +28,13 @@ import { chevron, COLORS, corner, escapeRich, hex, make, pad, SIDE_BUTTON, sideB
  *     one red line; three animated dots while a run is active. It sticks to the bottom unless the dev scrolls up, and
  *     a round button scrolls back down;
  *   - bottom: the composer, always visible: a growing message box (1 to 5 lines, then it scrolls), a "+" menu with the
- *     Dex path / Errors context toggles (shown as chips when on) and a round Send button that becomes Stop while a
- *     run is active.
+ *     Dex path / My logs / Server logs context toggles (shown as chips when on), the Live / Code mode toggle (each user
+ *     bubble shows the mode it was sent in) and a round Send button that becomes Stop while a run is active.
+ *   - tool calls are one line with a short result; tapping one shows its input and output (game-data wrappers removed,
+ *     JSON pretty-printed); results are paired with their calls by tool_use id;
+ *   - a code-mode change that touched files ends in a deploy card (files with +/- lines): Deploy or Discard, by the
+ *     requester, within 15 minutes;
+ *   - reply blocks and bubbles are selectable: a tap swaps the block for a read-only text box with everything selected.
  * Follow-ups continue the open conversation (the dev machine resumes the same Claude Code session); the open
  * conversation survives swaps through the kernel persist store. Debug lines (model, turns, cost, session ids) never
  * show. Everything lives in the tab's trove; the tab's own content ScrollingFrame is hidden while it is open.
@@ -51,12 +59,17 @@ const BUBBLE_BG = COLORS.header;
 const CODE_BG = Color3.fromRGB(13, 14, 18);
 const CODE_TEXT = Color3.fromRGB(205, 210, 222);
 const DIMMER = Color3.fromRGB(118, 124, 138);
+/** A tool line's short result, a step darker than the line. */
+const RESULT_DIM = Color3.fromRGB(88, 94, 106);
 
 /** Short text for the error codes of devtools/claude.ts and the dev machine. */
 const ERRORS: Record<string, string> = {
 	not_connected: "Not connected: start the dev server on this branch",
 	needs_pairing: "Pair first",
-	bad_code: "Wrong or expired code",
+	bad_code: "Wrong, used or expired code",
+	code_mismatch: "That code is for another tunnel: use the newest code",
+	code_busy: "Another code change is pending",
+	already_decided: "Already decided",
 	not_allowed: "Not on the session's user list",
 	prod_channel: "Claude works on dev-channel servers only",
 	busy: "Wait for the running prompt",
@@ -90,7 +103,80 @@ interface ChatState {
 	conversationId?: string;
 	draft: string;
 	attachPath: boolean;
-	attachErrors: boolean;
+	/** Older generations stored an "Errors" toggle; "My logs" replaced it. */
+	attachErrors?: boolean;
+	/** "My logs": this client's whole log history. */
+	attachMyLogs?: boolean;
+	/** "Server logs": the server's log history. */
+	attachServerLogs?: boolean;
+	/** The mode for a new chat (the last one picked). */
+	mode?: ClaudeMode;
+	/** The mode each conversation used last. */
+	modes?: Map<string, ClaudeMode>;
+}
+
+/** Strips RichText tags and entities: the text a label shows. */
+function visibleText(rich: string): string {
+	return rich
+		.gsub("<[^>]+>", "")[0]
+		.gsub("&lt;", "<")[0]
+		.gsub("&gt;", ">")[0]
+		.gsub("&quot;", '"')[0]
+		.gsub("&apos;", "'")[0]
+		.gsub("&amp;", "&")[0];
+}
+
+/**
+ * Clicking (or tapping without dragging) `target` swaps it, in place and with the same size and font, for a read-only
+ * TextBox holding `plain()` with everything selected, so Ctrl+C copies it at once and dragging selects part of it.
+ * FocusLost swaps back. A RichText TextBox would show its tags while focused, hence the swap. `hide` are extra GUIs
+ * covered by the box (a list marker). The connections die with the label.
+ */
+function makeSelectable(target: TextLabel, plain: () => string, cover?: { position: UDim2; size: UDim2; hide: GuiObject[] }) {
+	let down: Vector2 | undefined;
+	target.InputBegan.Connect((input) => {
+		if (input.UserInputType === Enum.UserInputType.MouseButton1 || input.UserInputType === Enum.UserInputType.Touch) down = new Vector2(input.Position.X, input.Position.Y);
+	});
+	target.InputEnded.Connect((input) => {
+		const start = down;
+		down = undefined;
+		if (start === undefined || !target.Visible) return;
+		if (input.UserInputType !== Enum.UserInputType.MouseButton1 && input.UserInputType !== Enum.UserInputType.Touch) return;
+		if (new Vector2(input.Position.X, input.Position.Y).sub(start).Magnitude > 8) return; // a drag or a scroll
+		const text = plain();
+		if (text === "") return;
+		const box = make("TextBox", {
+			Name: "Selectable",
+			BackgroundTransparency: 1,
+			ClearTextOnFocus: false,
+			TextEditable: false,
+			MultiLine: true,
+			RichText: false,
+			Text: text,
+			Font: target.Font,
+			TextSize: target.TextSize,
+			TextColor3: target.TextColor3,
+			TextWrapped: target.TextWrapped,
+			TextXAlignment: target.TextXAlignment,
+			TextYAlignment: Enum.TextYAlignment.Top,
+			AnchorPoint: target.AnchorPoint,
+			Position: cover?.position ?? target.Position,
+			Size: cover?.size ?? target.Size,
+			AutomaticSize: target.AutomaticSize,
+			LayoutOrder: target.LayoutOrder,
+			ZIndex: target.ZIndex,
+		});
+		const hidden = [target, ...(cover?.hide ?? [])];
+		for (const gui of hidden) gui.Visible = false;
+		box.Parent = target.Parent;
+		box.FocusLost.Once(() => {
+			for (const gui of hidden) if (gui.Parent !== undefined) gui.Visible = true;
+			box.Destroy();
+		});
+		box.CaptureFocus();
+		box.SelectionStart = 1;
+		box.CursorPosition = text.size() + 1;
+	});
 }
 
 /** The parts of the dev menu's TabContext this tab uses (client.ts passes its own). */
@@ -285,6 +371,11 @@ function label(text: string, color: Color3, size = TEXT_SIZE, rich = true): Text
 	return result;
 }
 
+/** "Live" or "Code". */
+function modeName(mode: ClaudeMode): string {
+	return mode === "live" ? "Live" : "Code";
+}
+
 function roundButton(parent: Instance, color: Color3): TextButton {
 	const button = make(
 		"TextButton",
@@ -339,9 +430,12 @@ function createBlock(block: Block): Rendered {
 		text.Position = UDim2.fromOffset(left + 28, 0);
 		text.Size = new UDim2(1, -(left + 28), 0, 0);
 		text.Parent = row;
+		// Selected as one line with its bullet or number; the box covers the marker column too.
+		makeSelectable(text, () => `${marker.Text} ${visibleText(text.Text)}`, { position: UDim2.fromOffset(left, 0), size: new UDim2(1, -left, 0, 0), hide: [marker] });
 		return { key: blockKey(block), gui: row, text, marker };
 	}
 	const text = label("", COLORS.text);
+	makeSelectable(text, () => visibleText(text.Text));
 	return { key: blockKey(block), gui: text, text };
 }
 
@@ -414,12 +508,19 @@ function menuIcon(parent: Instance, kind: string, color: Color3) {
 		bar(5, 7, 10, 3);
 		bar(5, 13, 10, 3);
 		bar(2, 4, 2, 11);
-	} else if (kind === "errors") {
-		const ring = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromOffset(16, 16) }, box);
-		corner(ring, 8);
-		make("UIStroke", { Color: color, Thickness: 2, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, ring);
-		bar(7, 3, 2, 6);
-		bar(7, 11, 2, 2);
+	} else if (kind === "logs") {
+		// A page of lines.
+		bar(1, 2, 14, 2);
+		bar(1, 7, 10, 2);
+		bar(1, 12, 13, 2);
+	} else if (kind === "server") {
+		// Two stacked server boxes with a light each.
+		for (const y of [1, 9]) {
+			const unit = make("Frame", { BackgroundTransparency: 1, Position: UDim2.fromOffset(0, y), Size: UDim2.fromOffset(16, 6) }, box);
+			corner(unit, 2);
+			make("UIStroke", { Color: color, Thickness: 2, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, unit);
+			bar(11, y + 2, 2, 2);
+		}
 	} else {
 		// A camera: a body and a lens.
 		const body = make("Frame", { BackgroundTransparency: 1, Position: UDim2.fromOffset(0, 3), Size: UDim2.fromOffset(16, 11) }, box);
@@ -441,9 +542,78 @@ interface ToolSegment {
 	resultDetail?: string;
 	failed: boolean;
 	dot: Frame;
+	/** The one line: the call, then a short dim result. */
+	line: TextLabel;
+	/** Built on the first tap only: collapsed by default. */
+	details?: TextBox;
 }
 
-type Segment = { kind: "text"; block?: number; text: string; holder: Frame; rendered: Rendered[]; dirty: boolean } | ToolSegment | { kind: "note"; line: TextLabel };
+/** The deploy card of a code change (deploy_proposal). */
+interface ProposalCard {
+	kind: "proposal";
+	frame: Frame;
+	status: TextLabel;
+	buttons: Frame;
+	expiresAt: number;
+	busy: boolean;
+}
+
+type Segment =
+	| { kind: "text"; block?: number; text: string; holder: Frame; rendered: Rendered[]; dirty: boolean }
+	| ToolSegment
+	| ProposalCard
+	| { kind: "note"; line: TextLabel };
+
+const DETAIL_CHARS = 1500;
+
+/** A JSON value, indented two spaces per level, objects with sorted keys. */
+function prettyJson(value: unknown, indent = ""): string {
+	if (typeIs(value, "table")) {
+		const keys = new Array<string | number>();
+		for (const [key] of pairs(value as object)) keys.push(key as string | number);
+		if (keys.size() === 0) return "{}";
+		const inner = `${indent}  `;
+		const list = value as defined[];
+		if (list.size() === keys.size()) return `[\n${list.map((item) => inner + prettyJson(item, inner)).join(",\n")}\n${indent}]`;
+		const names = keys.map((key) => tostring(key));
+		names.sort();
+		const object = value as Record<string, unknown>;
+		return `{\n${names.map((name) => `${inner}${HttpService.JSONEncode(name)}: ${prettyJson(object[name], inner)}`).join(",\n")}\n${indent}}`;
+	}
+	if (typeIs(value, "string")) return HttpService.JSONEncode(value);
+	return tostring(value);
+}
+
+/**
+ * Tool input or output for people: the <untrusted-game-data> wrapper (Claude needs it, the dev doesn't) and its
+ * \u003c / \u003e escapes removed, JSON pretty-printed, capped.
+ */
+function readableDetail(text: string): string {
+	const lines = new Array<string>();
+	for (const line of text.split("\n")) {
+		if (line.match("^%s*<untrusted%-game%-data.*>%s*$")[0] !== undefined || line.match("^%s*</untrusted%-game%-data>%s*$")[0] !== undefined) continue;
+		lines.push(line);
+	}
+	let out = lines.join("\n").gsub("\\u003c", "<")[0].gsub("\\u003e", ">")[0];
+	out = out.match("^%s*(.-)%s*$")[0] as string;
+	// The whole thing, or each line, may be JSON.
+	const [ok, decoded] = pcall(() => HttpService.JSONDecode(out));
+	if (ok && typeIs(decoded, "table")) out = prettyJson(decoded);
+	else {
+		const pretty = new Array<string>();
+		for (const line of out.split("\n")) {
+			const first = line.sub(1, 1);
+			let value: unknown;
+			if (first === "{" || first === "[") {
+				const [lineOk, decodedLine] = pcall(() => HttpService.JSONDecode(line));
+				if (lineOk) value = decodedLine;
+			}
+			pretty.push(typeIs(value, "table") ? prettyJson(value) : line);
+		}
+		out = pretty.join("\n");
+	}
+	return out.size() > DETAIL_CHARS ? `${out.sub(1, DETAIL_CHARS)}\n...` : out;
+}
 
 interface Message {
 	id: string;
@@ -457,12 +627,17 @@ interface Message {
 	commit?: string;
 	artifactId?: string;
 	error?: string;
+	mode: ClaudeMode;
+	proposal?: ClaudeProposal;
 	frame: Frame;
 	bubble: Frame;
 	reply: Frame;
 	segments: Segment[];
+	/** tool_use id → its line (results are matched by id, not by order). */
+	tools: Map<string, ToolSegment>;
 	outcome: TextLabel;
 	dots: Frame;
+	modeTag: TextLabel;
 }
 
 // The tab -------------------------------------------------------------------------------------------------------------
@@ -737,7 +912,8 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 	});
 	fitBox();
 
-	const actions = make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, ROUND), LayoutOrder: 3 }, composer);
+	// The actions row draws above the message box (the "+" menu hangs over it).
+	const actions = make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, ROUND), LayoutOrder: 3, ZIndex: 5 }, composer);
 	const plusButton = roundButton(actions, COLORS.button);
 	for (const [w, h] of [
 		[12, 2],
@@ -749,6 +925,36 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 			plusButton,
 		);
 	}
+	// Live / Code: which tools Claude gets for the next message (remembered per conversation). A pill next to "+".
+	const modeButton = make(
+		"TextButton",
+		{ AutoButtonColor: true, Text: "", BackgroundColor3: COLORS.button, BorderSizePixel: 0, Position: UDim2.fromOffset(ROUND + 6, 0), Size: UDim2.fromOffset(0, ROUND), AutomaticSize: Enum.AutomaticSize.X },
+		actions,
+	);
+	corner(modeButton, ROUND / 2);
+	make("UIPadding", { PaddingLeft: new UDim(0, 10), PaddingRight: new UDim(0, 12) }, modeButton);
+	make("UIListLayout", { FillDirection: Enum.FillDirection.Horizontal, VerticalAlignment: Enum.VerticalAlignment.Center, Padding: new UDim(0, 6), SortOrder: Enum.SortOrder.LayoutOrder }, modeButton);
+	const modeDot = make("Frame", { BorderSizePixel: 0, Size: UDim2.fromOffset(8, 8), LayoutOrder: 1 }, modeButton);
+	corner(modeDot, 4);
+	const modeText = style(make("TextLabel", { BackgroundTransparency: 1, LayoutOrder: 2 }, modeButton), "", SMALL, COLORS.text, Enum.Font.BuilderSansMedium);
+	modeText.TextWrapped = false;
+	modeText.Size = UDim2.fromOffset(0, ROUND);
+	modeText.AutomaticSize = Enum.AutomaticSize.X;
+	state.modes ??= new Map();
+	const modes = state.modes;
+	const currentMode = (): ClaudeMode => (state.conversationId !== undefined ? modes.get(state.conversationId) : undefined) ?? state.mode ?? "live";
+	const paintMode = () => {
+		const mode = currentMode();
+		modeText.Text = modeName(mode);
+		modeDot.BackgroundColor3 = mode === "live" ? COLORS.good : COLORS.info;
+	};
+	trove.connect(modeButton.Activated, () => {
+		const picked: ClaudeMode = currentMode() === "live" ? "code" : "live";
+		state.mode = picked;
+		if (state.conversationId !== undefined) modes.set(state.conversationId, picked);
+		paintMode();
+	});
+	paintMode();
 	const sendButton = roundButton(actions, COLORS.accent);
 	sendButton.AnchorPoint = new Vector2(1, 0);
 	sendButton.Position = UDim2.fromScale(1, 0);
@@ -761,8 +967,8 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 	);
 	corner(stopIcon, 2);
 
-	// "+" menu: a floating panel above the "+" button (like the desktop app's): toggles with a checkmark when on, items
-	// for later dimmed. It closes on an outside click or Escape.
+	// "+" menu: a floating panel just above the "+" button (like the desktop app's): toggles with a checkmark when on,
+	// items for later dimmed. It closes on an outside click or Escape.
 	interface MenuItem {
 		name: string;
 		icon: string;
@@ -772,43 +978,41 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 	}
 	const items: MenuItem[] = [
 		{ name: "Dex path", icon: "dex", get: () => state.attachPath, set: (on) => (state.attachPath = on) },
-		{ name: "Errors", icon: "errors", get: () => state.attachErrors, set: (on) => (state.attachErrors = on) },
+		{ name: "My logs", icon: "logs", get: () => state.attachMyLogs === true, set: (on) => (state.attachMyLogs = on) },
+		{ name: "Server logs", icon: "server", get: () => state.attachServerLogs === true, set: (on) => (state.attachServerLogs = on) },
 		{ name: "Screenshot", icon: "camera", disabled: true },
 	];
 	const MENU_WIDTH = 210;
 	const MENU_ROW = 36;
+	const MENU_PAD = 6;
+	const MENU_GAP = 2;
+	// A fixed size (no AutomaticSize): the shadow matches it exactly, also while the pop animation scales both.
+	const MENU_HEIGHT = items.size() * MENU_ROW + (items.size() - 1) * MENU_GAP + MENU_PAD * 2;
+	// The holder lives in `middle` (no layout; host's UIListLayout would stack it at the top) and is positioned in
+	// middle's coordinates, so its bottom-left sits just above the "+" button. Its UIScale pops panel and shadow together.
 	const menu = make(
 		"Frame",
-		{
-			Name: "PlusMenu",
-			BackgroundColor3: COLORS.header,
-			BorderSizePixel: 0,
-			AnchorPoint: new Vector2(0, 1),
-			Size: UDim2.fromOffset(MENU_WIDTH, 0),
-			AutomaticSize: Enum.AutomaticSize.Y,
-			Visible: false,
-			ZIndex: 20,
-		},
-		// In `middle` (no layout), not `host`: host's UIListLayout would stack the menu and its shadow at the top.
+		{ Name: "PlusMenu", BackgroundTransparency: 1, AnchorPoint: new Vector2(0, 1), Size: UDim2.fromOffset(MENU_WIDTH, MENU_HEIGHT), Visible: false, ZIndex: 20 },
 		middle,
 	);
-	corner(menu, 12);
-	make("UIStroke", { Color: COLORS.stroke, Thickness: 1, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, menu);
-	pad(menu, 6, 6);
-	make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 2) }, menu);
-	// Soft shadow: a darker, larger rounded frame behind the panel.
+	// Soft shadow: offset down-right, behind the panel.
 	const shadow = make(
 		"Frame",
-		{ BackgroundColor3: Color3.fromRGB(0, 0, 0), BackgroundTransparency: 0.6, BorderSizePixel: 0, AnchorPoint: new Vector2(0, 1), Visible: false, ZIndex: 19 },
-		middle,
+		{ BackgroundColor3: Color3.fromRGB(0, 0, 0), BackgroundTransparency: 0.6, BorderSizePixel: 0, Position: UDim2.fromOffset(2, 3), Size: UDim2.fromScale(1, 1), ZIndex: 19 },
+		menu,
 	);
-	corner(shadow, 14);
+	corner(shadow, 12);
+	const panel = make("Frame", { BackgroundColor3: COLORS.header, BorderSizePixel: 0, Size: UDim2.fromScale(1, 1), ZIndex: 20 }, menu);
+	corner(panel, 12);
+	make("UIStroke", { Color: COLORS.stroke, Thickness: 1, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, panel);
+	pad(panel, MENU_PAD, MENU_PAD);
+	make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, MENU_GAP) }, panel);
 	const checks = new Map<MenuItem, Frame>();
 	items.forEach((item, index) => {
 		const row = make(
 			"TextButton",
 			{ AutoButtonColor: false, Text: "", BackgroundColor3: COLORS.button, BackgroundTransparency: 1, BorderSizePixel: 0, Size: new UDim2(1, 0, 0, MENU_ROW), LayoutOrder: index, ZIndex: 21 },
-			menu,
+			panel,
 		);
 		corner(row, 8);
 		const color = item.disabled ? DIMMER : COLORS.text;
@@ -831,37 +1035,43 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 			paintToggles();
 		});
 	});
-	const closeMenu = () => {
-		if (!menu.Visible) return;
-		shadow.Visible = false;
-		popOut(menu);
-	};
-	const openMenu = () => {
-		// Above the "+" button, in `middle` coordinates (the menu hangs past middle's bottom over the composer).
+	let menuOpen = false;
+	/** Bottom-left 6 px above the "+" button, kept inside `middle` horizontally; both in the same (absolute) space. */
+	const placeMenu = () => {
 		const at = plusButton.AbsolutePosition.sub(middle.AbsolutePosition);
 		const x = math.clamp(at.X, 4, math.max(4, middle.AbsoluteSize.X - MENU_WIDTH - 4));
 		menu.Position = UDim2.fromOffset(x, at.Y - 6);
-		shadow.Position = UDim2.fromOffset(x + 2, at.Y - 2);
-		popIn(menu);
-		task.defer(() => {
-			shadow.Size = UDim2.fromOffset(menu.AbsoluteSize.X, menu.AbsoluteSize.Y);
-			shadow.Visible = menu.Visible;
-		});
 	};
-	trove.connect(plusButton.Activated, () => (menu.Visible ? closeMenu() : openMenu()));
+	const closeMenu = () => {
+		if (!menuOpen) return;
+		menuOpen = false;
+		popOut(menu);
+	};
+	const openMenu = () => {
+		menuOpen = true;
+		placeMenu();
+		popIn(menu);
+	};
+	trove.connect(plusButton.Activated, () => (menuOpen ? closeMenu() : openMenu()));
+	// The window can be moved or resized while the menu is open.
+	trove.connect(middle.GetPropertyChangedSignal("AbsoluteSize"), () => menuOpen && placeMenu());
+	trove.connect(plusButton.GetPropertyChangedSignal("AbsolutePosition"), () => menuOpen && placeMenu());
 	const inside = (gui: GuiObject, point: Vector2) => {
 		const corner0 = gui.AbsolutePosition;
 		const size = gui.AbsoluteSize;
 		return point.X >= corner0.X && point.X <= corner0.X + size.X && point.Y >= corner0.Y && point.Y <= corner0.Y + size.Y;
 	};
 	trove.connect(UserInputService.InputBegan, (input) => {
-		if (!menu.Visible) return;
+		if (!menuOpen) return;
 		if (input.KeyCode === Enum.KeyCode.Escape) return closeMenu();
 		const pointer = input.UserInputType === Enum.UserInputType.MouseButton1 || input.UserInputType === Enum.UserInputType.Touch;
 		if (!pointer) return;
-		const point = new Vector2(input.Position.X, input.Position.Y);
-		// AbsolutePosition ignores the GUI inset; input positions include it when the ScreenGui ignores it, which the dev menu does.
-		if (!inside(menu, point) && !inside(plusButton, point)) closeMenu();
+		// InputObject positions exclude the top bar inset; AbsolutePosition in a ScreenGui that ignores the inset (the dev
+		// menu's) includes it. Put the point in AbsolutePosition space before comparing.
+		const screenGui = host.FindFirstAncestorOfClass("ScreenGui");
+		const inset = screenGui !== undefined && screenGui.IgnoreGuiInset ? GuiService.GetGuiInset()[0] : Vector2.zero;
+		const point = new Vector2(input.Position.X, input.Position.Y).add(inset);
+		if (!inside(panel, point) && !inside(plusButton, point)) closeMenu();
 	});
 
 	let paintToggles: () => void = () => {};
@@ -932,17 +1142,33 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 	/** tool_use event index → its one-line error label. */
 	const problems = new Map<number, TextLabel>();
 	const approvalCards = new Map<string, Frame>();
-	const buildMessage = (id: string, prompt: string): Message => {
+	const buildMessage = (id: string, prompt: string, mode: ClaudeMode): Message => {
 		order += 1;
 		const frame = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: order }, list);
 		make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 8) }, frame);
 		const userRow = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: 1 }, frame);
-		make("UIListLayout", { FillDirection: Enum.FillDirection.Horizontal, HorizontalAlignment: Enum.HorizontalAlignment.Right }, userRow);
-		const bubble = make("Frame", { BackgroundColor3: BUBBLE_BG, BorderSizePixel: 0, AutomaticSize: Enum.AutomaticSize.Y }, userRow);
+		make(
+			"UIListLayout",
+			{
+				FillDirection: Enum.FillDirection.Horizontal,
+				HorizontalAlignment: Enum.HorizontalAlignment.Right,
+				VerticalAlignment: Enum.VerticalAlignment.Bottom,
+				SortOrder: Enum.SortOrder.LayoutOrder,
+				Padding: new UDim(0, 6),
+			},
+			userRow,
+		);
+		// The mode the message was sent in: a tiny dim tag at the bubble's bottom-left.
+		const modeTag = style(make("TextLabel", { BackgroundTransparency: 1, LayoutOrder: 1 }, userRow), modeName(mode).lower(), SMALL - 2, DIMMER, FONT);
+		modeTag.TextWrapped = false;
+		modeTag.Size = UDim2.fromOffset(0, LINE);
+		modeTag.AutomaticSize = Enum.AutomaticSize.X;
+		const bubble = make("Frame", { BackgroundColor3: BUBBLE_BG, BorderSizePixel: 0, AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: 2 }, userRow);
 		corner(bubble, 14);
 		pad(bubble, 8, 12);
 		const text = label(escapeRich(prompt), COLORS.text, TEXT_SIZE, true);
 		text.Parent = bubble;
+		makeSelectable(text, () => prompt);
 		const fit = { frame: bubble, text: prompt };
 		bubbles.push(fit);
 		fitBubble(fit);
@@ -971,7 +1197,7 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 			const dotFrame = make("Frame", { BackgroundColor3: COLORS.dim, BorderSizePixel: 0, Position: UDim2.fromOffset(index * 14, 3), Size: UDim2.fromOffset(8, 8) }, dots);
 			corner(dotFrame, 4);
 		}
-		return { id, prompt, state: "queued", finished: false, cursor: 0, seen: new Set(), frame, bubble, reply, segments: [], outcome, dots };
+		return { id, prompt, state: "queued", finished: false, cursor: 0, seen: new Set(), mode, frame, bubble, reply, segments: [], tools: new Map(), outcome, dots, modeTag };
 	};
 
 	const addNote = (message: Message, text: string, color: Color3) => {
@@ -979,6 +1205,95 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		line.LayoutOrder = message.segments.size() + 1;
 		line.Parent = message.reply;
 		message.segments.push({ kind: "note", line });
+	};
+
+	const proposalCard = (message: Message) => message.segments.find((segment): segment is ProposalCard => segment.kind === "proposal");
+
+	/** The deploy card's status line and buttons, from the message state and the proposal (dev machine fields). */
+	const paintProposal = (message: Message) => {
+		const card = proposalCard(message);
+		if (!card) return;
+		const proposal = message.proposal;
+		const expiresAt = proposal?.expiresAt ?? card.expiresAt;
+		let text = "";
+		let color = DIMMER;
+		const pending = message.state === "proposed" && (proposal === undefined || proposal.status === "pending");
+		if (pending) text = `Deploy within ${math.max(1, math.ceil((expiresAt - os.time()) / 60))} min, or it is discarded`;
+		else if (message.state === "building") text = "Deploying...";
+		else if (message.state === "deployed") {
+			text = `Deployed${message.artifactId !== undefined ? ` ${message.artifactId}` : ""}`;
+			color = COLORS.good;
+		} else if (message.state === "discarded") text = proposal?.status === "expired" ? "Expired after 15 min: discarded" : "Discarded";
+		else if (message.state === "failed") {
+			text = errorText(proposal?.error ?? message.error ?? "deploy failed");
+			color = COLORS.bad;
+		} else if (message.state === "lost") text = "Lost (the dev machine restarted)";
+		card.status.Text = text;
+		card.status.TextColor3 = color;
+		card.status.Visible = text !== "";
+		card.buttons.Visible = pending && !card.busy;
+	};
+
+	/** A code change waiting for the dev: summary, changed files with +/- lines, Deploy and Discard. */
+	const addProposalCard = (message: Message, event: ClaudeEvent) => {
+		if (proposalCard(message)) return;
+		const frame = make(
+			"Frame",
+			{ BackgroundColor3: COLORS.header, BorderSizePixel: 0, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: message.segments.size() + 1 },
+			message.reply,
+		);
+		corner(frame, 12);
+		make("UIStroke", { Color: COLORS.accent, Thickness: 1, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, frame);
+		pad(frame, 10, 12);
+		make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 6) }, frame);
+		const title = label(`<b>Deploy this change?</b>  ${escapeRich(stripEmoji(event.text))}`, COLORS.text, SMALL, true);
+		title.LayoutOrder = 1;
+		title.Parent = frame;
+		const files = event.files ?? [];
+		const shown = files.filter((_, index) => index < 6);
+		const lines = shown.map((file) => {
+			const counts = file.added < 0 ? "binary" : `<font color="${hex(COLORS.good)}">+${file.added}</font> <font color="${hex(COLORS.bad)}">-${file.removed}</font>`;
+			return `${escapeRich(file.path)}  ${counts}`;
+		});
+		if (files.size() > shown.size()) lines.push(`+${files.size() - shown.size()} more files`);
+		if (lines.size() > 0) {
+			const list = label(lines.join("\n"), DIMMER, SMALL, true);
+			list.LayoutOrder = 2;
+			list.Parent = frame;
+		}
+		const buttons = make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, ROUND), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: 3 }, frame);
+		make("UIListLayout", { FillDirection: Enum.FillDirection.Horizontal, SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 6), Wraps: true }, buttons);
+		const status = label("", DIMMER, SMALL, false);
+		status.LayoutOrder = 4;
+		status.Parent = frame;
+		const card: ProposalCard = { kind: "proposal", frame, status, buttons, expiresAt: event.expiresAt ?? os.time() + 900, busy: false };
+		message.segments.push(card);
+		const decide = (decision: "deploy" | "discard") =>
+			spawn(() => {
+				card.busy = true;
+				paintProposal(message);
+				const [ok, reply] = call("claude.deploy", { id: message.id, decision });
+				card.busy = false;
+				const answer = (typeIs(reply, "table") ? reply : {}) as { ok?: boolean; error?: string };
+				if (!ok || answer.ok !== true) notify(errorText(ok ? answer.error : reply), COLORS.bad);
+				else if (decision === "deploy" && message.state === "proposed") message.state = "building";
+				paintProposal(message);
+			});
+		const button = (text: string, color: Color3, textColor: Color3, decision: "deploy" | "discard", index: number) => {
+			const b = style(make("TextButton", { AutoButtonColor: true, LayoutOrder: index }), text, SMALL, textColor, Enum.Font.BuilderSansMedium);
+			b.TextXAlignment = Enum.TextXAlignment.Center;
+			b.TextWrapped = false;
+			b.BackgroundColor3 = color;
+			b.Size = UDim2.fromOffset(0, ROUND);
+			b.AutomaticSize = Enum.AutomaticSize.X;
+			corner(b, 8);
+			pad(b, 0, 14);
+			b.Parent = buttons;
+			trove.connect(b.Activated, () => decide(decision));
+		};
+		button("Deploy", COLORS.accent, COLORS.dark, "deploy", 1);
+		button("Discard", COLORS.button, COLORS.bad, "discard", 2);
+		paintProposal(message);
 	};
 
 	/** Applies new events to a message: text streams into its block, tools become one line, errors one red line. */
@@ -999,9 +1314,14 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 					message.segments.push({ kind: "text", block: event.block, text: event.text, holder, rendered: [], dirty: true });
 				}
 			} else if (event.kind === "tool_use") {
-				const row = make("TextButton", { AutoButtonColor: false, Text: "", BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: message.segments.size() + 1 }, message.reply);
+				const row = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: message.segments.size() + 1 }, message.reply);
 				make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 2) }, row);
-				const lineRow = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: 1 }, row);
+				// Only the line is the button: clicks in the opened details (to select text) don't close them.
+				const lineRow = make(
+					"TextButton",
+					{ AutoButtonColor: false, Text: "", BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: 1 },
+					row,
+				);
 				const dotFrame = make("Frame", { BackgroundColor3: COLORS.info, BorderSizePixel: 0, Position: UDim2.fromOffset(1, 6), Size: UDim2.fromOffset(6, 6) }, lineRow);
 				corner(dotFrame, 3);
 				const line = label(escapeRich(toolLine(event)), DIMMER, SMALL, true);
@@ -1011,10 +1331,6 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 				line.Size = new UDim2(1, -14, 0, LINE);
 				line.Position = UDim2.fromOffset(14, 0);
 				line.Parent = lineRow;
-				const details = label("", DIMMER, SMALL, false);
-				details.LayoutOrder = 2;
-				details.Visible = false;
-				details.Parent = row;
 				const problem = label("", COLORS.bad, SMALL, false);
 				problem.TextWrapped = false;
 				problem.TextTruncate = Enum.TextTruncate.AtEnd;
@@ -1024,38 +1340,61 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 				problem.Visible = false;
 				problem.Parent = lineRow;
 				problems.set(event.i, problem);
-				const segment: ToolSegment = { kind: "tool", event, failed: false, dot: dotFrame };
+				const segment: ToolSegment = { kind: "tool", event, failed: false, dot: dotFrame, line };
 				message.segments.push(segment);
-				trove.connect(row.Activated, () => {
-					// Tap: the input (run_luau: the code) and the output, truncated.
-					const lines = new Array<string>();
+				if (event.ref !== undefined) message.tools.set(event.ref, segment);
+				// Collapsed by default: one line. A tap builds (once) and toggles the input and output, readable and
+				// selectable: wrappers removed, JSON pretty-printed, capped.
+				trove.connect(lineRow.Activated, () => {
+					if (segment.details) {
+						segment.details.Visible = !segment.details.Visible;
+						return;
+					}
+					const parts = new Array<string>();
 					const input = event.detail ?? event.target;
-					if (input !== undefined && input !== "") lines.push(input.sub(1, 600));
+					if (input !== undefined && input !== "") parts.push(readableDetail(input));
 					const output = segment.resultDetail ?? segment.result;
-					if (output !== undefined) lines.push(`-> ${output.sub(1, 600)}`);
-					details.Text = lines.join("\n");
-					details.Visible = !details.Visible && lines.size() > 0;
+					if (output !== undefined) parts.push(`-> ${readableDetail(output)}`);
+					if (parts.size() === 0) return;
+					const details = style(make("TextBox", { BackgroundColor3: CODE_BG, ClearTextOnFocus: false, TextEditable: false, MultiLine: true, LayoutOrder: 2 }), parts.join("\n"), SMALL, CODE_TEXT, FONT);
+					details.TextYAlignment = Enum.TextYAlignment.Top;
+					details.Size = UDim2.fromScale(1, 0);
+					details.AutomaticSize = Enum.AutomaticSize.Y;
+					corner(details, 6);
+					pad(details, 6, 8);
+					details.Parent = row;
+					segment.details = details;
 				});
 			} else if (event.kind === "tool_result") {
-				for (let index = message.segments.size() - 1; index >= 0; index--) {
-					const segment = message.segments[index];
-					if (segment.kind === "tool" && segment.result === undefined) {
-						segment.result = event.text;
-						segment.resultDetail = event.detail;
-						segment.failed = event.text.sub(1, 6) === "error:";
-						segment.dot.BackgroundColor3 = segment.failed ? COLORS.bad : DIMMER;
-						const problem = problems.get(segment.event.i);
-						if (problem && segment.failed) {
-							problem.Text = stripEmoji(event.text.sub(7).gsub("^%s+", "")[0]).sub(1, 140);
-							problem.Visible = true;
+				// Paired by tool_use id (several tools can run at once); older dev servers send none: the oldest open call.
+				let segment = event.ref !== undefined ? message.tools.get(event.ref) : undefined;
+				if (!segment && event.ref === undefined) {
+					for (const candidate of message.segments) {
+						if (candidate.kind === "tool" && candidate.result === undefined) {
+							segment = candidate;
+							break;
 						}
-						const full = `${event.text} ${event.detail ?? ""}`;
-						if (shortTool(segment.event.tool) === "run_luau" && full.find("loadstring is unavailable", 1, true)[0] !== undefined) {
-							addNote(message, "Luau is off on this server: republish the kernel place", DIMMER);
-						}
-						break;
 					}
 				}
+				if (segment && segment.result === undefined) {
+					segment.result = event.text;
+					segment.resultDetail = event.detail;
+					segment.failed = event.text.sub(1, 6) === "error:";
+					segment.dot.BackgroundColor3 = segment.failed ? COLORS.bad : DIMMER;
+					// The short result after the call, darker: "Inspected game.Workspace · done".
+					if (!segment.failed) segment.line.Text = `${escapeRich(toolLine(segment.event))}  <font color="${hex(RESULT_DIM)}">${escapeRich(stripEmoji(event.text).sub(1, 60))}</font>`;
+					const problem = problems.get(segment.event.i);
+					if (problem && segment.failed) {
+						problem.Text = stripEmoji(readableDetail(event.text.sub(7)).gsub("^%s+", "")[0]).sub(1, 140);
+						problem.Visible = true;
+					}
+					const full = `${event.text} ${event.detail ?? ""}`;
+					if (shortTool(segment.event.tool) === "run_luau" && full.find("loadstring is unavailable", 1, true)[0] !== undefined) {
+						addNote(message, "Luau is off on this server: republish the kernel place", DIMMER);
+					}
+				}
+			} else if (event.kind === "deploy_proposal") {
+				addProposalCard(message, event);
 			} else if (event.kind === "error") {
 				addNote(message, errorText(event.text), COLORS.bad);
 			} else if (event.kind === "status" && event.state === undefined) {
@@ -1079,7 +1418,10 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 
 	/** The end of a message: dots while it runs, one short line when it finished with something to say. */
 	const paintOutcome = (message: Message) => {
-		message.dots.Visible = !message.finished;
+		// A proposal waits for the dev, not for Claude: no dots then.
+		message.dots.Visible = !message.finished && message.state !== "proposed";
+		paintProposal(message);
+		const hasCard = proposalCard(message) !== undefined;
 		const copy = copyButtons.get(message.id);
 		if (copy && deps.copyText) {
 			copy.Visible = message.finished && message.segments.some((segment) => segment.kind === "text");
@@ -1091,7 +1433,8 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		let text = "";
 		let color = DIMMER;
 		if (message.finished) {
-			if (message.state === "deployed") text = `Deployed${message.artifactId !== undefined ? ` ${message.artifactId}` : ""}`;
+			if (hasCard) text = ""; // the deploy card says how it ended
+			else if (message.state === "deployed") text = `Deployed${message.artifactId !== undefined ? ` ${message.artifactId}` : ""}`;
 			else if (message.state === "committed") text = `Committed${message.commit !== undefined ? ` ${message.commit.sub(1, 7)}` : ""}`;
 			else if (message.state === "cancelled") text = "Stopped";
 			else if (message.state === "lost") text = "Lost (the dev machine restarted)";
@@ -1105,8 +1448,8 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		message.outcome.Visible = text !== "";
 	};
 
-	const addMessage = (id: string, prompt: string) => {
-		const message = buildMessage(id, prompt);
+	const addMessage = (id: string, prompt: string, mode: ClaudeMode) => {
+		const message = buildMessage(id, prompt, mode);
 		messages.push(message);
 		paintOutcome(message);
 		paintEmpty();
@@ -1127,8 +1470,9 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 	};
 
 	const fromStored = (stored: ClaudeMessage) => {
-		const message = addMessage(stored.id, stored.prompt);
+		const message = addMessage(stored.id, stored.prompt, stored.mode ?? "live");
 		message.state = stored.state;
+		message.proposal = stored.proposal;
 		message.finished = stored.finished;
 		message.cursor = stored.next;
 		message.commit = stored.commit;
@@ -1147,6 +1491,7 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		clearTranscript();
 		const myView = view;
 		state.conversationId = id;
+		paintMode();
 		notify("Loading...");
 		const [ok, reply] = call("claude.conversation", id);
 		if (myView !== view) return;
@@ -1277,6 +1622,7 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 			message.commit = answer.commit ?? message.commit;
 			message.artifactId = answer.artifactId ?? message.artifactId;
 			message.error = answer.runError ?? message.error;
+			message.proposal = answer.proposal ?? message.proposal;
 			message.finished = answer.finished === true;
 			paintOutcome(message);
 			if (message.finished) {
@@ -1385,6 +1731,7 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		state.conversationId = undefined;
 		chats.Visible = false;
 		clearTranscript();
+		paintMode();
 		notify("");
 	});
 
@@ -1421,14 +1768,6 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		});
 	});
 
-	const lastClientErrors = (): string[] => {
-		const errors = new Array<string>();
-		for (const entry of kernel.logs(undefined, 300)) {
-			if (entry.kind === "error") errors.push(entry.text.sub(1, 500));
-		}
-		return errors.filter((_, index) => index >= errors.size() - 5);
-	};
-
 	sendFromEnter = () => send();
 	const send = () => {
 		if (sending) return;
@@ -1436,15 +1775,18 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		if (prompt === "") return notify(errorText("empty"), COLORS.warn);
 		if (prompt.size() > MAX_PROMPT) return notify(errorText("too_long"), COLORS.warn);
 		sending = true;
-		menu.Visible = false;
+		closeMenu();
+		const mode = currentMode();
 		spawn(() => {
-			const request: ClaudePromptRequest = { prompt, errors: state.attachErrors };
+			const request: ClaudePromptRequest = { prompt, mode };
 			if (state.conversationId !== undefined) request.conversationId = state.conversationId;
 			if (state.attachPath) {
 				const path = deps.dexSelection();
 				if (path !== undefined) request.path = path;
 			}
-			if (state.attachErrors) request.clientErrors = lastClientErrors();
+			// "My logs": this client's whole log history (all kinds, timestamps), newest ~64 KB. The server caps it again.
+			if (state.attachMyLogs === true) request.clientLogs = formatLogHistory(kernel.logs(undefined, 2000));
+			if (state.attachServerLogs === true) request.serverLogs = true;
 			const myView = view;
 			const [ok, reply] = call("claude.prompt", request);
 			sending = false;
@@ -1468,9 +1810,12 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 				openConversation(conversationId);
 				return;
 			}
-			if (conversationId !== undefined) state.conversationId = conversationId;
+			if (conversationId !== undefined) {
+				state.conversationId = conversationId;
+				modes.set(conversationId, mode);
+			}
 			chats.Visible = false;
-			active = addMessage(answer.request.id, prompt);
+			active = addMessage(answer.request.id, prompt, mode);
 			paintComposer();
 			scrollToEnd();
 		});

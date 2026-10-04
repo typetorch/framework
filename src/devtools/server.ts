@@ -1,4 +1,4 @@
-import { HttpService, MarketplaceService, Players } from "@rbxts/services";
+import { DataStoreService, HttpService, MarketplaceService, Players } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
 import type { ServerKernel } from "../kernel";
@@ -8,7 +8,6 @@ import { registerRemoteClaude } from "./claude";
 import { registerExplorerOps } from "./explorer-server";
 import { registerNetworkOps } from "./network-server";
 import { registerAdminOps } from "./admin-server";
-import { listChildren, listProperties, resolvePath, setProperty } from "./dex";
 import {
 	DEV_REQUEST,
 	DEV_RESPONSE,
@@ -77,14 +76,16 @@ function cleanLogs(value: unknown): LogEntry[] | undefined {
 	return entries;
 }
 
-function isStringArray(value: unknown): value is string[] {
-	if (!typeIs(value, "table")) return false;
-	let count = 0;
-	for (const [key, item] of pairs(value as object)) {
-		count += 1;
-		if (!typeIs(key, "number") || !typeIs(item, "string") || (item as string).size() > 100) return false;
-	}
-	return count <= 40;
+/** Seconds between two swaps (reload, switch, rollback, pin) of one server through the dev menu. */
+const SWAP_INTERVAL = 10;
+/** The kernel registry DataStore (kernel Constants.DATASTORE), read for a reserved server's creator. */
+const REGISTRY_STORE = "TypeTorch";
+
+/** Survives swaps: the last swap time (os.clock) and a reserved server's creator once known. */
+interface SwapGuard {
+	lastSwap?: number;
+	/** User id from the registry record private/<PrivateServerId> (setBy), first read in this server. */
+	reservedCreator?: number;
 }
 
 /**
@@ -94,15 +95,47 @@ function isStringArray(value: unknown): value is string[] {
  */
 export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDispatcher, trove: Trove) {
 	const ops = new Map<string, DevOp>();
-	const requireDevChannel = () => {
-		if (kernel.channel !== "dev") error("read-only on prod-channel servers", 0);
+	const guard = kernel.persist<SwapGuard>("typetorch/devtools-swaps", () => ({}));
+
+	/** The owner or an admin (kernel roles). */
+	const isAdmin = (player: Player) => {
+		const info = kernel.devInfo(player);
+		return info.dev && (info.role === "owner" || info.role === "admin");
 	};
-	const pathOf = (payload: unknown) => {
-		assert(isStringArray(payload), "bad path");
-		const instance = resolvePath(payload);
-		assert(instance, "not found");
-		return instance;
+	/**
+	 * The reserved server's creator: setBy of the kernel's registry record private/<PrivateServerId>, written by
+	 * newServer. Read once and kept (later switches rewrite setBy, but only the creator or an admin can switch).
+	 */
+	const reservedCreator = (): number | undefined => {
+		if (guard.reservedCreator !== undefined) return guard.reservedCreator;
+		const [ok, record] = pcall(() => DataStoreService.GetDataStore(REGISTRY_STORE).GetAsync(`private/${game.PrivateServerId}`)[0]);
+		if (!ok || !typeIs(record, "table")) return undefined;
+		const setBy = (record as { setBy?: unknown }).setBy;
+		if (typeIs(setBy, "number") && setBy > 0) guard.reservedCreator = setBy;
+		return guard.reservedCreator;
 	};
+	/**
+	 * Reload and switch (security audit L3): Studio, the private server's owner, the dev who created this reserved
+	 * server, or an admin/owner of the game. Everyone else (any other dev, any dev on a public server) is refused.
+	 */
+	const mayRetarget = (player: Player): boolean => {
+		if (isAdmin(player)) return true;
+		const kind = kernel.serverType;
+		if (kind === "studio") return true;
+		if (kind === "private") return game.PrivateServerOwnerId === player.UserId;
+		if (kind === "reserved") return reservedCreator() === player.UserId;
+		return false;
+	};
+	/** At most one swap per server every 10 s, counted before the kernel call (a swap stops this generation). */
+	const takeSwap = () => {
+		const now = os.clock();
+		const last = guard.lastSwap;
+		if (last !== undefined && now - last < SWAP_INTERVAL) {
+			error(`one swap per ${SWAP_INTERVAL} s on this server: try again in ${math.ceil(SWAP_INTERVAL - (now - last))} s`, 0);
+		}
+		guard.lastSwap = now;
+	};
+	const NOT_YOURS = "only this server's owner (or a game admin) can reload it or switch its branch";
 
 	ops.set("status", (player) => {
 		const modules = runningModules.map(
@@ -117,10 +150,19 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 	});
 	ops.set("logs", (_, payload) => kernel.logs(typeIs(payload, "number") ? payload : undefined, 200));
 	ops.set("branches", () => kernel.branches());
-	ops.set("reload", (player) => kernel.reload(player));
-	ops.set("rollback", (player) => kernel.rollback(player));
+	ops.set("reload", (player) => {
+		if (!mayRetarget(player)) error(NOT_YOURS, 0);
+		takeSwap();
+		return kernel.reload(player);
+	});
+	ops.set("rollback", (player) => {
+		takeSwap();
+		return kernel.rollback(player);
+	});
 	ops.set("switch", (player, payload) => {
 		assert(isBranchName(payload), "bad branch");
+		if (!mayRetarget(player)) error(NOT_YOURS, 0);
+		takeSwap();
 		return kernel.switchBranch(player, payload);
 	});
 	// payload: "branch" or { branch, assetId? } (assetId = boot pinned to that artifact; kernel 0.2+).
@@ -162,6 +204,7 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 	ops.set("pin", (player, payload) => {
 		assert(isAssetId(payload), "bad asset id");
 		if (!kernelHasArtifacts(kernel)) error(NEEDS_KERNEL_02, 0);
+		takeSwap();
 		return kernel.pinArtifact!(player, payload);
 	});
 	ops.set("net", () => {
@@ -170,24 +213,7 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 		stats.sort((a, b) => a.inbound + a.outbound > b.inbound + b.outbound);
 		return stats;
 	});
-	ops.set("dex.children", (_, payload) => listChildren(pathOf(payload)));
-	ops.set("dex.props", (_, payload) => listProperties(pathOf(payload)));
-	ops.set("dex.set", (_, payload) => {
-		requireDevChannel();
-		const request = payload as { path: unknown; name: unknown; value: unknown };
-		assert(typeIs(request, "table") && typeIs(request.name, "string") && typeIs(request.value, "string"), "bad edit");
-		assert((request.value as string).size() <= 1000, "value too long");
-		const [ok, err] = setProperty(pathOf(request.path), request.name as string, request.value as string);
-		if (!ok) error(err ?? "edit failed", 0);
-		return true;
-	});
-	ops.set("dex.destroy", (_, payload) => {
-		requireDevChannel();
-		const instance = pathOf(payload);
-		assert(instance.Parent !== game, "can't destroy a service");
-		instance.Destroy();
-		return true;
-	});
+	// The legacy dex.children/props/set/destroy ops are gone: the explorer (explorer.* ops) replaced them.
 	ops.set("state", () => describeState());
 
 	// Another player's client logs (Logs > Others). Dev only (checked for every op), the target must be in this
@@ -211,7 +237,9 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 		const timeout = task.delay(PLAYER_LOGS_TIMEOUT, () => finishLogs(id, false, "no_reply"));
 		pendingLogs.set(id, { target, thread, timeout });
 		kernel.send(target, DEVLOGS_REQUEST, id, since);
-		return coroutine.yield() as unknown as [boolean, unknown];
+		// coroutine.yield returns the resumed values as a tuple, not a table: pack them (indexing the tuple failed live).
+		const [ok, result] = coroutine.yield() as LuaTuple<[boolean, unknown]>;
+		return [ok, result];
 	};
 	ops.set("logs.player", (player, payload) => {
 		const request = (typeIs(payload, "table") ? payload : {}) as { userId?: unknown; since?: unknown };

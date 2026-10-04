@@ -1,4 +1,4 @@
-import { HttpService, MemoryStoreService, MessagingService, Players, RunService } from "@rbxts/services";
+import { DataStoreService, HttpService, MemoryStoreService, MessagingService, Players } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $print, $warn } from "rbxts-transform-debug";
 import type { LogEntry, ServerKernel } from "../kernel";
@@ -6,7 +6,9 @@ import type { ServerDispatcher } from "../net/runtime";
 import {
 	CLAUDE_TOOL_REQUEST,
 	CLAUDE_TOOL_RESPONSE,
+	capLogText,
 	findTool,
+	formatLogHistory,
 	inspectTool,
 	loadstringAvailable,
 	playerList,
@@ -20,12 +22,16 @@ import type {
 	ClaudeEvent,
 	ClaudeEventKind,
 	ClaudeEventsReply,
+	ClaudeFileChange,
 	ClaudeMessage,
+	ClaudeMode,
 	ClaudePromptRequest,
+	ClaudeProposal,
 	ClaudeRequestView,
 	ClaudeSessionView,
 	DevOp,
 } from "./protocol";
+import { CODE_ALPHABET, CODE_LENGTH, CODE_SECRET_LENGTH, codeFingerprint, sha256 } from "./sha256";
 
 /**
  * Game side of `typetorch remote-claude` (plans/11). A dev's machine announces a session over MessagingService; this
@@ -60,6 +66,33 @@ import type {
  * when no poll is open.
  * run_luau needs the dev's approval in their chat (or "always" for that chat) and LoadStringEnabled; every run is
  * logged (description and outcome, never the code) and the last 20 are kept.
+ *
+ * TUNNEL BINDING (security audit H1). Announcements come from MessagingService or the MemoryStore share, and anything
+ * that can run code in this universe can write both, so every announcement goes through onMessage's checks:
+ *   - the URL must be exactly https://<name>.trycloudflare.com;
+ *   - a session id is bound to the first URL heard for it; a later message with another URL is ignored (the dev
+ *     server starts a new session id after a tunnel restart, and the dev pairs again);
+ *   - a different session id replaces the current one only when the current one expired or has no pairing here;
+ *   - "closed" counts only with the matching session id and URL.
+ * Tokens are bound to the URL they came from (Pairing.url, the cached access token's URL) and only ever sent to it.
+ * A pairing code's last 4 symbols are an HMAC of the tunnel hostname keyed by the rest of the code (sha256.ts
+ * codeFingerprint): claude.pair refuses a code whose fingerprint doesn't match the session URL, so a code never goes to
+ * a URL it wasn't printed for.
+ *
+ * TOKENS (audit M5): codes are single use on the dev machine, and every refresh returns a new refresh token (the old
+ * one dies; reusing it revokes the pairing). The refresh tokens live in the kernel persist store, which any code of
+ * this generation can reach through the kernel; run_luau gets no kernel and no persist (claude-tools.ts), and code
+ * serving one user only ever reads that user's pairing (tokenFor, authed).
+ *
+ * MODES AND DEPLOYS: claude.prompt sends mode "live" (default: run_luau with approval, no file edits) or "code" (file
+ * edits; read-only game tools). A code run that changed files waits for Deploy / Discard: op "claude.deploy" passes
+ * the requester's decision to the dev machine, which checks it is the requester.
+ *
+ * LOGS: "My logs" (the client's log history, sent by the client) and "Server logs" (this server's kernel log ring) go
+ * to the dev machine as untrusted context, about 64 KB each, newest kept; the dev machine keeps them for that run only.
+ *
+ * AUDIT (audit M4): every run_luau decision leaves a best-effort DataStore record "TypeTorch"
+ * audit/<yyyy-mm-dd>/<JobId>/<n>: who, when, description, SHA-256 of the code and the outcome. Never the code.
  */
 
 const TOPIC = "TypeTorch/remote-claude";
@@ -67,8 +100,6 @@ const PERSIST_KEY = "remoteClaude";
 const MAX_PROMPT = 4000;
 const MAX_CONTEXT_BYTES = 12 * 1024;
 const MAX_PATH = 1024;
-const MAX_ERRORS = 5;
-const MAX_ERROR_CHARS = 500;
 const RATE_WINDOW = 600;
 const RATE_MAX = 10;
 const MAX_RECORDS = 20;
@@ -79,8 +110,16 @@ const MAX_TOKEN = 4096;
 /** Pairing attempts per user per minute (the dev-server limits too). */
 const PAIR_MAX = 5;
 const PAIR_WINDOW = 60;
-const FINISHED_STATES = new Set(["deployed", "answered", "failed", "cancelled", "lost"]);
-const EVENT_KINDS = new Set<string>(["assistant_text", "tool_use", "tool_result", "status", "error"]);
+const FINISHED_STATES = new Set(["deployed", "discarded", "answered", "failed", "cancelled", "lost"]);
+const EVENT_KINDS = new Set<string>(["assistant_text", "tool_use", "tool_result", "status", "error", "deploy_proposal"]);
+const PROPOSAL_STATUSES = new Set<string>(["pending", "deploying", "deployed", "discarded", "expired", "failed"]);
+const MAX_PROPOSAL_FILES = 50;
+/** Session ids remembered with their URL (a sid is bound to the first URL heard for it). */
+const MAX_BOUND_SIDS = 50;
+/** The kernel registry DataStore; run_luau audit records go under audit/. */
+const AUDIT_STORE = "TypeTorch";
+/** Lines read from the kernel log ring for "Server logs" (the ring holds 500). */
+const SERVER_LOG_LINES = 500;
 /** Events relayed per "claude.events" reply (the dev machine pages at 300). */
 const MAX_EVENTS = 300;
 const MAX_EVENT_TEXT = 4000;
@@ -130,6 +169,8 @@ interface RequestRecord {
 /** A user's refresh token for one session. Server memory only. */
 interface Pairing {
 	sid: string;
+	/** The tunnel URL the token came from; it is only ever sent there. Pairings from before H1 lack it (dropped). */
+	url?: string;
 	token: string;
 	/** Unix time; 0 = no expiry given. */
 	exp: number;
@@ -147,6 +188,10 @@ interface Store {
 	alwaysRun?: Map<string, boolean>;
 	/** The last run_luau runs: who, what, outcome (never the code). Added later. */
 	execs?: { at: number; user: number; description: string; ok: boolean; error?: string }[];
+	/** Session id -> the first URL heard for it (security audit H1). Added later. */
+	boundUrls?: Map<string, string>;
+	/** run_luau audit records written by this server (the <n> of audit/<date>/<JobId>/<n>). Added later. */
+	auditSeq?: number;
 }
 
 /** What the dev's server-side tools need from the devtools server. */
@@ -203,7 +248,52 @@ function cleanEvent(raw: unknown): ClaudeEvent | undefined {
 	if (state !== undefined) event.state = state;
 	const detail = shortString(data.detail, 2000);
 	if (detail !== undefined) event.detail = detail;
+	const ref = data.ref;
+	if (typeIs(ref, "string") && ref.size() <= 64 && matches(ref, "^[%w_%-]+$")) event.ref = ref;
+	const commit = data.commit;
+	if (typeIs(commit, "string") && commit.size() <= 40 && matches(commit, "^%x+$")) event.commit = commit;
+	const files = cleanFiles(data.files);
+	if (files !== undefined) event.files = files;
+	const expiresAt = shortNumber(data.expiresAt);
+	if (expiresAt !== undefined) event.expiresAt = expiresAt;
 	return event;
+}
+
+function cleanFiles(raw: unknown): ClaudeFileChange[] | undefined {
+	if (!typeIs(raw, "table")) return undefined;
+	const files = new Array<ClaudeFileChange>();
+	for (const item of listOf(raw)) {
+		if (files.size() >= MAX_PROPOSAL_FILES || !typeIs(item, "table")) continue;
+		const file = item as Record<string, unknown>;
+		const path = shortString(file.path, 160);
+		const added = shortNumber(file.added);
+		const removed = shortNumber(file.removed);
+		if (path !== undefined && added !== undefined && removed !== undefined) files.push({ path, added: math.floor(added), removed: math.floor(removed) });
+	}
+	return files;
+}
+
+/** A proposal from the dev machine, field by field. */
+function cleanProposal(raw: unknown): ClaudeProposal | undefined {
+	if (!typeIs(raw, "table")) return undefined;
+	const data = raw as Record<string, unknown>;
+	const status = data.status;
+	const commit = data.commit;
+	const expiresAt = shortNumber(data.expiresAt);
+	if (!typeIs(status, "string") || !PROPOSAL_STATUSES.has(status) || !typeIs(commit, "string") || !matches(commit, "^%x+$") || expiresAt === undefined) {
+		return undefined;
+	}
+	return {
+		status: status as ClaudeProposal["status"],
+		commit: commit.sub(1, 40),
+		expiresAt,
+		files: cleanFiles(data.files) ?? [],
+		error: shortString(data.error, 300),
+	};
+}
+
+function cleanMode(raw: unknown): ClaudeMode | undefined {
+	return raw === "live" || raw === "code" ? raw : undefined;
 }
 
 function cleanEvents(raw: unknown, max: number): ClaudeEvent[] {
@@ -220,15 +310,25 @@ function isFinished(state: string | undefined, finishedAt: unknown): boolean {
 	return (state !== undefined && FINISHED_STATES.has(state)) || finishedAt !== undefined;
 }
 
-/** Host-only https URL; plain http to localhost only in Studio (dev-server without a tunnel). */
+/** Only a Cloudflare Quick Tunnel origin: https://<name>.trycloudflare.com, nothing else (security audit H1). */
 function cleanUrl(value: unknown): string | undefined {
 	if (!typeIs(value, "string") || value.size() > 200) return undefined;
-	const url = value.gsub("/+$", "")[0];
-	if (matches(url, "^https://[%w%-%.]+$") || matches(url, "^https://[%w%-%.]+:%d+$")) return url;
-	if (RunService.IsStudio() && (matches(url, "^http://localhost:%d+$") || matches(url, "^http://127%.0%.0%.1:%d+$"))) {
-		return url;
+	return matches(value, "^https://[a-z0-9%-]+%.trycloudflare%.com$") ? value : undefined;
+}
+
+/** "abc-def.trycloudflare.com" from a cleaned URL. */
+function hostOf(url: string): string {
+	return url.sub(9);
+}
+
+/** Uppercase, spaces and dashes removed; undefined unless it is 24 symbols of the code alphabet. */
+function normalizeCode(raw: string): string | undefined {
+	const code = raw.upper().gsub("[%s%-]", "")[0];
+	if (code.size() !== CODE_LENGTH) return undefined;
+	for (let index = 1; index <= code.size(); index++) {
+		if (CODE_ALPHABET.find(code.sub(index, index), 1, true)[0] === undefined) return undefined;
 	}
-	return undefined;
+	return code;
 }
 
 function httpError(status: number): string {
@@ -238,6 +338,7 @@ function httpError(status: number): string {
 	if (status === 404) return "not_found";
 	if (status === 409) return "conflict";
 	if (status === 413) return "too_large";
+	if (status === 423) return "code_busy";
 	if (status === 429) return "remote_rate_limited";
 	if (status >= 500) return "remote_error";
 	return `http_${status}`;
@@ -269,8 +370,13 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	const cache = new Map<string, PromptCache>();
 	/** userId -> os.clock() of their last claude.* op (the chat is open). */
 	const lastSeen = new Map<number, number>();
-	// userId -> [access token, expires at (unix)]. Generation memory only: never persisted, sent or printed.
-	const tokens = new Map<number, [string, number]>();
+	// userId -> [access token, expires at (unix), the URL it came from]. Generation memory only: never persisted, sent
+	// or printed, and only ever sent to that URL.
+	const tokens = new Map<number, [string, number, string]>();
+	if (store.boundUrls === undefined) store.boundUrls = new Map();
+	const boundUrls = store.boundUrls;
+	// Pairings from before tunnel binding have no URL: they can't be checked, so they go (the dev pairs again).
+	for (const [userId, pairing] of pairings) if (pairing.url === undefined) pairings.delete(userId);
 	const exchanging = new Set<number>();
 	// userId -> unix times of pairing attempts (generation memory).
 	const pairAttempts = new Map<number, number[]>();
@@ -288,6 +394,9 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 
 	// A session for another branch (the server switched branches) or a prod-channel generation is dropped.
 	if (store.session && !usable(store.session)) store.session = undefined;
+	// A session kept by an older generation: only a tunnel URL, and its sid stays bound to that URL.
+	if (store.session && cleanUrl(store.session.url) === undefined) store.session = undefined;
+	if (store.session && !boundUrls.has(store.session.sid)) boundUrls.set(store.session.sid, store.session.url);
 
 	const activeSession = (): Session | undefined => {
 		const session = store.session;
@@ -306,6 +415,13 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 			if (!ok) $warn(`[remote-claude] could not share the session: ${err}`);
 		});
 	};
+	/** True when some user of this server holds a pairing for session sid. */
+	const pairedTo = (sid: string) => {
+		for (const [, pairing] of pairings) if (pairing.sid === sid) return true;
+		return false;
+	};
+	let warnedUrlChange = false;
+	// Every announcement (broadcast or MemoryStore share) goes through here: see TUNNEL BINDING in the header.
 	const onMessage = (raw: unknown, fromBroadcast = true) => {
 		let data = raw;
 		if (typeIs(raw, "string")) data = decode(raw);
@@ -313,8 +429,10 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		const message = data as Record<string, unknown>;
 		const sid = message.s;
 		if (message.v !== 1 || !typeIs(sid, "string") || !matches(sid, "^[0-9a-f]+$") || sid.size() !== 32) return;
+		const url = cleanUrl(message.url);
 		if (message.closed === true) {
-			if (store.session?.sid === sid) {
+			// Only the session's own URL can close it.
+			if (store.session?.sid === sid && url !== undefined && store.session.url === url) {
 				store.session = undefined;
 				forgetOtherSessions(undefined);
 			}
@@ -322,14 +440,32 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		}
 		const branch = message.b;
 		const exp = message.exp;
-		const url = cleanUrl(message.url);
 		if (!typeIs(branch, "string") || branch.size() > 64 || !typeIs(exp, "number") || url === undefined) return;
 		// Only dev-channel servers on the session branch keep it; everyone else drops it unread.
 		if (kernel.channel !== "dev" || branch !== kernel.branch || exp <= os.time()) return;
 		if (!typeIs(message.u, "table")) return;
+		// A session id keeps the first URL heard for it: a re-announcement with another URL is ignored, never followed.
+		const bound = boundUrls.get(sid);
+		if (bound !== undefined && bound !== url) {
+			if (!warnedUrlChange) {
+				warnedUrlChange = true;
+				$warn(`[remote-claude] ignored an announcement that changes the URL of session ${sid.sub(1, 8)} (a tunnel restart gets a new session id)`);
+			}
+			return;
+		}
+		// Another session id doesn't push out a live session that devs here are paired with.
+		const current = store.session;
+		if (current !== undefined && current.sid !== sid && current.exp > os.time() && pairedTo(current.sid)) return;
 		const users = new Array<number>();
 		for (const [, user] of pairs(message.u as object)) {
 			if (typeIs(user, "number") && user > 0 && user % 1 === 0 && users.size() < 100) users.push(user);
+		}
+		if (bound === undefined) {
+			if (boundUrls.size() >= MAX_BOUND_SIDS) {
+				// Keep only the current session's binding; old sessions are long gone.
+				for (const [known] of boundUrls) if (known !== current?.sid) boundUrls.delete(known);
+			}
+			boundUrls.set(sid, url);
 		}
 		if (store.session?.sid !== sid) forgetOtherSessions(sid);
 		const fresh = store.session?.sid !== sid || store.session.exp !== exp;
@@ -410,11 +546,12 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		if (!typeIs(token, "string") || token.size() > MAX_TOKEN || !typeIs(expiresIn, "number")) {
 			return [false, "bad_reply", status];
 		}
-		tokens.set(userId, [token, os.time() + expiresIn]);
+		tokens.set(userId, [token, os.time() + expiresIn, session.url]);
+		// Every grant returns a new refresh token (rotation): the old one is dead now, so it is replaced at once.
 		const refresh = reply.refresh_token;
 		if (typeIs(refresh, "string") && refresh.size() <= MAX_TOKEN) {
 			const refreshIn = reply.refresh_expires_in;
-			pairings.set(userId, { sid: session.sid, token: refresh, exp: typeIs(refreshIn, "number") ? os.time() + refreshIn : 0 });
+			pairings.set(userId, { sid: session.sid, url: session.url, token: refresh, exp: typeIs(refreshIn, "number") ? os.time() + refreshIn : 0 });
 		}
 		return [true, token, status];
 	};
@@ -422,24 +559,31 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	const pairingFor = (session: Session, userId: number): Pairing | undefined => {
 		const pairing = pairings.get(userId);
 		if (!pairing) return undefined;
-		if (pairing.sid !== session.sid || (pairing.exp !== 0 && pairing.exp <= os.time())) {
+		// Bound to the session and the URL it came from: a token never goes anywhere else.
+		if (pairing.sid !== session.sid || pairing.url !== session.url || (pairing.exp !== 0 && pairing.exp <= os.time())) {
 			pairings.delete(userId);
 			return undefined;
 		}
 		return pairing;
 	};
 
-	const isPaired = (session: Session, userId: number): boolean => {
+	/** The cached access token when it is still good and was issued by this session's URL. */
+	const cachedToken = (session: Session, userId: number): string | undefined => {
 		const cached = tokens.get(userId);
-		if (cached && cached[1] - TOKEN_MARGIN > os.time()) return true;
+		if (cached && cached[2] === session.url && cached[1] - TOKEN_MARGIN > os.time()) return cached[0];
+		return undefined;
+	};
+
+	const isPaired = (session: Session, userId: number): boolean => {
+		if (cachedToken(session, userId) !== undefined) return true;
 		return pairingFor(session, userId) !== undefined;
 	};
 
 	/** Cached access token, else the refresh grant, else `needs_pairing`. */
 	const tokenFor = (session: Session, userId: number): [ok: boolean, tokenOrError: string] => {
 		while (exchanging.has(userId)) task.wait(0.1);
-		const cached = tokens.get(userId);
-		if (cached && cached[1] - TOKEN_MARGIN > os.time()) return [true, cached[0]];
+		const cached = cachedToken(session, userId);
+		if (cached !== undefined) return [true, cached];
 		tokens.delete(userId);
 		const pairing = pairingFor(session, userId);
 		if (!pairing) return [false, "needs_pairing"];
@@ -527,17 +671,6 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		return result;
 	};
 
-	const lastServerErrors = (): string[] => {
-		const errors = new Array<string>();
-		for (const entry of kernel.logs(undefined, 300)) {
-			if (entry.kind === "error") errors.push(`[server] ${entry.text.sub(1, MAX_ERROR_CHARS)}`);
-		}
-		const from = math.max(0, errors.size() - MAX_ERRORS);
-		const result = new Array<string>();
-		for (let index = from; index < errors.size(); index++) result.push(errors[index]);
-		return result;
-	};
-
 	// Ops -------------------------------------------------------------------------------------------------------------
 	ops.set("claude.session", (player): ClaudeSessionView => {
 		lastSeen.set(player.UserId, os.clock());
@@ -571,13 +704,19 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		if (!session.users.includes(player.UserId)) return fail("not_allowed");
 		const raw = typeIs(payload, "table") ? (payload as { code?: unknown }).code : payload;
 		if (!typeIs(raw, "string") || raw.size() > MAX_CODE * 2) return fail("bad_code");
-		const code = raw.match("^%s*(.-)%s*$")[0] as string;
-		if (code === "" || code.size() > MAX_CODE) return fail("bad_code");
 		const now = os.time();
 		const attempts = (pairAttempts.get(player.UserId) ?? []).filter((at) => now - at < PAIR_WINDOW);
 		if (attempts.size() >= PAIR_MAX) return fail("rate_limited");
 		attempts.push(now);
 		pairAttempts.set(player.UserId, attempts);
+		const code = normalizeCode(raw);
+		if (code === undefined) return fail("bad_code");
+		// The code's last 4 symbols fingerprint the tunnel it was printed for (security audit H1): a code for another URL
+		// is never sent anywhere, so a re-announced or spoofed session can't collect it.
+		if (codeFingerprint(code.sub(1, CODE_SECRET_LENGTH), hostOf(session.url)) !== code.sub(CODE_SECRET_LENGTH + 1)) {
+			$warn(`[remote-claude] ${player.Name} entered a pairing code for another tunnel; it was not sent`);
+			return fail("code_mismatch");
+		}
 		while (exchanging.has(player.UserId)) task.wait(0.1);
 		exchanging.add(player.UserId);
 		const [ok, tokenOrError, status] = grant(session, player.UserId, { grant: "code", code });
@@ -612,9 +751,11 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		if (prompt === "") return fail("empty");
 		if (prompt.size() > MAX_PROMPT) return fail("too_long");
 
-		// One active request per user (re-checked against the dev machine, so a stale record can't block forever).
+		const mode: ClaudeMode = cleanMode(request.mode) ?? "live";
+		// One active request per user (re-checked against the dev machine, so a stale record can't block forever). A code
+		// change waiting for Deploy / Discard doesn't block: the dev machine refuses what can't run next to it.
 		for (const record of store.requests) {
-			if (record.sid !== session.sid || record.user !== player.UserId || record.finished) continue;
+			if (record.sid !== session.sid || record.user !== player.UserId || record.finished || record.state === "proposed") continue;
 			refresh(session, record, player.UserId);
 			if (!record.finished) return fail("busy");
 		}
@@ -622,24 +763,19 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		const recent = (store.sent.get(player.UserId) ?? []).filter((at) => now - at < RATE_WINDOW);
 		if (recent.size() >= RATE_MAX) return fail("rate_limited");
 
-		const context: { path?: string; errors?: string[]; artifact?: string } = { artifact: kernel.artifact.id.sub(1, 128) };
+		const context: { path?: string; artifact?: string; logs?: { client?: string; server?: string } } = { artifact: kernel.artifact.id.sub(1, 128) };
 		if (typeIs(request.path, "string")) context.path = request.path.sub(1, MAX_PATH);
-		if (request.errors === true) {
-			const errors = lastServerErrors();
-			if (typeIs(request.clientErrors, "table")) {
-				for (const [, line] of pairs(request.clientErrors as object)) {
-					if (typeIs(line, "string") && errors.size() < MAX_ERRORS * 2) {
-						errors.push(`[client] ${line.sub(1, MAX_ERROR_CHARS)}`);
-					}
-				}
-			}
-			if (errors.size() > 0) context.errors = errors;
-		}
 		if (encodedSize(context) > MAX_CONTEXT_BYTES) return fail("context_too_large");
+		// "My logs" (from the client, capped again here) and "Server logs" (this server's log ring): untrusted context,
+		// about 64 KB each, newest kept. They can hold other players' names and chat: they are never printed here.
+		const logs: { client?: string; server?: string } = {};
+		if (typeIs(request.clientLogs, "string") && request.clientLogs !== "") logs.client = capLogText(request.clientLogs);
+		if (request.serverLogs === true) logs.server = formatLogHistory(kernel.logs(undefined, SERVER_LOG_LINES));
+		if (logs.client !== undefined || logs.server !== undefined) context.logs = logs;
 
 		recent.push(now);
 		store.sent.set(player.UserId, recent);
-		const body: { prompt: string; context: typeof context; conversationId?: string } = { prompt, context };
+		const body: { prompt: string; mode: ClaudeMode; context: typeof context; conversationId?: string } = { prompt, mode, context };
 		if (conversationId !== undefined) body.conversationId = conversationId;
 		const result = authed(session, player.UserId, "POST", "/v1/prompts", body);
 		if (!result.ok) {
@@ -665,6 +801,20 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		store.requests.push(record);
 		while (store.requests.size() > MAX_RECORDS) store.requests.shift();
 		return { ok: true, request: view(record, player) };
+	});
+
+	// The requester's Deploy / Discard for a code change (the dev machine checks the requester and the proposal).
+	ops.set("claude.deploy", (player, payload) => {
+		if (kernel.channel !== "dev") return fail("prod_channel");
+		const session = chatSession(player);
+		if (isFailure(session)) return session;
+		const request = (typeIs(payload, "table") ? payload : {}) as { id?: unknown; decision?: unknown };
+		const decision = request.decision;
+		if (!isServerId(request.id) || (decision !== "deploy" && decision !== "discard")) return fail("bad_request");
+		lastSeen.set(player.UserId, os.clock());
+		const result = authed(session, player.UserId, "POST", `/v1/prompts/${request.id}/deploy`, { decision });
+		if (!result.ok) return result.error === "conflict" ? fail("already_decided") : result.error === "forbidden" ? fail("not_yours") : result;
+		return { ok: true };
 	});
 
 	ops.set("claude.status", (player, payload) => {
@@ -733,6 +883,8 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 				artifactId: shortString(fields.artifactId, 128),
 				runError: shortString(fields.error, 300),
 				costUsd: shortNumber(fields.costUsd),
+				mode: cleanMode(fields.mode),
+				proposal: cleanProposal(fields.proposal),
 				events,
 				next: nextIndex,
 				more: nextIndex < cached.start + cached.events.size(),
@@ -768,6 +920,8 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 			artifactId: shortString(reply.artifactId, 128),
 			runError: shortString(reply.error, 300),
 			costUsd: shortNumber(reply.costUsd),
+			mode: cleanMode(reply.mode),
+			proposal: cleanProposal(reply.proposal),
 			events: cleanEvents(reply.events, MAX_EVENTS),
 			next: nextIndex !== undefined ? math.max(since, math.floor(nextIndex)) : since,
 			more: reply.more === true,
@@ -829,6 +983,8 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 				id,
 				prompt: prompt.sub(1, MAX_PROMPT),
 				state,
+				mode: cleanMode(data.mode),
+				proposal: cleanProposal(data.proposal),
 				finished: isFinished(state, data.finishedAt),
 				summary: shortString(data.summary, 300),
 				commit: shortString(data.commit, 64),
@@ -913,7 +1069,9 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		const timeout = task.delay(CLIENT_TOOL_TIMEOUT, () => finishClient(id, false, "no reply from the developer's client"));
 		pendingClient.set(id, { target, thread, timeout });
 		kernel.send(target, CLAUDE_TOOL_REQUEST, id, tool, args);
-		return coroutine.yield() as unknown as [boolean, unknown];
+		// coroutine.yield returns the resumed values as a tuple, not a table: pack them (indexing the tuple failed live).
+		const [ok, result] = coroutine.yield() as LuaTuple<[boolean, unknown]>;
+		return [ok, result];
 	};
 	if (deps) {
 		deps.dispatcher.setRaw(CLAUDE_TOOL_RESPONSE, (player, id, ok, result) => {
@@ -944,6 +1102,42 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	};
 
 	type ToolAnswer = { ok: boolean; output?: string[]; returned?: string; error?: string; data?: string; ms?: number; denied?: boolean };
+
+	/**
+	 * A durable record of one run_luau decision (security audit M4), best effort: DataStore "TypeTorch" key
+	 * audit/<yyyy-mm-dd>/<JobId>/<n> (UTC date, "studio" for Studio's empty JobId, n counts up per server across swaps).
+	 * Who, when, where, the description, the SHA-256 of the code and the outcome: never the code itself.
+	 */
+	const audit = (
+		player: Player,
+		run: { description: string; code: string; outcome: "ok" | "error" | "denied" | "timeout"; error?: string; ms?: number; requestId: string; conversationId?: string },
+	) => {
+		store.auditSeq = (store.auditSeq ?? 0) + 1;
+		const key = `audit/${os.date("!%Y-%m-%d")}/${game.JobId !== "" ? game.JobId : "studio"}/${store.auditSeq}`;
+		const record = {
+			v: 1,
+			at: os.time(),
+			user: player.UserId,
+			name: player.Name,
+			place: game.PlaceId,
+			job: game.JobId,
+			branch: kernel.branch,
+			artifact: kernel.artifact.id,
+			session: store.session?.sid.sub(1, 8),
+			request: run.requestId.sub(1, 64),
+			conversation: run.conversationId,
+			description: run.description,
+			sha256: sha256(run.code),
+			bytes: run.code.size(),
+			outcome: run.outcome,
+			error: run.error?.sub(1, 200),
+			ms: run.ms,
+		};
+		task.spawn(() => {
+			const [ok, err] = pcall(() => DataStoreService.GetDataStore(AUDIT_STORE).SetAsync(key, record));
+			if (!ok) $warn(`[claude] run_luau audit record not saved (${key}): ${err}`);
+		});
+	};
 
 	/** Runs one tool for the requesting dev. */
 	const runTool = (player: Player, request: Record<string, unknown>): ToolAnswer => {
@@ -1000,15 +1194,18 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 				const decision = askApproval(player.UserId, { id, description, code, conversationId });
 				if (decision !== "once" && decision !== "always") {
 					$print(`[claude] run_luau for ${player.Name} denied (${decision}): ${description}`);
+					audit(player, { description, code, outcome: decision === "timeout" ? "timeout" : "denied", requestId: id, conversationId });
 					return { ok: false, denied: true, error: decision === "timeout" ? "no answer within 60 s" : "denied", output: [] };
 				}
 			}
 			// The requester may have left or lost dev access while deciding.
 			if (player.Parent === undefined || !kernel.isDev(player) || kernel.channel !== "dev") return { ok: false, error: "the developer is no longer a dev in this server" };
-			const result = runLuau(code, { player, kernel, persist: (key: string) => kernel.persist(key, () => ({})) }, timeoutSeconds);
+			// Only `player`: no kernel, no persist store (refresh tokens live there), and a guarded game (claude-tools.ts).
+			const result = runLuau(code, { player }, timeoutSeconds);
 			$print(`[claude] run_luau for ${player.Name}: ${description} -> ${result.ok ? "ok" : "error"} (${result.ms} ms)`);
 			execs.push({ at: os.time(), user: player.UserId, description, ok: result.ok, error: result.error?.sub(1, 200) });
 			while (execs.size() > MAX_EXEC_LOG) execs.shift();
+			audit(player, { description, code, outcome: result.ok ? "ok" : "error", error: result.error, ms: result.ms, requestId: id, conversationId });
 			return result;
 		}
 		return { ok: false, error: `unknown tool ${tostring(tool).sub(1, 40)}` };
