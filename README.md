@@ -56,12 +56,13 @@ export class CoinService extends Module implements OnStart {
 - **UI:** `observeElement(trove, tag, (instance, elementTrove) => ...)`, `isRealFrame`, `popIn` / `popOut` / `bump`
   (UIScale, never Size tweens) and `PopupQueue` (one modal at a time).
 - **Dev menu:** devs (Studio, project members, dev badge) get a DEV button, `Ctrl+Shift+D` and `/tt dev`: artifact,
-  server status, logs, client and server dex, network stats, module state, branch controls and a Claude prompt.
-  Prod-channel servers are read-only.
+  server status, logs (server, own client, other players' clients), client and server dex, network stats, module
+  state, a branch and artifact picker (Server > Branch) and a Claude prompt. Prod-channel servers are read-only. The
+  window can be dragged by its header and resized from its corner (double-tap the header to reset).
 - **Remote Claude** (dev-channel servers only): while `typetorch remote-claude` runs on a dev's machine, allowlisted
-  devs prompt Claude Code from the Claude tab. The game server holds the session URL and short-lived tokens in memory
-  and never sends them to clients. Setup: add the experience secret `typetorch_remote_claude` (domain
-  `*.trycloudflare.com`) with the same value as the dev machine's `TYPETORCH_REMOTE_CLAUDE_SECRET`.
+  devs prompt Claude Code from the Claude tab. Each dev pairs once by pasting the pairing code printed by
+  typetorch-dev-server; the game server keeps the session URL and the tokens in memory and never sends them to clients.
+  No Roblox secret is needed.
 
 ## Develop
 

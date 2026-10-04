@@ -6,16 +6,20 @@ import type { ClaudePromptRequest, ClaudeRequestView, ClaudeSessionView, DevOp }
 
 /**
  * Game side of `typetorch remote-claude` (plans/11). A dev's machine announces a session over MessagingService; this
- * server keeps it only when its effective channel is "dev" and its branch is the session branch, exchanges the
- * Secrets Store secret for a short-lived JWT per user, and forwards prompts.
+ * server keeps it only when its effective channel is "dev" and its branch is the session branch, and forwards prompts.
  *
- * SECRECY: the session URL and every token stay in server memory. They are never sent to a client, never printed
- * (server logs reach dev clients through the Logs tab) and never put in attributes. HTTP failures are reported as
- * short codes only, because Roblox error text can contain the URL.
+ * AUTH (pairing, no Roblox Secrets Store): a dev pastes the pairing code printed by typetorch-dev-server into the
+ * Claude tab (op `claude.pair`). The server trades it at `POST {url}/v1/token` `{grant: "code", sid, user, job,
+ * branch, code}` for `{access_token, expires_in, refresh_token, refresh_expires_in}`. The refresh token is kept per
+ * user in the kernel persist store (server memory; survives the swaps Claude's own deploys cause) and traded for new
+ * access tokens with `{grant: "refresh", sid, user, job, branch, refresh_token}`. Without either: `needs_pairing`.
+ *
+ * SECRECY: the session URL, the pairing code and every token stay in server memory. They are never sent to a client,
+ * never printed (server logs reach dev clients through the Logs tab) and never put in attributes. HTTP failures are
+ * reported as short codes only, because Roblox error text can contain the URL.
  */
 
 const TOPIC = "TypeTorch/remote-claude";
-const SECRET_NAME = "typetorch_remote_claude";
 const PERSIST_KEY = "remoteClaude";
 const MAX_PROMPT = 4000;
 const MAX_CONTEXT_BYTES = 12 * 1024;
@@ -27,6 +31,11 @@ const RATE_MAX = 10;
 const MAX_RECORDS = 20;
 const VISIBLE_RECORDS = 10;
 const TOKEN_MARGIN = 60;
+const MAX_CODE = 64;
+const MAX_TOKEN = 4096;
+/** Pairing attempts per user per minute (the dev-server limits too). */
+const PAIR_MAX = 5;
+const PAIR_WINDOW = 60;
 const FINISHED_STATES = new Set(["deployed", "failed", "cancelled"]);
 
 interface Session {
@@ -53,12 +62,22 @@ interface RequestRecord {
 	log?: string[];
 }
 
+/** A user's refresh token for one session. Server memory only. */
+interface Pairing {
+	sid: string;
+	token: string;
+	/** Unix time; 0 = no expiry given. */
+	exp: number;
+}
+
 /** Kept in the kernel persist store, so it survives swaps (including the one Claude's own deploy causes). */
 interface Store {
 	session?: Session;
 	requests: RequestRecord[];
 	/** userId -> unix times of accepted prompts (rate limit). */
 	sent: Map<number, number[]>;
+	/** userId -> refresh token from pairing (added later: stores from older generations lack it). */
+	pairings?: Map<number, Pairing>;
 }
 
 type Failure = { ok: false; error: string };
@@ -111,10 +130,22 @@ function encodedSize(value: unknown): number {
 }
 
 export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Map<string, DevOp>) {
-	const store = kernel.persist<Store>(PERSIST_KEY, () => ({ requests: [], sent: new Map() }));
+	const store = kernel.persist<Store>(PERSIST_KEY, () => ({ requests: [], sent: new Map(), pairings: new Map() }));
+	if (store.pairings === undefined) store.pairings = new Map();
+	const pairings = store.pairings;
 	// userId -> [access token, expires at (unix)]. Generation memory only: never persisted, sent or printed.
 	const tokens = new Map<number, [string, number]>();
 	const exchanging = new Set<number>();
+	// userId -> unix times of pairing attempts (generation memory).
+	const pairAttempts = new Map<number, number[]>();
+
+	/** Drops tokens of other sessions (a new session invalidates every pairing). */
+	const forgetOtherSessions = (sid: string | undefined) => {
+		tokens.clear();
+		for (const [userId, pairing] of pairings) {
+			if (pairing.sid !== sid) pairings.delete(userId);
+		}
+	};
 
 	const usable = (session: Session | undefined): session is Session =>
 		session !== undefined && kernel.channel === "dev" && session.branch === kernel.branch;
@@ -138,7 +169,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		if (message.closed === true) {
 			if (store.session?.sid === sid) {
 				store.session = undefined;
-				tokens.clear();
+				forgetOtherSessions(undefined);
 			}
 			return;
 		}
@@ -153,7 +184,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		for (const [, user] of pairs(message.u as object)) {
 			if (typeIs(user, "number") && user > 0 && user % 1 === 0 && users.size() < 100) users.push(user);
 		}
-		if (store.session?.sid !== sid) tokens.clear();
+		if (store.session?.sid !== sid) forgetOtherSessions(sid);
 		store.session = { sid, branch, users, url, exp };
 	};
 
@@ -185,7 +216,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		session: Session,
 		method: "GET" | "POST",
 		path: string,
-		headers: Record<string, string | Secret>,
+		headers: Record<string, string>,
 		body?: unknown,
 	): [sent: boolean, status: number, data: unknown] => {
 		const request: RequestAsyncRequest = { Url: `${session.url}${path}`, Method: method, Headers: headers };
@@ -196,29 +227,73 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		return [true, response.StatusCode, decode(response.Body)];
 	};
 
-	const tokenFor = (session: Session, userId: number): [ok: boolean, tokenOrError: string] => {
-		while (exchanging.has(userId)) task.wait(0.1);
-		const cached = tokens.get(userId);
-		if (cached && cached[1] - TOKEN_MARGIN > os.time()) return [true, cached[0]];
-		const [secretOk, secret] = pcall(() => HttpService.GetSecret(SECRET_NAME));
-		if (!secretOk) return [false, "no_secret"];
-		exchanging.add(userId);
+	/**
+	 * `POST /v1/token` (no Authorization header; the grant carries the credential). Stores the access token and, when
+	 * the reply has one, the (rotated) refresh token. Returns [ok, access token or error code, HTTP status].
+	 */
+	const grant = (
+		session: Session,
+		userId: number,
+		body: Record<string, unknown>,
+	): [ok: boolean, tokenOrError: string, status: number] => {
 		const [sent, status, data] = send(
 			session,
 			"POST",
 			"/v1/token",
-			{ Authorization: (secret as Secret).AddPrefix("Bearer "), "Content-Type": "application/json" },
-			{ sid: session.sid, user: userId, job: game.JobId, branch: session.branch },
+			{ "Content-Type": "application/json" },
+			{ ...body, sid: session.sid, user: userId, job: game.JobId, branch: session.branch },
 		);
-		exchanging.delete(userId);
-		if (!sent) return [false, "unreachable"];
-		if (status !== 200) return [false, httpError(status)];
-		const reply = (typeIs(data, "table") ? data : {}) as { access_token?: unknown; expires_in?: unknown };
+		if (!sent) return [false, "unreachable", 0];
+		if (status !== 200) return [false, httpError(status), status];
+		const reply = (typeIs(data, "table") ? data : {}) as Record<string, unknown>;
 		const token = reply.access_token;
 		const expiresIn = reply.expires_in;
-		if (!typeIs(token, "string") || token.size() > 4096 || !typeIs(expiresIn, "number")) return [false, "bad_reply"];
+		if (!typeIs(token, "string") || token.size() > MAX_TOKEN || !typeIs(expiresIn, "number")) {
+			return [false, "bad_reply", status];
+		}
 		tokens.set(userId, [token, os.time() + expiresIn]);
-		return [true, token];
+		const refresh = reply.refresh_token;
+		if (typeIs(refresh, "string") && refresh.size() <= MAX_TOKEN) {
+			const refreshIn = reply.refresh_expires_in;
+			pairings.set(userId, { sid: session.sid, token: refresh, exp: typeIs(refreshIn, "number") ? os.time() + refreshIn : 0 });
+		}
+		return [true, token, status];
+	};
+
+	const pairingFor = (session: Session, userId: number): Pairing | undefined => {
+		const pairing = pairings.get(userId);
+		if (!pairing) return undefined;
+		if (pairing.sid !== session.sid || (pairing.exp !== 0 && pairing.exp <= os.time())) {
+			pairings.delete(userId);
+			return undefined;
+		}
+		return pairing;
+	};
+
+	const isPaired = (session: Session, userId: number): boolean => {
+		const cached = tokens.get(userId);
+		if (cached && cached[1] - TOKEN_MARGIN > os.time()) return true;
+		return pairingFor(session, userId) !== undefined;
+	};
+
+	/** Cached access token, else the refresh grant, else `needs_pairing`. */
+	const tokenFor = (session: Session, userId: number): [ok: boolean, tokenOrError: string] => {
+		while (exchanging.has(userId)) task.wait(0.1);
+		const cached = tokens.get(userId);
+		if (cached && cached[1] - TOKEN_MARGIN > os.time()) return [true, cached[0]];
+		tokens.delete(userId);
+		const pairing = pairingFor(session, userId);
+		if (!pairing) return [false, "needs_pairing"];
+		exchanging.add(userId);
+		const [ok, tokenOrError, status] = grant(session, userId, { grant: "refresh", refresh_token: pairing.token });
+		exchanging.delete(userId);
+		if (ok) return [true, tokenOrError];
+		if (status === 401 || status === 403) {
+			// Revoked or expired on the dev machine: pair again.
+			pairings.delete(userId);
+			return [false, "needs_pairing"];
+		}
+		return [false, tokenOrError];
 	};
 
 	/** An authenticated call as `userId`. Re-exchanges the token once after a 401. */
@@ -315,7 +390,49 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 				if (record.sid === session.sid) requests.push(view(record, player));
 			}
 		}
-		return { available: true, allowed, branch: session.branch, label: session.sid.sub(1, 8), requests };
+		return {
+			available: true,
+			allowed,
+			paired: allowed && isPaired(session, player.UserId),
+			branch: session.branch,
+			label: session.sid.sub(1, 8),
+			requests,
+		};
+	});
+
+	// Pairing: trade the code printed by typetorch-dev-server for this player's tokens. The code is never logged.
+	ops.set("claude.pair", (player, payload) => {
+		if (kernel.channel !== "dev") return fail("prod_channel");
+		const session = activeSession();
+		if (!session) return fail("not_connected");
+		if (!session.users.includes(player.UserId)) return fail("not_allowed");
+		const raw = typeIs(payload, "table") ? (payload as { code?: unknown }).code : payload;
+		if (!typeIs(raw, "string") || raw.size() > MAX_CODE * 2) return fail("bad_code");
+		const code = raw.match("^%s*(.-)%s*$")[0] as string;
+		if (code === "" || code.size() > MAX_CODE) return fail("bad_code");
+		const now = os.time();
+		const attempts = (pairAttempts.get(player.UserId) ?? []).filter((at) => now - at < PAIR_WINDOW);
+		if (attempts.size() >= PAIR_MAX) return fail("rate_limited");
+		attempts.push(now);
+		pairAttempts.set(player.UserId, attempts);
+		while (exchanging.has(player.UserId)) task.wait(0.1);
+		exchanging.add(player.UserId);
+		const [ok, tokenOrError, status] = grant(session, player.UserId, { grant: "code", code });
+		exchanging.delete(player.UserId);
+		if (ok) {
+			pairAttempts.delete(player.UserId);
+			return { ok: true };
+		}
+		if (status === 400 || status === 401 || status === 404) return fail("bad_code");
+		if (status === 403) return fail("not_allowed");
+		if (status === 429) return fail("rate_limited");
+		return fail(tokenOrError);
+	});
+
+	ops.set("claude.unpair", (player) => {
+		tokens.delete(player.UserId);
+		pairings.delete(player.UserId);
+		return { ok: true };
 	});
 
 	ops.set("claude.prompt", (player, payload) => {

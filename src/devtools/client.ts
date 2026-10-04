@@ -1,10 +1,20 @@
-import { HttpService, Players, UserInputService } from "@rbxts/services";
+import { HttpService, Players, ReplicatedStorage, SoundService, UserInputService, Workspace } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
-import type { ArtifactInfo, BranchInfo, ClientKernel, DevInfo, KernelStatus, LogEntry, SwapReport } from "../kernel";
+import type {
+	ArtifactEntry,
+	ArtifactInfo,
+	BranchInfo,
+	ClientKernel,
+	DevInfo,
+	KernelStatus,
+	LogEntry,
+	NewServerReport,
+	SwapReport,
+} from "../kernel";
 import type { ClientDispatcher, LeafStats } from "../net/runtime";
 import { runningModules } from "../runtime/registry";
-import { popIn, popOut } from "../ui";
+import { bump, popIn, popOut } from "../ui";
 import { listChildren, listProperties, resolvePath, setProperty } from "./dex";
 import {
 	ClaudePromptRequest,
@@ -12,6 +22,10 @@ import {
 	ClaudeSessionView,
 	DEV_REQUEST,
 	DEV_RESPONSE,
+	DEVLOGS_MAX_BYTES,
+	DEVLOGS_MAX_ENTRIES,
+	DEVLOGS_REQUEST,
+	DEVLOGS_RESPONSE,
 	DexNode,
 	DexProperty,
 	ModuleSummary,
@@ -19,36 +33,55 @@ import {
 	StateSummary,
 } from "./protocol";
 import { describeState } from "./state";
+import {
+	addButton,
+	buttonRow,
+	COLORS,
+	corner,
+	escapeRich,
+	make,
+	pad,
+	Page,
+	paintSelected,
+	playerSelector,
+	scrolling,
+	searchBox,
+	spacer,
+	style,
+	tag,
+	upButton,
+	verticalList,
+} from "./widgets";
 
 /**
  * Client half of the dev menu (plans/10), built in code. Only devs see it: the toggle button, Ctrl+Shift+D and
  * `/tt dev` all check the server's last word on dev status, and the server re-checks every request anyway.
  * Prod-channel servers are read-only (the server enforces it; the UI only hides edit controls).
+ *
+ * Every client (dev or not) also answers the server's DEVLOGS_REQUEST with its recent logs, so a dev can read another
+ * player's client logs (Logs > Others). Only the server can ask, and it only asks for devs.
  */
 
 const REQUEST_TIMEOUT = 15;
 const REFRESH = 2;
+/** Logs > Others polls slower (the server allows one request per dev every 2 s). */
+const OTHER_LOGS_REFRESH = 4;
 const CLAUDE_POLL = 2.5;
 const MAX_LOG_ROWS = 300;
 const HEADER = 46;
 const TAB_WIDTH = 116;
+/** Artifact rows shown per branch before "Show all". */
+const ARTIFACTS_PER_BRANCH = 6;
 const PERSIST_KEY = "typetorch/devtools";
+/** Played after a hot swap on dev-channel servers (ships with the client: no upload, no moderation). */
+const RELOAD_SOUND = "rbxasset://sounds/electronicpingshort.wav";
 
-const COLORS = {
-	window: Color3.fromRGB(22, 24, 30),
-	header: Color3.fromRGB(30, 33, 41),
-	row: Color3.fromRGB(36, 40, 50),
-	button: Color3.fromRGB(50, 55, 68),
-	stroke: Color3.fromRGB(64, 69, 82),
-	accent: Color3.fromRGB(255, 138, 61),
-	text: Color3.fromRGB(232, 234, 240),
-	dim: Color3.fromRGB(150, 157, 172),
-	good: Color3.fromRGB(112, 214, 134),
-	warn: Color3.fromRGB(255, 196, 87),
-	bad: Color3.fromRGB(255, 107, 107),
-	info: Color3.fromRGB(122, 178, 255),
-	dark: Color3.fromRGB(18, 18, 22),
-};
+// Window geometry (pixels).
+const MIN_SIZE = new Vector2(360, 280);
+const DEFAULT_MAX = new Vector2(900, 640);
+const SCREEN_MARGIN = 8;
+const GRIP = 24;
+const DOUBLE_TAP = 0.35;
 
 const LOG_COLORS: Record<string, Color3> = {
 	output: COLORS.text,
@@ -71,11 +104,12 @@ const CLAUDE_STATE_COLORS: Record<string, Color3> = {
 /** Short text for the remote-claude error codes of devtools/claude.ts. */
 const CLAUDE_ERRORS: Record<string, string> = {
 	not_connected: "Not connected: start `typetorch remote-claude` on this branch",
-	no_secret: "Secret typetorch_remote_claude is missing",
-	not_allowed: "not on the session's user list",
+	needs_pairing: "Pair first: paste the pairing code",
+	bad_code: "Wrong or expired code",
+	not_allowed: "Not on the session's user list",
 	prod_channel: "Prompts work on dev-channel servers only.",
 	busy: "Wait for your running request",
-	rate_limited: "Limit: 10 prompts per 10 min",
+	rate_limited: "Too many tries, wait a bit",
 	empty: "Write a prompt first",
 	too_long: "Prompt too long (4000 max)",
 	context_too_large: "Attached context too large",
@@ -92,14 +126,23 @@ function claudeError(code: unknown): string {
 	return "Failed";
 }
 
+/** Short text for the "logs.player" errors of devtools/server.ts. */
+const OTHER_LOG_ERRORS: Record<string, string> = {
+	no_reply: "No reply from that player",
+	not_in_server: "That player left",
+	rate_limited: "Slow down",
+};
+
 interface ClaudeReply {
 	ok?: boolean;
 	error?: string;
 	request?: ClaudeRequestView;
 }
 
-const TABS = ["Artifact", "Server", "Logs", "Dex", "Network", "State", "Branch", "Claude"] as const;
+const TABS = ["Artifact", "Server", "Logs", "Dex", "Network", "State", "Claude"] as const;
 type TabName = (typeof TABS)[number];
+/** Tabs with sub-tabs (a segmented bar on top of the content); the first one is the default. */
+const SUBTABS: Partial<Record<TabName, readonly string[]>> = { Server: ["Status", "Branch"] };
 
 interface StatusReply {
 	server: KernelStatus;
@@ -113,236 +156,29 @@ interface TabContext {
 	/** Cleaned on tab switch and when the window closes. */
 	readonly trove: Trove;
 	readonly content: ScrollingFrame;
+	/** A button row pinned above the scrolling content (sticky toolbar), removed with the tab. */
+	readonly toolbar: () => Frame;
+	/** A bar pinned under the scrolling content, removed with the tab. */
+	readonly footer: () => Page;
 }
 
-// Instance helpers ----------------------------------------------------------------------------------------------------
-
-function make<T extends keyof CreatableInstances>(
-	className: T,
-	props: Partial<WritableInstanceProperties<CreatableInstances[T]>>,
-	parent?: Instance,
-): CreatableInstances[T] {
-	const instance = new Instance(className);
-	for (const [key, value] of pairs(props as unknown as Record<string, unknown>)) {
-		(instance as unknown as Record<string, unknown>)[key] = value;
-	}
-	if (parent) instance.Parent = parent;
-	return instance;
+interface Rect {
+	x: number;
+	y: number;
+	w: number;
+	h: number;
 }
 
-function corner(parent: Instance, radius: number) {
-	make("UICorner", { CornerRadius: new UDim(0, radius) }, parent);
-}
-
-function pad(parent: Instance, vertical: number, horizontal: number) {
-	make(
-		"UIPadding",
-		{
-			PaddingTop: new UDim(0, vertical),
-			PaddingBottom: new UDim(0, vertical),
-			PaddingLeft: new UDim(0, horizontal),
-			PaddingRight: new UDim(0, horizontal),
-		},
-		parent,
-	);
-}
-
-function style<T extends TextLabel | TextButton | TextBox>(
-	gui: T,
-	text: string,
-	size = 15,
-	color = COLORS.text,
-	font: Enum.Font = Enum.Font.BuilderSans,
-): T {
-	gui.Text = text;
-	gui.TextSize = size;
-	gui.TextColor3 = color;
-	gui.Font = font;
-	gui.TextXAlignment = Enum.TextXAlignment.Left;
-	gui.TextWrapped = true;
-	gui.BorderSizePixel = 0;
-	return gui;
-}
-
-function verticalList(parent: Instance, gap: number) {
-	make(
-		"UIListLayout",
-		{ FillDirection: Enum.FillDirection.Vertical, SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, gap) },
-		parent,
-	);
-}
-
-/** Script-free scrolling (user UI rule): AutomaticCanvasSize + a layout; Lua never touches CanvasSize. */
-function scrolling(parent: Instance, props: Partial<WritableInstanceProperties<ScrollingFrame>>): ScrollingFrame {
-	const frame = make(
-		"ScrollingFrame",
-		{
-			BackgroundTransparency: 1,
-			BorderSizePixel: 0,
-			CanvasSize: new UDim2(),
-			AutomaticCanvasSize: Enum.AutomaticSize.Y,
-			ScrollingDirection: Enum.ScrollingDirection.Y,
-			ScrollBarThickness: 6,
-			ScrollBarImageColor3: COLORS.dim,
-			VerticalScrollBarInset: Enum.ScrollBarInset.ScrollBar,
-		},
-		parent,
-	);
-	for (const [key, value] of pairs(props as unknown as Record<string, unknown>)) {
-		(frame as unknown as Record<string, unknown>)[key] = value;
-	}
-	return frame;
-}
-
-function addButton(row: Instance, text: string, onClick: () => void, color = COLORS.button): TextButton {
-	const button = style(make("TextButton", { AutoButtonColor: true }), text, 15, COLORS.text, Enum.Font.BuilderSansMedium);
-	button.TextXAlignment = Enum.TextXAlignment.Center;
-	button.TextWrapped = false;
-	button.BackgroundColor3 = color;
-	button.Size = UDim2.fromOffset(0, 34);
-	button.AutomaticSize = Enum.AutomaticSize.X;
-	button.LayoutOrder = row.GetChildren().size();
-	corner(button, 6);
-	pad(button, 0, 12);
-	button.Parent = row;
-	button.Activated.Connect(onClick);
-	return button;
-}
-
-/** One column of rows inside the content ScrollingFrame. Rows are rebuilt freely; the layout sizes everything. */
-class Page {
-	private order = 0;
-
-	constructor(readonly frame: Frame) {}
-
-	static mount(parent: Instance, gap = 6): Page {
-		const frame = make("Frame", {
-			Name: "Page",
-			BackgroundTransparency: 1,
-			Size: UDim2.fromScale(1, 0),
-			AutomaticSize: Enum.AutomaticSize.Y,
-		});
-		verticalList(frame, gap);
-		frame.Parent = parent;
-		return new Page(frame);
-	}
-
-	place<T extends GuiObject>(gui: T): T {
-		this.order += 1;
-		gui.LayoutOrder = this.order;
-		gui.Parent = this.frame;
-		return gui;
-	}
-
-	clear() {
-		for (const child of this.frame.GetChildren()) {
-			if (child.IsA("GuiObject")) child.Destroy();
-		}
-		this.order = 0;
-	}
-
-	group(gap = 6): Page {
-		const page = Page.mount(this.frame, gap);
-		this.order += 1;
-		page.frame.LayoutOrder = this.order;
-		return page;
-	}
-
-	section(text: string): TextLabel {
-		const label = style(make("TextLabel", { BackgroundTransparency: 1 }), text, 16, COLORS.accent, Enum.Font.BuilderSansBold);
-		label.Size = new UDim2(1, 0, 0, 26);
-		label.TextYAlignment = Enum.TextYAlignment.Bottom;
-		return this.place(label);
-	}
-
-	text(text: string, color = COLORS.text, code = false): TextLabel {
-		const label = style(
-			make("TextLabel", { BackgroundTransparency: 1 }),
-			text,
-			code ? 14 : 15,
-			color,
-			code ? Enum.Font.Code : Enum.Font.BuilderSans,
-		);
-		label.Size = UDim2.fromScale(1, 0);
-		label.AutomaticSize = Enum.AutomaticSize.Y;
-		return this.place(label);
-	}
-
-	/** Label + value. The value is a read-only TextBox, so it can be selected and copied (commit hashes, job ids). */
-	field(name: string, value: string, color = COLORS.text): TextBox {
-		const row = this.place(
-			make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y }),
-		);
-		const label = style(make("TextLabel", { BackgroundTransparency: 1 }, row), name, 15, COLORS.dim);
-		label.Size = new UDim2(0.34, -8, 0, 0);
-		label.AutomaticSize = Enum.AutomaticSize.Y;
-		const box = style(make("TextBox", { BackgroundTransparency: 1 }, row), value, 14, color, Enum.Font.Code);
-		box.TextEditable = false;
-		box.ClearTextOnFocus = false;
-		box.Size = new UDim2(0.66, 0, 0, 0);
-		box.Position = UDim2.fromScale(0.34, 0);
-		box.AutomaticSize = Enum.AutomaticSize.Y;
-		return box;
-	}
-
-	/** Label + an editable value; `commit` runs when the player presses Enter with a changed value. */
-	editable(name: string, value: string, commit: (text: string) => void): TextBox {
-		const box = this.field(name, value);
-		box.TextEditable = true;
-		box.BackgroundTransparency = 0;
-		box.BackgroundColor3 = COLORS.row;
-		corner(box, 4);
-		pad(box, 4, 6);
-		box.FocusLost.Connect((enterPressed) => {
-			if (enterPressed && box.Text !== value) commit(box.Text);
-			else box.Text = value;
-		});
-		return box;
-	}
-
-	/** A horizontal row of buttons (wraps on narrow screens). Add buttons with addButton(row, ...). */
-	buttons(): Frame {
-		const row = this.place(
-			make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, 34), AutomaticSize: Enum.AutomaticSize.Y }),
-		);
-		make(
-			"UIListLayout",
-			{
-				FillDirection: Enum.FillDirection.Horizontal,
-				SortOrder: Enum.SortOrder.LayoutOrder,
-				Padding: new UDim(0, 6),
-				Wraps: true,
-			},
-			row,
-		);
-		return row;
-	}
-
-	/** A full-width clickable row (dex children). */
-	link(text: string, onClick: () => void): TextButton {
-		const button = style(make("TextButton", { AutoButtonColor: true }), text, 15);
-		button.BackgroundColor3 = COLORS.row;
-		button.TextWrapped = false;
-		button.TextTruncate = Enum.TextTruncate.AtEnd;
-		button.Size = new UDim2(1, 0, 0, 34);
-		corner(button, 4);
-		pad(button, 0, 8);
-		button.Activated.Connect(onClick);
-		return this.place(button);
-	}
-
-	input(placeholder: string, height: number, multiline: boolean): TextBox {
-		const box = style(make("TextBox", { ClearTextOnFocus: false }), "", 15);
-		box.PlaceholderText = placeholder;
-		box.PlaceholderColor3 = COLORS.dim;
-		box.MultiLine = multiline;
-		box.TextYAlignment = Enum.TextYAlignment.Top;
-		box.BackgroundColor3 = COLORS.row;
-		box.Size = new UDim2(1, 0, 0, height);
-		corner(box, 6);
-		pad(box, 6, 8);
-		return this.place(box);
-	}
+/** What survives swaps (kernel persist store). Fields after `tab` were added later: older stores lack them. */
+interface MenuState {
+	open: boolean;
+	tab: string;
+	/** tab -> selected sub-tab */
+	sub?: Record<string, string>;
+	/** Sound after a hot swap on dev-channel servers (default on). */
+	reloadSound?: boolean;
+	/** Window rectangle in pixels; undefined = the centered default. */
+	window?: Rect;
 }
 
 // Formatting --------------------------------------------------------------------------------------------------------
@@ -387,6 +223,25 @@ function swapText(ok: boolean, reply: unknown): [string, Color3] {
 	return [`Failed: ${report.error ?? "unknown error"}`, COLORS.bad];
 }
 
+function serverText(ok: boolean, reply: unknown): [string, Color3] {
+	if (!ok) return [`Failed: ${str(reply)}`, COLORS.bad];
+	const report = (typeIs(reply, "table") ? reply : {}) as NewServerReport;
+	if (report.ok) return ["Teleporting...", COLORS.good];
+	return [`Failed: ${report.error ?? "unknown error"}`, COLORS.bad];
+}
+
+/** "5m ago" from an ISO time. */
+function ago(iso: unknown): string {
+	if (!typeIs(iso, "string")) return "-";
+	const [ok, time] = pcall(() => DateTime.fromIsoDate(iso));
+	if (!ok || time === undefined) return iso;
+	const elapsed = math.max(0, DateTime.now().UnixTimestamp - time.UnixTimestamp);
+	if (elapsed < 60) return "just now";
+	if (elapsed < 3600) return `${math.floor(elapsed / 60)}m ago`;
+	if (elapsed < 86400) return `${math.floor(elapsed / 3600)}h ago`;
+	return `${math.floor(elapsed / 86400)}d ago`;
+}
+
 function statLine(stat: LeafStats, previous: [number, number, number] | undefined, now: number): string {
 	let line = `in ${stat.inbound}  out ${stat.outbound}  rejected ${stat.rejected}  errors ${stat.errors}`;
 	if (previous) {
@@ -415,12 +270,30 @@ function every(trove: Trove, interval: number, callback: () => void) {
 	});
 }
 
+/** The newest log entries that fit the reply caps (DEVLOGS_MAX_ENTRIES, DEVLOGS_MAX_BYTES), oldest first. */
+function shareableLogs(entries: LogEntry[]): LogEntry[] {
+	const picked = new Array<LogEntry>();
+	let bytes = 0;
+	for (let index = entries.size() - 1; index >= 0 && picked.size() < DEVLOGS_MAX_ENTRIES; index--) {
+		const entry = entries[index];
+		const text = entry.text.sub(1, 600);
+		bytes += text.size() + 32;
+		if (bytes > DEVLOGS_MAX_BYTES) break;
+		picked.push({ i: entry.i, t: entry.t, kind: entry.kind, text });
+	}
+	const ordered = new Array<LogEntry>();
+	for (let index = picked.size() - 1; index >= 0; index--) ordered.push(picked[index]);
+	return ordered;
+}
+
 // The menu ----------------------------------------------------------------------------------------------------------
 
 interface Ui {
 	gui: ScreenGui;
 	toggle: TextButton;
 	window: Frame;
+	/** Right of the tab list: [sub-tabs] [toolbar] [content] [footer], top to bottom. */
+	body: Frame;
 	content: ScrollingFrame;
 	tabButtons: Map<TabName, TextButton>;
 }
@@ -430,12 +303,25 @@ interface Waiter {
 	timeout: thread;
 }
 
+export interface DevtoolsClient {
+	/** Call once the client generation is up (all modules started). */
+	readonly started: () => void;
+}
+
 /**
  * Starts the dev menu for this client generation. Everything it creates or connects lives in `trove`, so a swap
- * removes it; the open state and tab survive the swap through the kernel persist store.
+ * removes it; the open state, tab, sub-tab, window rectangle and options survive the swap through the kernel persist
+ * store.
  */
-export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDispatcher, trove: Trove) {
-	const state = kernel.persist(PERSIST_KEY, () => ({ open: false, tab: "Artifact" as string }));
+export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDispatcher, trove: Trove): DevtoolsClient {
+	const state = kernel.persist<MenuState>(PERSIST_KEY, () => ({ open: false, tab: "Artifact" }));
+	if (state.sub === undefined) state.sub = {};
+	const subs = state.sub;
+	// Before sub-tabs, Branch was a top-level tab.
+	if (state.tab === "Branch") {
+		state.tab = "Server";
+		subs.Server = "Branch";
+	}
 
 	// Requests ------------------------------------------------------------------------------------------------------
 	// Random start: a response addressed to the previous generation can't match one of ours after a swap.
@@ -466,13 +352,39 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	dispatcher.setRaw(DEV_RESPONSE, (id, ok, result) => {
 		if (typeIs(id, "number")) resume(id, ok === true, result);
 	});
+	// Every client answers the server's log requests (Logs > Others on a dev's menu). Never shown, never logged.
+	dispatcher.setRaw(DEVLOGS_REQUEST, (id, since) => {
+		if (!typeIs(id, "number")) return;
+		const entries = kernel.logs(typeIs(since, "number") ? since : undefined, DEVLOGS_MAX_ENTRIES);
+		kernel.send(DEVLOGS_RESPONSE, id, shareableLogs(entries));
+	});
 	trove.add(() => {
 		dispatcher.removeRaw(DEV_RESPONSE);
+		dispatcher.removeRaw(DEVLOGS_REQUEST);
 		for (const [, waiter] of waiters) {
 			if (coroutine.status(waiter.timeout) === "suspended") task.cancel(waiter.timeout);
 		}
 		waiters.clear();
 	});
+
+	// Reload sound --------------------------------------------------------------------------------------------------
+	const effectiveChannel = (): unknown => {
+		if (kernel.channel !== undefined) return kernel.channel;
+		return ReplicatedStorage.FindFirstChild("TypeTorch")?.GetAttribute("Channel");
+	};
+
+	/** After a hot swap (client generation > 1) on a dev-channel server, for devs, unless turned off. */
+	const playReloadSound = (force = false) => {
+		if (!force) {
+			if (kernel.generation <= 1 || state.reloadSound === false || effectiveChannel() !== "dev") return;
+			const [ok, info] = pcall(() => kernel.devStatus());
+			if (!ok || !typeIs(info, "table") || info.dev !== true) return;
+		}
+		const sound = trove.add(make("Sound", { Name: "TypeTorchReload", SoundId: RELOAD_SOUND, Volume: 0.5 }));
+		sound.Parent = SoundService;
+		SoundService.PlayLocalSound(sound);
+		trove.add(task.delay(4, () => trove.remove(sound)));
+	};
 
 	// Tabs ------------------------------------------------------------------------------------------------------------
 
@@ -522,49 +434,66 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		});
 	};
 
-	const renderServer = ({ page, trove: tabTrove }: TabContext) => {
-		page.text("Loading...", COLORS.dim);
+	// Server > Status
+	const renderServer = ({ page, trove: tabTrove, toolbar }: TabContext) => {
+		const bar = toolbar();
+		const soundButton = addButton(bar, "", () => {
+			state.reloadSound = state.reloadSound === false;
+			paintSound();
+			if (state.reloadSound) playReloadSound(true); // preview
+		});
+		const paintSound = () => {
+			const on = state.reloadSound !== false;
+			soundButton.Text = on ? "Reload sound: on" : "Reload sound: off";
+			paintSelected(soundButton, on, COLORS.info);
+		};
+		paintSound();
+
+		const body = page.group();
+		body.text("Loading...", COLORS.dim);
 		every(tabTrove, REFRESH, () => {
 			const [ok, reply] = call("status");
-			page.clear();
+			body.clear();
 			if (!ok || !typeIs(reply, "table")) {
-				page.text(str(reply), COLORS.bad);
+				body.text(str(reply), COLORS.bad);
 				return;
 			}
 			const status = (reply as StatusReply).server;
-			page.section("Server");
-			page.field("Type", status.serverType);
-			page.field("Job", str(status.jobId));
-			page.field("Place version", str(status.placeVersion));
-			page.field("Branch", `${str(status.branch)} (${str(status.channel)})`);
-			page.field("Uptime", duration(status.uptime));
+			body.section("Server");
+			body.field("Type", status.serverType);
+			body.field("Job", str(status.jobId));
+			body.field("Place version", str(status.placeVersion));
+			body.field("Branch", `${str(status.branch)} (${str(status.channel)})`);
+			if (status.pinned !== undefined) body.field("Pinned", status.pinned ? "yes" : "no", status.pinned ? COLORS.warn : COLORS.text);
+			body.field("Uptime", duration(status.uptime));
 			if (status.generation) {
-				page.field("Generation", status.generation.name);
-				page.field("Generation uptime", duration(status.generation.uptime));
+				body.field("Generation", status.generation.name);
+				body.field("Generation uptime", duration(status.generation.uptime));
 			}
-			page.field("Players", `${status.players}/${status.maxPlayers}`);
-			page.field("Memory", typeIs(status.memoryMb, "number") ? "%.0f MB".format(status.memoryMb) : "-");
-			page.field("Lua heap", typeIs(status.luaHeapKb, "number") ? "%.1f MB".format(status.luaHeapKb / 1024) : "-");
-			page.field("Registry seq", str(status.appliedSeq));
-			if (status.registryError !== undefined) page.field("Registry error", status.registryError, COLORS.bad);
+			body.field("Players", `${status.players}/${status.maxPlayers}`);
+			body.field("Memory", typeIs(status.memoryMb, "number") ? "%.0f MB".format(status.memoryMb) : "-");
+			body.field("Lua heap", typeIs(status.luaHeapKb, "number") ? "%.1f MB".format(status.luaHeapKb / 1024) : "-");
+			body.field("Registry seq", str(status.appliedSeq));
+			body.field("Kernel", `${status.kernelVersion} (API ${status.kernelApi})`);
+			if (status.registryError !== undefined) body.field("Registry error", status.registryError, COLORS.bad);
 
-			page.section("Last deploy message");
+			body.section("Last deploy message");
 			const message = status.lastMessage;
 			if (message) {
-				page.field("Artifact", str(message.data.i ?? message.data.a));
-				page.field("Branch", str(message.data.b));
-				page.field("Latency", message.sentMs !== undefined ? `${message.receivedMs - message.sentMs} ms` : "-");
-				page.field("Received", utc(math.floor(message.receivedMs / 1000)));
+				body.field("Artifact", str(message.data.i ?? message.data.a));
+				body.field("Branch", str(message.data.b));
+				body.field("Latency", message.sentMs !== undefined ? `${message.receivedMs - message.sentMs} ms` : "-");
+				body.field("Received", utc(math.floor(message.receivedMs / 1000)));
 			} else {
-				page.text("None since boot", COLORS.dim);
+				body.text("None since boot", COLORS.dim);
 			}
 
-			page.section("Swaps");
+			body.section("Swaps");
 			const history = status.history ?? [];
-			if (history.size() === 0) page.text("None", COLORS.dim);
+			if (history.size() === 0) body.text("None", COLORS.dim);
 			for (let index = history.size() - 1; index >= 0; index--) {
 				const entry = history[index];
-				page.field(
+				body.field(
 					entry.name,
 					`${entry.reason}, ${entry.at}, load ${seconds(entry.loadSeconds)}, swap ${ms(entry.swapSeconds)}`,
 				);
@@ -572,36 +501,76 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		});
 	};
 
-	let logRealm: "server" | "client" = "server";
-	const renderLogs = ({ page, trove: tabTrove, content }: TabContext) => {
-		const bar = page.buttons();
+	let logRealm: "server" | "client" | "other" = "server";
+	/** UserId whose client logs Logs > Others shows. */
+	let logPlayer: number | undefined;
+	const renderLogs = ({ page, trove: tabTrove, content, toolbar }: TabContext) => {
+		const bar = toolbar();
+		const heading = page.text("", COLORS.accent);
+		heading.Font = Enum.Font.BuilderSansBold;
+		heading.Visible = false;
+		const note = page.text("", COLORS.bad);
+		note.Visible = false;
+		const picker = page.group(4);
 		const rows = page.group(2);
 		const shown = new Array<TextLabel>();
 		let since = 0;
 		let epoch = 0;
+		let lastOther = -math.huge;
+		let pickerTrove: Trove | undefined;
 
+		const setNote = (text: string) => {
+			note.Text = text;
+			note.Visible = text !== "";
+		};
 		const realmButtons = new Map<string, TextButton>();
 		const highlight = () => {
-			for (const [realm, button] of realmButtons) {
-				button.BackgroundColor3 = realm === logRealm ? COLORS.accent : COLORS.button;
-				button.TextColor3 = realm === logRealm ? COLORS.dark : COLORS.text;
-			}
+			for (const [realm, button] of realmButtons) paintSelected(button, realm === logRealm);
 		};
+		const showHeading = () => {
+			if (logRealm !== "other" || logPlayer === undefined) {
+				heading.Visible = false;
+				return;
+			}
+			const target = Players.GetPlayerByUserId(logPlayer);
+			heading.Text = `Logs: ${target ? target.DisplayName : `user ${logPlayer}`}`;
+			heading.Visible = true;
+		};
+		const reset = () => {
+			epoch += 1;
+			since = 0;
+			lastOther = -math.huge;
+			shown.clear();
+			rows.clear();
+			setNote("");
+		};
+
 		const fetch = () => {
 			const realm = logRealm;
 			const myEpoch = epoch;
 			let entries: LogEntry[];
 			if (realm === "client") {
 				entries = kernel.logs(since, 200);
-			} else {
+			} else if (realm === "server") {
 				const [ok, reply] = call("logs", since);
 				if (myEpoch !== epoch) return;
 				if (!ok || !typeIs(reply, "table")) {
-					rows.text(`Logs: ${str(reply)}`, COLORS.bad);
+					setNote(`Logs: ${str(reply)}`);
+					return;
+				}
+				entries = reply as LogEntry[];
+			} else {
+				if (logPlayer === undefined || os.clock() - lastOther < OTHER_LOGS_REFRESH) return;
+				lastOther = os.clock();
+				const [ok, reply] = call("logs.player", { userId: logPlayer, since });
+				if (myEpoch !== epoch) return;
+				if (!ok || !typeIs(reply, "table")) {
+					setNote(typeIs(reply, "string") ? OTHER_LOG_ERRORS[reply] ?? `Failed: ${reply}` : "Failed");
 					return;
 				}
 				entries = reply as LogEntry[];
 			}
+			setNote("");
 			for (const entry of entries) {
 				if (entry.i <= since) continue;
 				since = entry.i;
@@ -610,18 +579,48 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			}
 			while (shown.size() > MAX_LOG_ROWS) shown.shift()?.Destroy();
 		};
-		const selectRealm = (realm: "server" | "client") => {
+
+		const closePicker = () => {
+			pickerTrove?.clean();
+			picker.clear();
+		};
+		const openPicker = () => {
+			closePicker();
+			pickerTrove = tabTrove.extend();
+			picker.text("Pick a player", COLORS.dim);
+			playerSelector(picker, pickerTrove, {
+				exclude: (player) => player === Players.LocalPlayer,
+				selected: logPlayer,
+				emptyText: "No other players",
+				onSelect: (player) => {
+					logPlayer = player.UserId;
+					closePicker();
+					reset();
+					showHeading();
+					spawnIn(tabTrove, fetch);
+				},
+			});
+		};
+
+		const selectRealm = (realm: "server" | "client" | "other") => {
 			logRealm = realm;
-			epoch += 1;
-			since = 0;
-			shown.clear();
-			rows.clear();
+			reset();
+			closePicker();
+			if (realm === "other") {
+				// The selector opens every time "Others" is pressed; the list is empty until a player is picked.
+				logPlayer = undefined;
+				openPicker();
+			}
+			showHeading();
 			highlight();
 			spawnIn(tabTrove, fetch);
 		};
 		realmButtons.set("server", addButton(bar, "Server", () => selectRealm("server")));
 		realmButtons.set("client", addButton(bar, "Client", () => selectRealm("client")));
+		realmButtons.set("other", addButton(bar, "Others", () => selectRealm("other")));
 		highlight();
+		showHeading();
+		if (logRealm === "other" && logPlayer === undefined) openPicker();
 
 		// Newest at the bottom: follow new lines unless the player scrolled up.
 		let follow = true;
@@ -637,12 +636,16 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 
 	let dexRealm: "client" | "server" = "client";
 	let dexPath = new Array<string>();
-	const renderDex = ({ page, trove: tabTrove }: TabContext) => {
-		const bar = page.buttons();
+	let dexQuery = "";
+	const renderDex = ({ page, trove: tabTrove, toolbar }: TabContext) => {
+		// Sticky toolbar: [up] [Client] [Server] [search...] [Refresh]
+		const bar = toolbar();
 		const pathLabel = page.text("", COLORS.dim, true);
 		const note = page.text("", COLORS.dim);
+		const childrenList = page.group(4);
 		const body = page.group(4);
 		let epoch = 0;
+		let children = new Array<DexNode>();
 
 		const canEdit = () => dexRealm === "client" || kernel.channel === "dev";
 		const setNote = (text: string, color = COLORS.dim) => {
@@ -654,26 +657,43 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 
 		const realmButtons = new Map<string, TextButton>();
 		const highlight = () => {
-			for (const [realm, button] of realmButtons) {
-				button.BackgroundColor3 = realm === dexRealm ? COLORS.accent : COLORS.button;
-				button.TextColor3 = realm === dexRealm ? COLORS.dark : COLORS.text;
-			}
+			for (const [realm, button] of realmButtons) paintSelected(button, realm === dexRealm);
 		};
 
 		let load: () => void;
+		let search: TextBox;
 		const navigate = (path: string[]) => {
 			dexPath = path;
+			dexQuery = "";
+			search.Text = "";
 			setNote("");
 			load();
 		};
 
-		const draw = (children: DexNode[], properties: DexProperty[]) => {
-			body.clear();
-			body.section(`Children (${children.size()})`);
-			for (const node of children) {
+		/** Children filtered by the search box (name or class, case-insensitive). */
+		const drawChildren = () => {
+			childrenList.clear();
+			const query = (dexQuery.lower().match("^%s*(.-)%s*$")[0] as string | undefined) ?? "";
+			const shown =
+				query === ""
+					? children
+					: children.filter(
+							(node) =>
+								node.name.lower().find(query, 1, true)[0] !== undefined ||
+								node.className.lower().find(query, 1, true)[0] !== undefined,
+						);
+			childrenList.section(
+				query === "" ? `Children (${children.size()})` : `Children (${shown.size()} of ${children.size()})`,
+			);
+			for (const node of shown) {
 				const count = node.children > 0 ? ` (${node.children})` : "";
-				body.link(`${node.name}   ${node.className}${count}`, () => navigate([...dexPath, node.name]));
+				childrenList.link(`${node.name}   ${node.className}${count}`, () => navigate([...dexPath, node.name]));
 			}
+		};
+
+		const draw = (properties: DexProperty[]) => {
+			drawChildren();
+			body.clear();
 			body.section("Properties");
 			const editable = canEdit();
 			for (const property of properties) {
@@ -732,6 +752,12 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			setNote("Deleted", COLORS.good);
 		};
 
+		const clearLists = () => {
+			children = [];
+			childrenList.clear();
+			body.clear();
+		};
+
 		load = () => {
 			epoch += 1;
 			const myEpoch = epoch;
@@ -739,13 +765,12 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			const path = [...dexPath];
 			pathLabel.Text = ["game", ...path].join(" / ");
 			spawnIn(tabTrove, () => {
-				let children: DexNode[];
 				let properties: DexProperty[];
 				if (realm === "client") {
 					const instance = resolvePath(path);
 					if (!instance) {
 						setNote("Not found", COLORS.bad);
-						body.clear();
+						clearLists();
 						return;
 					}
 					children = listChildren(instance);
@@ -755,7 +780,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 					if (myEpoch !== epoch) return;
 					if (!childrenOk) {
 						setNote(`Failed: ${str(childrenReply)}`, COLORS.bad);
-						body.clear();
+						clearLists();
 						return;
 					}
 					const [propertiesOk, propertiesReply] = call("dex.props", path);
@@ -763,24 +788,35 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 					children = childrenReply as DexNode[];
 					properties = propertiesOk ? (propertiesReply as DexProperty[]) : [];
 				}
-				draw(children, properties);
+				draw(properties);
 			});
 		};
 
 		const selectRealm = (realm: "client" | "server") => {
-			if (realm !== dexRealm) dexPath = [];
+			if (realm !== dexRealm) {
+				dexPath = [];
+				dexQuery = "";
+				search.Text = "";
+			}
 			dexRealm = realm;
 			highlight();
 			setNote("");
 			load();
 		};
-		realmButtons.set("client", addButton(bar, "Client", () => selectRealm("client")));
-		realmButtons.set("server", addButton(bar, "Server", () => selectRealm("server")));
-		addButton(bar, "Up", () => {
+		upButton(bar, () => {
 			if (dexPath.size() === 0) return;
 			const path = [...dexPath];
 			path.pop();
 			navigate(path);
+		});
+		realmButtons.set("client", addButton(bar, "Client", () => selectRealm("client")));
+		realmButtons.set("server", addButton(bar, "Server", () => selectRealm("server")));
+		search = searchBox(bar, "Search");
+		search.Text = dexQuery;
+		tabTrove.connect(search.GetPropertyChangedSignal("Text"), () => {
+			if (search.Text === dexQuery) return;
+			dexQuery = search.Text;
+			drawChildren();
 		});
 		addButton(bar, "Refresh", () => load());
 		highlight();
@@ -813,51 +849,210 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		});
 	};
 
-	const renderBranch = ({ page, trove: tabTrove }: TabContext) => {
-		const bar = page.buttons();
-		const result = page.text("", COLORS.dim);
-		result.Visible = false;
-		const list = page.group(8);
-		list.text("Loading...", COLORS.dim);
+	// Server > Branch: this server, the branch picker, the artifact picker; Reload / Rollback in a sticky footer.
+	const renderBranch = ({ page, trove: tabTrove, footer }: TabContext) => {
+		const foot = footer();
+		const bar = foot.buttons();
+		const result = foot.place(
+			style(make("TextLabel", { BackgroundTransparency: 1 }), "", 14, COLORS.dim, Enum.Font.BuilderSansMedium),
+		);
+		result.TextWrapped = false;
+		result.TextTruncate = Enum.TextTruncate.AtEnd;
+		result.Size = new UDim2(1, 0, 0, 18);
+		const setResult = (text: string, color: Color3) => {
+			result.Text = text;
+			result.TextColor3 = color;
+			bump(result);
+		};
 
-		const run = (label: string, op: string, payload?: unknown) =>
+		const body = page.group(6);
+		body.text("Loading...", COLORS.dim);
+
+		interface Picker {
+			status?: KernelStatus;
+			you?: DevInfo;
+			branches: BranchInfo[];
+			branchesError?: string;
+			artifacts?: ArtifactEntry[];
+			/** Why the artifact list is missing (kernel 0.1.0, or an error). */
+			artifactsNote?: string;
+		}
+		let data: Picker | undefined;
+		const expanded = new Set<string>();
+		let busy = false;
+		let epoch = 0;
+		let load: () => void;
+		let draw: () => void;
+
+		/** Runs one action op (one at a time); a successful swap restarts this menu in the new generation. */
+		const act = (label: string, op: string, payload?: unknown) => {
+			if (busy) return;
+			busy = true;
+			setResult(`${label}...`, COLORS.dim);
 			spawnIn(tabTrove, () => {
-				result.Visible = true;
-				result.Text = `${label}...`;
-				result.TextColor3 = COLORS.dim;
 				const [ok, reply] = call(op, payload);
-				const [text, color] = swapText(ok, reply);
-				result.Text = text;
-				result.TextColor3 = color;
+				busy = false;
+				const [text, color] = op === "newServer" ? serverText(ok, reply) : swapText(ok, reply);
+				setResult(text, color);
+				if (op !== "newServer") load();
 			});
-		addButton(bar, "Reload", () => run("Reloading", "reload"));
-		addButton(bar, "Rollback", () => run("Rolling back", "rollback"));
+		};
+		addButton(bar, "Reload", () => act("Reloading", "reload"));
+		addButton(bar, "Rollback", () => act("Rolling back", "rollback"));
 
-		spawnIn(tabTrove, () => {
-			const [statusOk, statusReply] = call("status");
-			const [branchesOk, branchesReply] = call("branches");
-			list.clear();
-			if (!branchesOk || !typeIs(branchesReply, "table")) {
-				list.text(`Branches: ${str(branchesReply)}`, COLORS.bad);
+		draw = () => {
+			if (!data) return;
+			body.clear();
+			const status = data.status;
+			const serverType = status?.serverType;
+			const isPublic = serverType === "public";
+			const isAdmin = data.you?.role === "owner" || data.you?.role === "admin";
+			const running = status?.generation?.artifact;
+
+			// This server.
+			body.section("This server");
+			if (status) {
+				body.field("Type", serverType ?? "-");
+				body.field("Branch", str(status.branch));
+				body.field("Channel", str(status.channel));
+				let artifactText = str(running?.id);
+				if (running?.commit !== undefined && artifactText.find(running.commit, 1, true)[0] === undefined) {
+					artifactText += `  ${running.commit}`;
+				}
+				body.field("Running", artifactText);
+				const pinned = status.pinned === true;
+				body.field("Pinned", pinned ? "yes, until the next deploy" : "no", pinned ? COLORS.warn : COLORS.text);
+			} else {
+				body.text("Status unavailable", COLORS.bad);
+			}
+
+			// Branch picker: switch here (private/reserved/studio) or open a reserved server (public).
+			body.section("Branches");
+			if (data.branchesError !== undefined) body.text(`Failed: ${data.branchesError}`, COLORS.bad);
+			else if (data.branches.size() === 0) body.text("None", COLORS.dim);
+			for (const branch of data.branches) {
+				const current = status !== undefined && branch.name === status.branch;
+				let title = `<b>${escapeRich(branch.name)}</b>`;
+				if (current) title += tag("CURRENT", COLORS.accent);
+				const parts = [branch.channel as string];
+				if (branch.seq !== undefined) parts.push(`#${branch.seq}`);
+				parts.push(branch.commit ?? branch.artifactId ?? "-");
+				if (branch.deployedAt !== undefined) parts.push(ago(branch.deployedAt));
+				const detail = escapeRich(parts.join("  "));
+				if (serverType === undefined || (current && !isPublic)) {
+					body.row(title, detail);
+				} else if (isPublic) {
+					body.row(title, detail, {
+						label: "Open server",
+						onClick: () => act(`Opening a server on ${branch.name}`, "newServer", branch.name),
+					});
+				} else {
+					body.row(title, detail, {
+						label: "Switch",
+						color: COLORS.accent,
+						onClick: () => act(`Switching to ${branch.name}`, "switch", branch.name),
+					});
+				}
+			}
+
+			// Artifact picker: newest first, grouped by branch.
+			body.section("Artifacts");
+			const artifacts = data.artifacts;
+			if (artifacts === undefined) {
+				body.text(data.artifactsNote ?? "Unavailable", COLORS.dim);
 				return;
 			}
-			const status = statusOk && typeIs(statusReply, "table") ? (statusReply as StatusReply).server : undefined;
-			const serverType = status?.serverType;
-			const canSwitch = serverType === "private" || serverType === "reserved" || serverType === "studio";
-			const branches = branchesReply as BranchInfo[];
-			list.section("Branches");
-			if (branches.size() === 0) list.text("None", COLORS.dim);
-			for (const branch of branches) {
-				const current = status !== undefined && branch.name === status.branch;
-				const card = list.group(4);
-				const title = card.text(`${branch.name}${current ? "  (this server)" : ""}`, COLORS.text);
-				title.Font = Enum.Font.BuilderSansBold;
-				card.text(`${branch.channel}  ${str(branch.artifactId)}  ${str(branch.commit)}`, COLORS.dim, true);
-				const actions = card.buttons();
-				if (canSwitch && !current) addButton(actions, "Switch here", () => run(`Switching to ${branch.name}`, "switch", branch.name));
-				addButton(actions, "New server", () => run(`Opening a server on ${branch.name}`, "newServer", branch.name));
+			if (artifacts.size() === 0) body.text("None yet", COLORS.dim);
+			const order = new Array<string>();
+			const groups = new Map<string, ArtifactEntry[]>();
+			for (const entry of artifacts) {
+				let group = groups.get(entry.branch);
+				if (!group) {
+					group = [];
+					groups.set(entry.branch, group);
+					order.push(entry.branch);
+				}
+				group.push(entry);
 			}
-		});
+			for (const branchName of order) {
+				const group = groups.get(branchName)!;
+				const heading = body.text(`${branchName}  (${group[0].channel})`, COLORS.text);
+				heading.Font = Enum.Font.BuilderSansBold;
+				const showAll = expanded.has(branchName);
+				group.forEach((entry, index) => {
+					if (!showAll && index >= ARTIFACTS_PER_BRANCH) return;
+					const short = entry.commit ?? entry.artifactId ?? `asset ${entry.assetId}`;
+					let title = `<b>${entry.seq !== undefined ? `#${entry.seq}  ` : ""}${escapeRich(short)}</b>`;
+					if (entry.running) title += tag(status?.pinned === true ? "RUNNING, PINNED" : "RUNNING", COLORS.good);
+					if (entry.live) title += tag("LIVE", COLORS.info);
+					if (entry.rollback) title += tag("ROLLBACK", COLORS.warn);
+					const detail = escapeRich(`${entry.artifactId ?? `asset-${entry.assetId}`}  ${ago(entry.at)}`);
+					if (entry.running || serverType === undefined) {
+						body.row(title, detail);
+						return;
+					}
+					// Mirrors the kernel's rules (it re-checks): any dev loads on private/reserved/studio servers; on a
+					// public server only owner/admin, and only prod-channel artifacts. Otherwise open a reserved server
+					// pinned to it.
+					const canLoad = !isPublic || (isAdmin && entry.channel === "prod");
+					if (canLoad) {
+						let armed = !isPublic; // a public server swaps every player: tap twice
+						body.row(title, detail, {
+							label: "Load",
+							color: COLORS.accent,
+							onClick: (button) => {
+								if (!armed) {
+									armed = true;
+									button.Text = "Confirm";
+									return;
+								}
+								act(`Loading ${short}`, "pin", entry.assetId);
+							},
+						});
+					} else {
+						body.row(title, detail, {
+							label: "Open server",
+							onClick: () =>
+								act(`Opening a server on ${short}`, "newServer", { branch: entry.branch, assetId: entry.assetId }),
+						});
+					}
+				});
+				if (!showAll && group.size() > ARTIFACTS_PER_BRANCH) {
+					body.link(`Show all ${group.size()}`, () => {
+						expanded.add(branchName);
+						draw();
+					});
+				}
+			}
+		};
+
+		load = () => {
+			epoch += 1;
+			const myEpoch = epoch;
+			spawnIn(tabTrove, () => {
+				const [statusOk, statusReply] = call("status");
+				const [branchesOk, branchesReply] = call("branches");
+				const [artifactsOk, artifactsReply] = call("artifacts");
+				if (myEpoch !== epoch) return;
+				const fresh: Picker = { branches: [] };
+				if (statusOk && typeIs(statusReply, "table")) {
+					fresh.status = (statusReply as StatusReply).server;
+					fresh.you = (statusReply as StatusReply).you;
+				}
+				if (branchesOk && typeIs(branchesReply, "table")) fresh.branches = branchesReply as BranchInfo[];
+				else fresh.branchesError = str(branchesReply);
+				const reply = (typeIs(artifactsReply, "table") ? artifactsReply : {}) as {
+					supported?: boolean;
+					list?: ArtifactEntry[];
+				};
+				if (!artifactsOk) fresh.artifactsNote = `Failed: ${str(artifactsReply)}`;
+				else if (reply.supported !== true) fresh.artifactsNote = "Kernel 0.2 needed for artifacts";
+				else fresh.artifacts = reply.list ?? [];
+				data = fresh;
+				draw();
+			});
+		};
+		load();
 	};
 
 	const renderState = ({ page, trove: tabTrove }: TabContext) => {
@@ -897,7 +1092,75 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			page.text(claudeError("prod_channel"), COLORS.dim);
 			return;
 		}
-		const sessionLine = page.text("Checking session...", COLORS.dim);
+
+		// Session line, with Unpair on the right once paired.
+		const sessionRow = page.place(
+			make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y }),
+		);
+		const sessionLine = style(make("TextLabel", { BackgroundTransparency: 1 }, sessionRow), "Checking session...", 15, COLORS.dim);
+		sessionLine.Size = new UDim2(1, -96, 0, 32);
+		sessionLine.AutomaticSize = Enum.AutomaticSize.Y;
+		sessionLine.TextYAlignment = Enum.TextYAlignment.Center;
+		const unpairButton = style(
+			make("TextButton", { AutoButtonColor: true, Visible: false }, sessionRow),
+			"Unpair",
+			15,
+			COLORS.text,
+			Enum.Font.BuilderSansMedium,
+		);
+		unpairButton.TextXAlignment = Enum.TextXAlignment.Center;
+		unpairButton.TextWrapped = false;
+		unpairButton.BackgroundColor3 = COLORS.button;
+		unpairButton.AnchorPoint = new Vector2(1, 0);
+		unpairButton.Position = UDim2.fromScale(1, 0);
+		unpairButton.Size = UDim2.fromOffset(88, 32);
+		corner(unpairButton, 6);
+
+		// Pairing (allowed, not paired yet): a masked code box. A TextBox can't mask, so its real text is invisible
+		// (TextTransparency 1) under a label that shows one dot per character.
+		const pairing = page.group(6);
+		pairing.frame.Visible = false;
+		const codeRow = pairing.place(
+			make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, 34) }),
+		);
+		const codeBox = style(make("TextBox", { ClearTextOnFocus: false }, codeRow), "", 15, COLORS.text, Enum.Font.Code);
+		codeBox.TextTransparency = 1;
+		codeBox.PlaceholderText = "";
+		codeBox.TextWrapped = false;
+		codeBox.ClipsDescendants = true;
+		codeBox.BackgroundColor3 = COLORS.row;
+		codeBox.Size = new UDim2(1, -96, 1, 0);
+		corner(codeBox, 6);
+		pad(codeBox, 0, 8);
+		const mask = style(make("TextLabel", { BackgroundTransparency: 1, Interactable: false }, codeBox), "", 15, COLORS.dim, Enum.Font.Code);
+		mask.Size = UDim2.fromScale(1, 1);
+		mask.TextWrapped = false;
+		mask.TextTruncate = Enum.TextTruncate.AtEnd;
+		const paintMask = () => {
+			const length = math.min(codeBox.Text.size(), 64);
+			mask.Text = length > 0 ? string.rep("•", length) : "Pairing code";
+			mask.TextColor3 = length > 0 ? COLORS.text : COLORS.dim;
+		};
+		paintMask();
+		tabTrove.connect(codeBox.GetPropertyChangedSignal("Text"), paintMask);
+		const pairButton = style(make("TextButton", { AutoButtonColor: true }, codeRow), "Pair", 15, COLORS.dark, Enum.Font.BuilderSansMedium);
+		pairButton.TextXAlignment = Enum.TextXAlignment.Center;
+		pairButton.TextWrapped = false;
+		pairButton.BackgroundColor3 = COLORS.accent;
+		pairButton.AnchorPoint = new Vector2(1, 0);
+		pairButton.Position = UDim2.fromScale(1, 0);
+		pairButton.Size = UDim2.fromOffset(88, 34);
+		corner(pairButton, 6);
+		pairing.text("Paste the pairing code printed by typetorch-dev-server", COLORS.dim);
+		const pairResult = pairing.text("", COLORS.dim);
+		pairResult.Visible = false;
+		const showPairResult = (text: string, color: Color3) => {
+			pairResult.Text = text;
+			pairResult.TextColor3 = color;
+			pairResult.Visible = text !== "";
+		};
+
+		// Composer (paired): prompt, then [Dex path] [Errors] ... [Send].
 		const composer = page.group(6);
 		composer.frame.Visible = false;
 		const list = page.group(8);
@@ -905,22 +1168,18 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		const box = composer.input("Describe a change", 120, true);
 		box.Text = claudeDraft;
 		tabTrove.connect(box.GetPropertyChangedSignal("Text"), () => (claudeDraft = box.Text));
-		const toggles = composer.buttons();
-		const paintToggle = (button: TextButton, on: boolean) => {
-			button.BackgroundColor3 = on ? COLORS.info : COLORS.button;
-			button.TextColor3 = on ? COLORS.dark : COLORS.text;
-		};
-		const pathToggle = addButton(toggles, "Dex path", () => {
-			attachPath = !attachPath;
-			paintToggle(pathToggle, attachPath);
-		});
-		const errorsToggle = addButton(toggles, "Errors", () => {
-			attachErrors = !attachErrors;
-			paintToggle(errorsToggle, attachErrors);
-		});
-		paintToggle(pathToggle, attachPath);
-		paintToggle(errorsToggle, attachErrors);
 		const actions = composer.buttons();
+		const pathToggle = addButton(actions, "Dex path", () => {
+			attachPath = !attachPath;
+			paintSelected(pathToggle, attachPath, COLORS.info);
+		});
+		const errorsToggle = addButton(actions, "Errors", () => {
+			attachErrors = !attachErrors;
+			paintSelected(errorsToggle, attachErrors, COLORS.info);
+		});
+		paintSelected(pathToggle, attachPath, COLORS.info);
+		paintSelected(errorsToggle, attachErrors, COLORS.info);
+		spacer(actions);
 		const result = composer.text("", COLORS.dim);
 		result.Visible = false;
 		const showResult = (text: string, color: Color3) => {
@@ -931,6 +1190,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 
 		let requests = new Array<ClaudeRequestView>();
 		let sending = false;
+		let pairingBusy = false;
 
 		const replace = (updated: ClaudeRequestView) => {
 			const index = requests.findIndex((request) => request.id === updated.id);
@@ -939,6 +1199,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		};
 
 		let drawList: () => void;
+		let refreshSession: () => void;
 		const cancel = (id: string) =>
 			spawnIn(tabTrove, () => {
 				const [ok, reply] = call("claude.cancel", id);
@@ -972,7 +1233,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			}
 		};
 
-		const refreshSession = () => {
+		refreshSession = () => {
 			const [ok, reply] = call("claude.session");
 			if (!ok || !typeIs(reply, "table")) {
 				sessionLine.Text = `Failed: ${str(reply)}`;
@@ -980,17 +1241,24 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				return;
 			}
 			const session = reply as ClaudeSessionView;
+			const paired = session.paired === true;
 			if (!session.available) {
 				sessionLine.Text = claudeError("not_connected");
 				sessionLine.TextColor3 = COLORS.warn;
 			} else if (!session.allowed) {
 				sessionLine.Text = `Session ${session.label}: ${claudeError("not_allowed")}`;
 				sessionLine.TextColor3 = COLORS.warn;
+			} else if (!paired) {
+				sessionLine.Text = `Session ${session.label}: not paired`;
+				sessionLine.TextColor3 = COLORS.warn;
 			} else {
 				sessionLine.Text = `Session ${session.label} on ${str(session.branch)}`;
 				sessionLine.TextColor3 = COLORS.good;
 			}
-			composer.frame.Visible = session.available && session.allowed;
+			const usable = session.available && session.allowed;
+			pairing.frame.Visible = usable && !paired;
+			composer.frame.Visible = usable && paired;
+			unpairButton.Visible = usable && paired;
 			requests = session.requests;
 			drawList();
 		};
@@ -1015,6 +1283,43 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			return errors.filter((_, index) => index >= errors.size() - 5);
 		};
 
+		// The code goes to the server once and is cleared at once; it is never logged.
+		const pair = () => {
+			const code = (codeBox.Text.match("^%s*(.-)%s*$")[0] as string | undefined) ?? "";
+			codeBox.Text = "";
+			if (code === "") return showPairResult("Paste a code first", COLORS.warn);
+			showPairResult("Pairing...", COLORS.dim);
+			const [ok, reply] = call("claude.pair", { code });
+			const answer = (typeIs(reply, "table") ? reply : {}) as ClaudeReply;
+			if (ok && answer.ok === true) {
+				showPairResult("", COLORS.dim);
+				showResult("Paired", COLORS.good);
+				refreshSession();
+			} else {
+				showPairResult(claudeError(ok ? answer.error : reply), COLORS.bad);
+			}
+		};
+		const startPair = () => {
+			if (pairingBusy) return;
+			pairingBusy = true;
+			spawnIn(tabTrove, () => {
+				const [ok, err] = pcall(pair);
+				pairingBusy = false;
+				if (!ok) showPairResult(`Failed: ${err}`, COLORS.bad);
+			});
+		};
+		pairButton.Activated.Connect(startPair);
+		tabTrove.connect(codeBox.FocusLost, (enterPressed) => {
+			if (enterPressed) startPair();
+		});
+		unpairButton.Activated.Connect(() =>
+			spawnIn(tabTrove, () => {
+				call("claude.unpair");
+				showResult("", COLORS.dim);
+				refreshSession();
+			}),
+		);
+
 		const send = () => {
 			const prompt = (box.Text.match("^%s*(.-)%s*$")[0] as string | undefined) ?? "";
 			if (prompt === "") return showResult(claudeError("empty"), COLORS.warn);
@@ -1031,6 +1336,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				drawList();
 			} else {
 				showResult(claudeError(ok ? answer.error : reply), COLORS.bad);
+				// The dev machine dropped this pairing: show the code box again.
+				if (ok && answer.error === "needs_pairing") refreshSession();
 			}
 		};
 		addButton(
@@ -1057,14 +1364,15 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		});
 	};
 
-	const RENDER: Record<TabName, (tab: TabContext) => void> = {
+	/** Keys: a tab name, or "Tab/Sub" for tabs with sub-tabs. */
+	const RENDER: Record<string, (tab: TabContext) => void> = {
 		Artifact: renderArtifact,
-		Server: renderServer,
+		"Server/Status": renderServer,
+		"Server/Branch": renderBranch,
 		Logs: renderLogs,
 		Dex: renderDex,
 		Network: renderNetwork,
 		State: renderState,
-		Branch: renderBranch,
 		Claude: renderClaude,
 	};
 
@@ -1075,7 +1383,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	let isOpen = false;
 	let dev = false;
 
-	const selectTab = (name: TabName) => {
+	const selectTab = (name: TabName, sub?: string) => {
 		if (!ui || !tabTrove) return;
 		tabTrove.clean();
 		state.tab = name;
@@ -1083,12 +1391,58 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			button.BackgroundColor3 = tab === name ? COLORS.accent : COLORS.header;
 			button.TextColor3 = tab === name ? COLORS.dark : COLORS.text;
 		}
+		const body = ui.body;
+		const tabSubs = SUBTABS[name];
+		let key: string = name;
+		if (tabSubs) {
+			let chosen = sub ?? subs[name];
+			if (chosen === undefined || !tabSubs.includes(chosen)) chosen = tabSubs[0];
+			subs[name] = chosen;
+			key = `${name}/${chosen}`;
+			const subBar = tabTrove.add(buttonRow());
+			subBar.Name = "SubTabs";
+			subBar.LayoutOrder = 1;
+			subBar.BackgroundTransparency = 0;
+			subBar.BackgroundColor3 = COLORS.header;
+			pad(subBar, 6, 10);
+			for (const subName of tabSubs) {
+				paintSelected(
+					addButton(subBar, subName, () => selectTab(name, subName)),
+					subName === chosen,
+				);
+			}
+			subBar.Parent = body;
+		}
 		ui.content.CanvasPosition = Vector2.zero;
 		const page = Page.mount(ui.content);
 		tabTrove.add(page.frame);
-		const [ok, err] = pcall(() => RENDER[name]({ page, trove: tabTrove!, content: ui!.content }));
+		const toolbar = () => {
+			const row = tabTrove!.add(buttonRow());
+			row.Name = "Toolbar";
+			row.LayoutOrder = 2;
+			pad(row, 6, 10);
+			row.Parent = body;
+			return row;
+		};
+		const footer = () => {
+			const frame = tabTrove!.add(
+				make("Frame", {
+					Name: "Footer",
+					BackgroundTransparency: 1,
+					Size: UDim2.fromScale(1, 0),
+					AutomaticSize: Enum.AutomaticSize.Y,
+					LayoutOrder: 4,
+				}),
+			);
+			pad(frame, 8, 10);
+			const footerPage = Page.mount(frame, 4);
+			frame.Parent = body;
+			return footerPage;
+		};
+		const render = RENDER[key];
+		const [ok, err] = pcall(() => render({ page, trove: tabTrove!, content: ui!.content, toolbar, footer }));
 		if (!ok) {
-			$warn(`[devtools] ${name} tab failed: ${err}`);
+			$warn(`[devtools] ${key} tab failed: ${err}`);
 			page.text(`This tab failed: ${err}`, COLORS.bad);
 		}
 	};
@@ -1127,6 +1481,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		corner(toggle, 8);
 		toggle.Activated.Connect(() => (isOpen ? close() : open()));
 
+		// Offset-sized and centered on its AnchorPoint, so UIScale pops grow from the middle; placed by applyRect.
 		const window = make(
 			"Frame",
 			{
@@ -1135,20 +1490,19 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				Visible: false,
 				AnchorPoint: new Vector2(0.5, 0.5),
 				Position: UDim2.fromScale(0.5, 0.5),
-				Size: UDim2.fromScale(0.62, 0.7),
+				Size: UDim2.fromOffset(MIN_SIZE.X, MIN_SIZE.Y),
 				BackgroundColor3: COLORS.window,
 				BorderSizePixel: 0,
 				ClipsDescendants: true,
 			},
 			gui,
 		);
-		make("UISizeConstraint", { MinSize: new Vector2(360, 280), MaxSize: new Vector2(900, 640) }, window);
 		make("UIStroke", { Color: COLORS.stroke, Thickness: 1, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, window);
 		corner(window, 10);
 
 		const header = make(
 			"Frame",
-			{ Name: "Header", BackgroundColor3: COLORS.header, BorderSizePixel: 0, Size: new UDim2(1, 0, 0, HEADER) },
+			{ Name: "Header", Active: true, BackgroundColor3: COLORS.header, BorderSizePixel: 0, Size: new UDim2(1, 0, 0, HEADER) },
 			window,
 		);
 		const title = style(make("TextLabel", { BackgroundTransparency: 1 }, header), "TypeTorch", 18, COLORS.accent);
@@ -1199,15 +1553,138 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			tabButtons.set(name, button);
 		});
 
-		const content = scrolling(window, {
-			Name: "Content",
-			Position: UDim2.fromOffset(TAB_WIDTH, HEADER),
-			Size: new UDim2(1, -TAB_WIDTH, 1, -HEADER),
-		});
+		// Right of the tabs: [sub-tabs] [toolbar] [content] [footer]. The bars come and go with the tab; the content
+		// takes whatever height is left (UIFlexItem Fill), so toolbars and footers stay put while it scrolls.
+		const body = make(
+			"Frame",
+			{
+				Name: "Body",
+				BackgroundTransparency: 1,
+				Position: UDim2.fromOffset(TAB_WIDTH, HEADER),
+				Size: new UDim2(1, -TAB_WIDTH, 1, -HEADER),
+			},
+			window,
+		);
+		verticalList(body, 0);
+		const content = scrolling(body, { Name: "Content", Size: UDim2.fromScale(1, 1), LayoutOrder: 3 });
+		make("UIFlexItem", { FlexMode: Enum.UIFlexMode.Fill }, content);
 		pad(content, 10, 10);
 
+		// Resize grip (bottom-right, touch-sized): two diagonal strokes.
+		const grip = make(
+			"TextButton",
+			{
+				Name: "Grip",
+				Text: "",
+				AutoButtonColor: false,
+				BackgroundTransparency: 1,
+				AnchorPoint: new Vector2(1, 1),
+				Position: UDim2.fromScale(1, 1),
+				Size: UDim2.fromOffset(GRIP, GRIP),
+				ZIndex: 5,
+			},
+			window,
+		);
+		for (const [length, offset] of [
+			[0.75, 0.55],
+			[0.4, 0.75],
+		]) {
+			make(
+				"Frame",
+				{
+					BackgroundColor3: COLORS.dim,
+					BorderSizePixel: 0,
+					AnchorPoint: new Vector2(0.5, 0.5),
+					Position: UDim2.fromScale(offset, offset),
+					Size: new UDim2(length, 0, 0, 2),
+					Rotation: -45,
+					ZIndex: 5,
+				},
+				grip,
+			);
+		}
+
 		gui.Parent = playerGui;
-		return { gui, toggle, window, content, tabButtons };
+
+		// Placement: drag by the header, resize by the grip, double-tap the header to reset. Saved across swaps.
+		const viewport = (): Vector2 => {
+			if (gui.AbsoluteSize.X > 0 && gui.AbsoluteSize.Y > 0) return gui.AbsoluteSize;
+			return Workspace.CurrentCamera?.ViewportSize ?? new Vector2(1280, 720);
+		};
+		const limits = (): [min: Vector2, max: Vector2] => {
+			const view = viewport();
+			const max = new Vector2(math.max(200, view.X - SCREEN_MARGIN * 2), math.max(160, view.Y - SCREEN_MARGIN * 2));
+			return [new Vector2(math.min(MIN_SIZE.X, max.X), math.min(MIN_SIZE.Y, max.Y)), max];
+		};
+		const defaultRect = (): Rect => {
+			const view = viewport();
+			const [min, max] = limits();
+			const w = math.clamp(view.X * 0.62, min.X, math.max(min.X, math.min(DEFAULT_MAX.X, max.X)));
+			const h = math.clamp(view.Y * 0.7, min.Y, math.max(min.Y, math.min(DEFAULT_MAX.Y, max.Y)));
+			return { x: (view.X - w) / 2, y: (view.Y - h) / 2, w, h };
+		};
+		let rect = defaultRect();
+		/** Clamps to the screen (size within limits, header on screen) and places the window. */
+		const applyRect = (wanted: Rect, save: boolean) => {
+			const view = viewport();
+			const [min, max] = limits();
+			const w = math.clamp(wanted.w, min.X, max.X);
+			const h = math.clamp(wanted.h, min.Y, max.Y);
+			const x = math.clamp(wanted.x, 0, math.max(0, view.X - w));
+			const y = math.clamp(wanted.y, 0, math.max(0, view.Y - HEADER));
+			rect = { x, y, w, h };
+			window.Size = UDim2.fromOffset(w, h);
+			window.Position = UDim2.fromOffset(x + w / 2, y + h / 2);
+			if (save) state.window = { x, y, w, h };
+		};
+		const place = () => {
+			if (state.window) applyRect(state.window, true);
+			else applyRect(defaultRect(), false);
+		};
+		place();
+		trove.connect(gui.GetPropertyChangedSignal("AbsoluteSize"), place);
+
+		let drag: { kind: "move" | "resize"; input: InputObject; start: Vector3; from: Rect } | undefined;
+		let lastHeaderTap = 0;
+		const isPointer = (input: InputObject) =>
+			input.UserInputType === Enum.UserInputType.MouseButton1 || input.UserInputType === Enum.UserInputType.Touch;
+		const begin = (kind: "move" | "resize", input: InputObject) => {
+			if (!isPointer(input) || input.UserInputState !== Enum.UserInputState.Begin) return;
+			if (kind === "move") {
+				const now = os.clock();
+				if (now - lastHeaderTap < DOUBLE_TAP) {
+					lastHeaderTap = 0;
+					drag = undefined;
+					state.window = undefined;
+					applyRect(defaultRect(), false);
+					return;
+				}
+				lastHeaderTap = now;
+			}
+			drag = { kind, input, start: input.Position, from: { ...rect } };
+		};
+		trove.connect(header.InputBegan, (input) => begin("move", input));
+		trove.connect(grip.InputBegan, (input) => begin("resize", input));
+		trove.connect(UserInputService.InputChanged, (input) => {
+			if (!drag) return;
+			const mouseMove =
+				input.UserInputType === Enum.UserInputType.MouseMovement &&
+				drag.input.UserInputType === Enum.UserInputType.MouseButton1;
+			if (!mouseMove && input !== drag.input) return;
+			const delta = input.Position.sub(drag.start);
+			const from = drag.from;
+			if (drag.kind === "move") applyRect({ x: from.x + delta.X, y: from.y + delta.Y, w: from.w, h: from.h }, true);
+			else applyRect({ x: from.x, y: from.y, w: from.w + delta.X, h: from.h + delta.Y }, true);
+		});
+		trove.connect(UserInputService.InputEnded, (input) => {
+			if (!drag) return;
+			const mouseUp =
+				input.UserInputType === Enum.UserInputType.MouseButton1 &&
+				drag.input.UserInputType === Enum.UserInputType.MouseButton1;
+			if (mouseUp || input === drag.input) drag = undefined;
+		});
+
+		return { gui, toggle, window, body, content, tabButtons };
 	};
 
 	open = () => {
@@ -1259,4 +1736,11 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		if (isOpen) close();
 		else open();
 	});
+
+	return {
+		started: () => {
+			const [ok, err] = pcall(() => playReloadSound());
+			if (!ok) $warn(`[devtools] reload sound failed: ${err}`);
+		},
+	};
 }

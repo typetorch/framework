@@ -46,12 +46,42 @@ export interface SwapReport {
 	swapSeconds?: number;
 	/** Set when the new generation failed to start and the kernel rolled back to this artifact. */
 	rollbackTo?: string;
+	/** Kernel 0.2+: set by pinArtifact when the server now holds the pinned artifact. */
+	pinned?: boolean;
+}
+
+export interface NewServerReport {
+	ok: boolean;
+	error?: string;
+	branch?: string;
+	/** Kernel 0.2+: the artifact the reserved server boots pinned to. */
+	assetId?: number;
+}
+
+/** One known deployment (kernel 0.2+ `artifacts()`), newest first. */
+export interface ArtifactEntry {
+	/** Deploy sequence number (global across branches); absent for entries only known from a server's history. */
+	seq?: number;
+	branch: string;
+	channel: Channel;
+	artifactId?: string;
+	assetId: number;
+	commit?: string;
+	/** ISO time of the deploy. */
+	at?: string;
+	rollback?: boolean;
+	/** The current head of its branch. */
+	live: boolean;
+	/** This server's current generation. */
+	running: boolean;
 }
 
 export interface BranchInfo {
 	name: string;
 	channel: Channel;
 	artifactId?: string;
+	/** Kernel 0.2+. */
+	assetId?: number;
 	commit?: string;
 	seq?: number;
 	deployedAt?: string;
@@ -74,6 +104,8 @@ export interface KernelStatus {
 	serverType: ServerType;
 	branch: string;
 	channel?: Channel;
+	/** Kernel 0.2+: the running generation was pinned (holds until a newer deploy of this server's branch). */
+	pinned?: boolean;
 	startedAt: number;
 	uptime: number;
 	generation?: { name: string; number: number; startedAt: number; uptime: number; artifact: ArtifactInfo };
@@ -119,7 +151,20 @@ export interface ServerKernel {
 	reload(player: Player): SwapReport;
 	rollback(player: Player): SwapReport;
 	switchBranch(player: Player, branch: string): SwapReport;
-	newServer(player: Player, branch: string): { ok: boolean; error?: string; branch?: string };
+	/**
+	 * Reserves a server on `branch` and teleports the player. `assetId` needs kernel 0.2+ (older kernels ignore it and
+	 * open the branch head), so only pass it when `pinArtifact` exists.
+	 */
+	newServer(player: Player, branch: string, assetId?: number): NewServerReport;
+
+	// Kernel 0.2+ (additive, same kernelApi): feature-detect with `typeIs((kernel as any).artifacts, "function")`.
+	/** Known deployments, newest first. Yields (DataStore). */
+	artifacts?(): ArtifactEntry[];
+	/**
+	 * Swap this server to a known artifact and hold it until a newer deploy of its branch. Devs on private/reserved/
+	 * studio servers; on public servers only owner/admin and only prod-channel artifacts.
+	 */
+	pinArtifact?(player: Player, assetId: number): SwapReport;
 }
 
 export interface ClientKernel {

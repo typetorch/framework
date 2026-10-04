@@ -34,6 +34,7 @@ export type {
 	ServerSender,
 } from "./net";
 export type {
+	ArtifactEntry,
 	ArtifactInfo,
 	BranchInfo,
 	Channel,
@@ -43,6 +44,7 @@ export type {
 	Kernel,
 	KernelStatus,
 	LogEntry,
+	NewServerReport,
 	ServerKernel,
 	ServerType,
 	SwapReport,

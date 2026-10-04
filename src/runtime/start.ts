@@ -100,6 +100,8 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 	};
 
 	let stopNetwork: () => void;
+	/** Devtools client hook, run once every module has started (e.g. the reload sound). */
+	let onStarted: (() => void) | undefined;
 	if (realm === "server") {
 		const serverKernel = kernel as ServerKernel;
 		const dispatcher = new ServerDispatcher(serverKernel);
@@ -113,7 +115,7 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 		const dispatcher = new ClientDispatcher(clientKernel);
 		setClientDispatcher(dispatcher);
 		clientKernel.onMessage(dispatcher.dispatch);
-		if (options.devtools !== false) startDevtoolsClient(clientKernel, dispatcher, root.extend());
+		if (options.devtools !== false) onStarted = startDevtoolsClient(clientKernel, dispatcher, root.extend()).started;
 		stopNetwork = () => {
 			dispatcher.stop();
 			setClientDispatcher(undefined);
@@ -182,6 +184,8 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 		// In the module trove, so a soft stop also ends an onStart that is still running (e.g. a loop).
 		if (has(instance, "onStart")) running.trove.add(task.spawn(() => (instance as OnStart).onStart()));
 	}
+
+	onStarted?.();
 
 	$print(
 		`TypeTorch ${realm} started ${runningModules.size()} modules in ${math.floor((os.clock() - startedAt) * 1000)} ms (artifact ${kernel.artifact.id}, generation ${kernel.generation})`,

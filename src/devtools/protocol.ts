@@ -1,6 +1,13 @@
 /** Dev menu wire format (raw channels on the kernel transport; plans/10). */
 export const DEV_REQUEST = "__tt/dev";
 export const DEV_RESPONSE = "__tt/devres";
+/** Server -> any client: (requestId, since) asks for that client's recent logs (a dev's Logs > Others view). */
+export const DEVLOGS_REQUEST = "__tt/devlogs-req";
+/** Client -> server: (requestId, LogEntry[]) the answer; accepted only from the asked player for a pending id. */
+export const DEVLOGS_RESPONSE = "__tt/devlogs-res";
+/** What a client sends at most: its newest entries, capped by count and by text bytes. */
+export const DEVLOGS_MAX_ENTRIES = 200;
+export const DEVLOGS_MAX_BYTES = 48 * 1024;
 
 export interface DexNode {
 	name: string;
@@ -68,6 +75,8 @@ export interface ClaudeRequestView {
 export interface ClaudeSessionView {
 	available: boolean;
 	allowed: boolean;
+	/** The requesting player has tokens for this session (paired with the code printed by typetorch-dev-server). */
+	paired?: boolean;
 	branch?: string;
 	/** First 8 characters of the session id. */
 	label: string;
