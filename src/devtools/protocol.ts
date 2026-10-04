@@ -76,6 +76,8 @@ export interface ClaudeRequestView {
 
 export interface ClaudeSessionView {
 	available: boolean;
+	/** No session yet, but the server started recently: the next announcement may still come (claude.ts). */
+	searching?: boolean;
 	allowed: boolean;
 	/** The requesting player has tokens for this session (paired with the code printed by typetorch-dev-server). */
 	paired?: boolean;
