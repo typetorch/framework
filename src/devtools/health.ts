@@ -76,12 +76,12 @@ export function signingIssues(status: KernelStatus): HealthIssue[] {
 		}
 	}
 	if (signing.fallbackRevoked === true) {
-		issues.push({ level: "error", title: "Fallback key revoked", detail: "Replace it, then kernel deploy." });
+		issues.push({ level: "error", title: "Fallback Key revoked", detail: "Replace it, then kernel deploy." });
 	}
 	if (signing.mode === "none" && status.signedOnly === true) {
 		issues.push({ level: "error", title: "No signing keys", detail: "Prod refuses every deploy. Run keys init." });
 	} else if (signing.mode === "fallback only") {
-		issues.push({ level: "warn", title: "Fallback key only", detail: "The key asset never loaded here." });
+		issues.push({ level: "warn", title: "Fallback Key only", detail: "The Root Key asset never loaded here." });
 	}
 	const rejected = status.rejected;
 	if (rejected !== undefined && rejected.total > 0) {

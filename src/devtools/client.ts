@@ -450,12 +450,12 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	};
 
 	const drawSigning = (target: Page, keys: KeyTrust) => {
-		const modeText = keys.mode === "key asset" ? "Key asset" : keys.mode === "fallback only" ? "Fallback key only" : "No keys";
+		const modeText = keys.mode === "key asset" ? "Root Key" : keys.mode === "fallback only" ? "Fallback Key only" : "No keys";
 		const modeColor = keys.mode === "key asset" ? COLORS.good : keys.mode === "fallback only" || !keys.signedOnly ? COLORS.warn : COLORS.bad;
 		target.field("Mode", modeText, modeColor);
 		target.field("This server", keys.signedOnly ? "Signed deploys only" : "Unsigned allowed (dev)");
 		const assetText = keys.keyAssetId !== undefined ? `${keys.keyAssetId}${keys.version !== undefined ? `  v${keys.version}` : ""}` : "-";
-		target.field("Key asset", assetText);
+		target.field("Root Key asset", assetText);
 		target.field("Loaded", keys.loaded ? utc(keys.loadedAt) : "Never", keys.loaded ? COLORS.text : COLORS.warn);
 		if (keys.lastError !== undefined) {
 			const when = keys.lastErrorAt !== undefined ? `  ${utc(keys.lastErrorAt)}` : "";
@@ -469,14 +469,14 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		}
 		const rejected = keys.rejected;
 		target.field("Rejected", rejected.total > 0 ? `${rejected.total}  ${rejected.last?.why ?? ""}` : "0", rejected.total > 0 ? COLORS.warn : COLORS.text);
-		target.text("Public keys", COLORS.dim);
+		target.text("Root Key", COLORS.dim);
 		if (keys.publicKeys.size() === 0) target.text("None", keys.loaded ? COLORS.bad : COLORS.dim);
 		for (const key of keys.publicKeys) keyRow(target, key, key.revoked === true ? tag("REVOKED", COLORS.bad) : "");
 		if (keys.revokedKeys.size() > 0) {
 			target.text("Revoked", COLORS.dim);
 			for (const key of keys.revokedKeys) keyRow(target, key, "", COLORS.dim);
 		}
-		target.text("Fallback key", COLORS.dim);
+		target.text("Fallback Key", COLORS.dim);
 		const fallback = keys.fallback;
 		if (fallback) keyRow(target, fallback, fallback.revoked ? tag("REVOKED", COLORS.bad) : "", fallback.revoked ? COLORS.bad : COLORS.text);
 		else target.text("None", keys.signedOnly ? COLORS.warn : COLORS.dim);
