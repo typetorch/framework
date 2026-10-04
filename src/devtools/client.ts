@@ -17,7 +17,6 @@ import { runningModules } from "../runtime/registry";
 import { bump, popIn, popOut } from "../ui";
 import { ExplorerPersist, mountExplorer } from "./explorer";
 import {
-	copyText,
 	DEV_REQUEST,
 	DEV_RESPONSE,
 	DEVLOGS_MAX_BYTES,
@@ -41,6 +40,7 @@ import {
 	chevron,
 	buttonRow,
 	COLORS,
+	copyText,
 	corner,
 	escapeRich,
 	make,
