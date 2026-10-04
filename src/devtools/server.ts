@@ -6,6 +6,7 @@ import type { ServerDispatcher } from "../net/runtime";
 import { runningModules } from "../runtime/registry";
 import { registerRemoteClaude } from "./claude";
 import { registerExplorerOps } from "./explorer-server";
+import { registerAdminOps } from "./admin-server";
 import { listChildren, listProperties, resolvePath, setProperty } from "./dex";
 import {
 	DEV_REQUEST,
@@ -229,6 +230,10 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 			ops.set(op, handler);
 		}, kernel),
 	);
+	// Admin ops (admin.players/tp/bring/respawn/kick/ban/unban/history/servers/join/newServer/shutdown).
+	registerAdminOps((op, handler) => {
+		ops.set(op, handler);
+	}, kernel, trove);
 
 	const reply = (player: Player, id: unknown, ok: boolean, result: unknown) => kernel.send(player, DEV_RESPONSE, id, ok, result);
 

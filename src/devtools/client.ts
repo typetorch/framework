@@ -31,6 +31,7 @@ import {
 } from "./protocol";
 import { CLAUDE_TOOL_REQUEST, CLAUDE_TOOL_RESPONSE, findTool, inspectTool } from "./claude-tools";
 import { renderClaudeChat } from "./claude-ui";
+import { adminTabs } from "./admin-ui";
 import { describeState } from "./state";
 import { badgeLevel, checkHealth, HealthIssue, HealthLevel, ServerFacts } from "./health";
 import {
@@ -98,10 +99,10 @@ const OTHER_LOG_ERRORS: Record<string, string> = {
 	rate_limited: "Slow down",
 };
 
-const TABS = ["Artifact", "Server", "Logs", "Dex", "Network", "State", "Claude"] as const;
+const TABS = ["Artifact", "Server", "Admin", "Logs", "Dex", "Network", "State", "Claude"] as const;
 type TabName = (typeof TABS)[number];
 /** Tabs with sub-tabs (a segmented bar on top of the content); the first one is the default. */
-const SUBTABS: Partial<Record<TabName, readonly string[]>> = { Server: ["Status", "Branch"] };
+const SUBTABS: Partial<Record<TabName, readonly string[]>> = { Server: ["Status", "Branch"], Admin: ["Players", "Servers", "Bans"] };
 
 interface StatusReply {
 	server: KernelStatus;
@@ -940,6 +941,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		Artifact: renderArtifact,
 		"Server/Status": renderServer,
 		"Server/Branch": renderBranch,
+		...adminTabs({ kernel, call }),
 		Logs: renderLogs,
 		Dex: renderDex,
 		Network: renderNetwork,
