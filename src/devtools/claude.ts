@@ -1,8 +1,20 @@
-import { HttpService, MessagingService, RunService } from "@rbxts/services";
+import { HttpService, MessagingService, Players, RunService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
-import { $warn } from "rbxts-transform-debug";
-import type { ServerKernel } from "../kernel";
+import { $print, $warn } from "rbxts-transform-debug";
+import type { LogEntry, ServerKernel } from "../kernel";
+import type { ServerDispatcher } from "../net/runtime";
+import {
+	CLAUDE_TOOL_REQUEST,
+	CLAUDE_TOOL_RESPONSE,
+	findTool,
+	inspectTool,
+	loadstringAvailable,
+	playerList,
+	runLuau,
+	toJson,
+} from "./claude-tools";
 import type {
+	ClaudeApproval,
 	ClaudeConversation,
 	ClaudeConversationSummary,
 	ClaudeEvent,
@@ -33,6 +45,14 @@ import type {
  * client polls "claude.events" about once a second while a prompt runs; replies are re-checked here field by field
  * (types, lengths, counts) before they reach a client. "claude.conversations" / "claude.conversation" reopen a chat
  * after a swap or a rejoin; the dev machine only shows a user their own conversations.
+ *
+ * GAME TOOLS: Claude's game tools (run_luau, game_logs, inspect, find, game_status) act on the server that sent the
+ * prompt. The dev machine publishes a wake message on TypeTorch/tool {v, s, j, x, u} (no code); this server also
+ * polls GET /v1/game/pending while a dev's prompt runs. A request is served only when: this server's effective channel
+ * is "dev", j is this server's JobId, s is the session, u is in the session's users, is in this server, is still a
+ * dev and is paired here. The request itself is fetched with that user's token (the dev machine checks user AND job).
+ * run_luau needs the dev's approval in their chat (or "always" for that chat) and LoadStringEnabled; every run is
+ * logged (description and outcome, never the code) and the last 20 are kept.
  */
 
 const TOPIC = "TypeTorch/remote-claude";
@@ -61,6 +81,15 @@ const MAX_EVENT_TEXT = 4000;
 const CONVERSATION_TEXT_BUDGET = 120_000;
 const MAX_MESSAGES = 30;
 const MAX_CONVERSATIONS = 20;
+const TOOL_TOPIC = "TypeTorch/tool";
+const TOOL_POLL = 2;
+/** Prompts older than this are not polled for tool requests. */
+const TOOL_POLL_WINDOW = 30 * 60;
+const APPROVAL_SECONDS = 60;
+const CLIENT_TOOL_TIMEOUT = 10;
+const MAX_EXEC_LOG = 20;
+const LOADSTRING_HELP =
+	"loadstring is unavailable on this server: the kernel place needs ServerScriptService.LoadStringEnabled (republish the TypeTorch kernel 0.2 place)";
 
 interface Session {
 	sid: string;
@@ -104,6 +133,17 @@ interface Store {
 	sent: Map<number, number[]>;
 	/** userId -> refresh token from pairing (added later: stores from older generations lack it). */
 	pairings?: Map<number, Pairing>;
+	/** "<userId>:<conversationId>" -> true: run_luau runs without asking in that chat (added later). */
+	alwaysRun?: Map<string, boolean>;
+	/** The last run_luau runs: who, what, outcome (never the code). Added later. */
+	execs?: { at: number; user: number; description: string; ok: boolean; error?: string }[];
+}
+
+/** What the dev's server-side tools need from the devtools server. */
+export interface ClaudeToolDeps {
+	dispatcher: ServerDispatcher;
+	/** The player's client logs (Logs > Others path): [ok, entries or error]. */
+	clientLogs: (target: Player, since: number) => [ok: boolean, result: unknown];
 }
 
 type Failure = { ok: false; error: string };
@@ -151,6 +191,8 @@ function cleanEvent(raw: unknown): ClaudeEvent | undefined {
 	if (block !== undefined) event.block = block;
 	const state = shortString(data.state, 20);
 	if (state !== undefined) event.state = state;
+	const detail = shortString(data.detail, 2000);
+	if (detail !== undefined) event.detail = detail;
 	return event;
 }
 
@@ -202,10 +244,12 @@ function encodedSize(value: unknown): number {
 	return ok ? json.size() : math.huge;
 }
 
-export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Map<string, DevOp>) {
+export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Map<string, DevOp>, deps?: ClaudeToolDeps) {
 	const store = kernel.persist<Store>(PERSIST_KEY, () => ({ requests: [], sent: new Map(), pairings: new Map() }));
 	if (store.pairings === undefined) store.pairings = new Map();
 	const pairings = store.pairings;
+	/** run_luau snippets waiting for a player's approval (set up in the game tools section below). */
+	let approvalsFor: (player: Player) => ClaudeApproval[] | undefined = () => undefined;
 	// userId -> [access token, expires at (unix)]. Generation memory only: never persisted, sent or printed.
 	const tokens = new Map<number, [string, number]>();
 	const exchanging = new Set<number>();
@@ -652,6 +696,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 			events: cleanEvents(reply.events, MAX_EVENTS),
 			next: nextIndex !== undefined ? math.max(since, math.floor(nextIndex)) : since,
 			more: reply.more === true,
+			approvals: approvalsFor(player),
 		};
 	});
 
@@ -721,4 +766,254 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		const conversation: ClaudeConversation = { id: payload, title: shortString(reply.title, 80) ?? "chat", messages };
 		return { ok: true, conversation };
 	});
+	// Game tools ------------------------------------------------------------------------------------------------------
+	if (store.alwaysRun === undefined) store.alwaysRun = new Map();
+	if (store.execs === undefined) store.execs = [];
+	const alwaysRun = store.alwaysRun;
+	const execs = store.execs;
+	const handled = new Set<string>();
+	interface PendingApproval {
+		userId: number;
+		approval: ClaudeApproval;
+		expiresAt: number;
+		thread: thread;
+		timeout: thread;
+	}
+	const pendingApprovals = new Map<string, PendingApproval>();
+
+	approvalsFor = (player: Player): ClaudeApproval[] | undefined => {
+		const list = new Array<ClaudeApproval>();
+		for (const [, pending] of pendingApprovals) {
+			if (pending.userId !== player.UserId) continue;
+			list.push({ ...pending.approval, expiresIn: math.max(0, math.floor(pending.expiresAt - os.clock())) });
+		}
+		return list.size() > 0 ? list : undefined;
+	};
+
+	const settleApproval = (id: string, decision: string) => {
+		const pending = pendingApprovals.get(id);
+		if (!pending) return;
+		pendingApprovals.delete(id);
+		if (coroutine.status(pending.timeout) === "suspended") task.cancel(pending.timeout);
+		if (coroutine.status(pending.thread) === "suspended") task.spawn(pending.thread, decision);
+	};
+
+	/** Asks the dev in their chat; yields until they answer or APPROVAL_SECONDS pass. "once" | "always" | "deny". */
+	const askApproval = (userId: number, approval: Omit<ClaudeApproval, "expiresIn">): string => {
+		const thread = coroutine.running();
+		const timeout = task.delay(APPROVAL_SECONDS, () => settleApproval(approval.id, "timeout"));
+		pendingApprovals.set(approval.id, { userId, approval: { ...approval, expiresIn: APPROVAL_SECONDS }, expiresAt: os.clock() + APPROVAL_SECONDS, thread, timeout });
+		return coroutine.yield()[0] as string;
+	};
+
+	ops.set("claude.approve", (player, payload) => {
+		const request = (typeIs(payload, "table") ? payload : {}) as { id?: unknown; decision?: unknown };
+		const id = request.id;
+		const decision = request.decision;
+		if (!typeIs(id, "string") || !typeIs(decision, "string") || !["once", "always", "deny"].includes(decision)) return fail("bad_request");
+		const pending = pendingApprovals.get(id);
+		if (!pending || pending.userId !== player.UserId) return fail("not_found");
+		if (decision === "always" && pending.approval.conversationId !== undefined) {
+			alwaysRun.set(`${player.UserId}:${pending.approval.conversationId}`, true);
+		}
+		settleApproval(id, decision);
+		return { ok: true };
+	});
+
+	// Client-realm requests to the dev's own client (inspect / find on their DataModel).
+	let nextClientRequest = math.random(1, 2 ** 30);
+	const pendingClient = new Map<number, { target: Player; thread: thread; timeout: thread }>();
+	const finishClient = (id: number, ok: boolean, result: unknown) => {
+		const pending = pendingClient.get(id);
+		if (!pending) return;
+		pendingClient.delete(id);
+		if (coroutine.status(pending.timeout) === "suspended") task.cancel(pending.timeout);
+		if (coroutine.status(pending.thread) === "suspended") task.spawn(pending.thread, ok, result);
+	};
+	const askClient = (target: Player, tool: string, args: unknown): [ok: boolean, result: unknown] => {
+		nextClientRequest += 1;
+		const id = nextClientRequest;
+		const thread = coroutine.running();
+		const timeout = task.delay(CLIENT_TOOL_TIMEOUT, () => finishClient(id, false, "no reply from the developer's client"));
+		pendingClient.set(id, { target, thread, timeout });
+		kernel.send(target, CLAUDE_TOOL_REQUEST, id, tool, args);
+		return coroutine.yield() as unknown as [boolean, unknown];
+	};
+	if (deps) {
+		deps.dispatcher.setRaw(CLAUDE_TOOL_RESPONSE, (player, id, ok, result) => {
+			if (!typeIs(id, "number")) return;
+			const pending = pendingClient.get(id);
+			// Only the asked player may answer, and only once.
+			if (!pending || pending.target !== player) return;
+			finishClient(id, ok === true, typeIs(result, "string") ? result.sub(1, 60_000) : "bad reply");
+		});
+		trove.add(() => {
+			deps.dispatcher.removeRaw(CLAUDE_TOOL_RESPONSE);
+			for (const [id] of pendingClient) finishClient(id, false, "server swapped");
+			for (const [id] of pendingApprovals) settleApproval(id, "timeout");
+		});
+	}
+
+	const formatLogs = (entries: LogEntry[], filter: string | undefined, limit: number): string => {
+		const lines = new Array<string>();
+		const needle = filter?.lower();
+		for (const entry of entries) {
+			if (needle !== undefined && entry.text.lower().find(needle, 1, true)[0] === undefined) continue;
+			lines.push(`#${entry.i} ${entry.kind} ${entry.text.sub(1, 600)}`);
+		}
+		const from = math.max(0, lines.size() - limit);
+		const shown = new Array<string>();
+		for (let index = from; index < lines.size(); index++) shown.push(lines[index]);
+		return shown.size() > 0 ? shown.join("\n") : "(no matching lines)";
+	};
+
+	type ToolAnswer = { ok: boolean; output?: string[]; returned?: string; error?: string; data?: string; ms?: number; denied?: boolean };
+
+	/** Runs one tool for the requesting dev. */
+	const runTool = (player: Player, request: Record<string, unknown>): ToolAnswer => {
+		const tool = request.tool;
+		const args = (typeIs(request.args, "table") ? request.args : {}) as Record<string, unknown>;
+		const realm = args.realm === "client" ? "client" : "server";
+		if (tool === "game_status") {
+			const status = kernel.status();
+			return {
+				ok: true,
+				data: toJson({
+					artifact: kernel.artifact.id,
+					generation: status.generation?.name,
+					branch: kernel.branch,
+					channel: kernel.channel,
+					serverType: kernel.serverType,
+					placeVersion: status.placeVersion,
+					uptime: math.floor(status.uptime),
+					kernel: status.kernelVersion,
+					requester: player.UserId,
+					players: playerList(),
+				}),
+			};
+		}
+		if (tool === "game_logs") {
+			const since = typeIs(args.since, "number") ? args.since : undefined;
+			const limit = typeIs(args.limit, "number") ? math.clamp(math.floor(args.limit), 1, 500) : 100;
+			const filter = typeIs(args.filter, "string") ? args.filter.sub(1, 100) : undefined;
+			if (realm === "server") return { ok: true, data: formatLogs(kernel.logs(since, 500), filter, limit) };
+			if (!deps) return { ok: false, error: "client logs are not available here" };
+			const [ok, result] = deps.clientLogs(player, since ?? 0);
+			if (!ok) return { ok: false, error: tostring(result) };
+			return { ok: true, data: formatLogs(result as LogEntry[], filter, limit) };
+		}
+		if (tool === "inspect" || tool === "find") {
+			if (realm === "client") {
+				if (!deps) return { ok: false, error: "the client realm is not available here" };
+				const [ok, result] = askClient(player, tool, args);
+				return ok ? { ok: true, data: result as string } : { ok: false, error: tostring(result) };
+			}
+			const [ok, result] = pcall(() => (tool === "inspect" ? inspectTool(args) : findTool(args)));
+			return ok ? { ok: true, data: result } : { ok: false, error: tostring(result) };
+		}
+		if (tool === "run_luau") {
+			const code = request.args !== undefined && typeIs(args.code, "string") ? args.code : "";
+			const description = shortString(request.description, 120) ?? "luau";
+			const timeoutSeconds = typeIs(args.timeoutSeconds, "number") ? math.clamp(args.timeoutSeconds, 1, 30) : 10;
+			if (code === "") return { ok: false, error: "no code" };
+			if (!loadstringAvailable()) return { ok: false, error: LOADSTRING_HELP };
+			const conversationId = isServerId(request.conversationId) ? request.conversationId : undefined;
+			const id = typeIs(request.id, "string") ? request.id : HttpService.GenerateGUID(false);
+			const always = conversationId !== undefined && alwaysRun.get(`${player.UserId}:${conversationId}`) === true;
+			if (!always) {
+				const decision = askApproval(player.UserId, { id, description, code, conversationId });
+				if (decision !== "once" && decision !== "always") {
+					$print(`[claude] run_luau for ${player.Name} denied (${decision}): ${description}`);
+					return { ok: false, denied: true, error: decision === "timeout" ? "no answer within 60 s" : "denied", output: [] };
+				}
+			}
+			// The requester may have left or lost dev access while deciding.
+			if (player.Parent === undefined || !kernel.isDev(player) || kernel.channel !== "dev") return { ok: false, error: "the developer is no longer a dev in this server" };
+			const result = runLuau(code, { player, kernel, persist: (key: string) => kernel.persist(key, () => ({})) }, timeoutSeconds);
+			$print(`[claude] run_luau for ${player.Name}: ${description} -> ${result.ok ? "ok" : "error"} (${result.ms} ms)`);
+			execs.push({ at: os.time(), user: player.UserId, description, ok: result.ok, error: result.error?.sub(1, 200) });
+			while (execs.size() > MAX_EXEC_LOG) execs.shift();
+			return result;
+		}
+		return { ok: false, error: `unknown tool ${tostring(tool).sub(1, 40)}` };
+	};
+
+	/** Serves one game-tool request id for `player` (from a wake message or the pending poll). */
+	const serveToolRequest = (session: Session, player: Player, requestId: string) => {
+		if (handled.has(requestId)) return;
+		handled.add(requestId);
+		const fetched = authed(session, player.UserId, "GET", `/v1/game/requests/${requestId}`);
+		if (!fetched.ok || !typeIs(fetched.data, "table")) return;
+		const request = fetched.data as Record<string, unknown>;
+		const [ok, answer] = pcall(() => runTool(player, request));
+		const body: ToolAnswer = ok ? answer : { ok: false, error: tostring(answer).sub(1, 2000) };
+		authed(session, player.UserId, "POST", `/v1/game/requests/${requestId}/result`, { output: [], ...body });
+	};
+
+	/** Who may use the game tools here right now: the session's user, in this server, a dev, paired here. */
+	const toolPlayer = (session: Session, userId: number): Player | undefined => {
+		if (kernel.channel !== "dev" || !session.users.includes(userId)) return undefined;
+		const player = Players.GetPlayerByUserId(userId);
+		if (!player || !kernel.isDev(player) || !isPaired(session, userId)) return undefined;
+		return player;
+	};
+
+	const pollPending = (session: Session, player: Player) => {
+		const result = authed(session, player.UserId, "GET", "/v1/game/pending");
+		if (!result.ok || !typeIs(result.data, "table")) return;
+		for (const item of listOf((result.data as { requests?: unknown }).requests)) {
+			const id = typeIs(item, "table") ? (item as { id?: unknown }).id : undefined;
+			if (typeIs(id, "string") && id.size() === 32 && matches(id, "^%x+$")) task.spawn(serveToolRequest, session, player, id);
+		}
+	};
+
+	if (kernel.channel === "dev") {
+		let stopped = false;
+		let toolConnection: RBXScriptConnection | undefined;
+		trove.add(() => {
+			stopped = true;
+			toolConnection?.Disconnect();
+		});
+		// Wake messages (fast path).
+		task.spawn(() => {
+			const [ok, result] = pcall(() =>
+				MessagingService.SubscribeAsync(TOOL_TOPIC, (message) => {
+					if (stopped) return;
+					const data = (typeIs(message.Data, "string") ? decode(message.Data) : message.Data) as Record<string, unknown> | undefined;
+					if (!typeIs(data, "table") || data.v !== 1 || data.j !== game.JobId) return;
+					const session = activeSession();
+					const userId = data.u;
+					const id = data.x;
+					if (!session || data.s !== session.sid || !typeIs(userId, "number") || !typeIs(id, "string") || id.size() !== 32) return;
+					const player = toolPlayer(session, userId);
+					if (player) task.spawn(serveToolRequest, session, player, id);
+				}),
+			);
+			if (!ok) {
+				$warn(`[remote-claude] tool messages unavailable: ${result}`);
+				return;
+			}
+			if (stopped) result.Disconnect();
+			else toolConnection = result;
+		});
+		// Backup poll: while a dev's prompt from this server is running (messages can be lost).
+		trove.add(
+			task.spawn(() => {
+				while (!stopped) {
+					task.wait(TOOL_POLL);
+					const session = activeSession();
+					if (!session) continue;
+					const users = new Set<number>();
+					const now = os.time();
+					for (const record of store.requests) {
+						if (record.sid === session.sid && !record.finished && now - record.createdAt < TOOL_POLL_WINDOW) users.add(record.user);
+					}
+					for (const userId of users) {
+						const player = toolPlayer(session, userId);
+						if (player) pcall(pollPending, session, player);
+					}
+				}
+			}),
+		);
+	}
 }

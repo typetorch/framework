@@ -174,6 +174,16 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 		if (coroutine.status(pending.timeout) === "suspended") task.cancel(pending.timeout);
 		if (coroutine.status(pending.thread) === "suspended") task.spawn(pending.thread, ok, result);
 	};
+	/** Asks `target`'s client for its logs since `since`; yields until it answers (or 5 s pass). */
+	const askClientLogs = (target: Player, since: number): [ok: boolean, result: unknown] => {
+		nextLogRequest += 1;
+		const id = nextLogRequest;
+		const thread = coroutine.running();
+		const timeout = task.delay(PLAYER_LOGS_TIMEOUT, () => finishLogs(id, false, "no_reply"));
+		pendingLogs.set(id, { target, thread, timeout });
+		kernel.send(target, DEVLOGS_REQUEST, id, since);
+		return coroutine.yield() as unknown as [boolean, unknown];
+	};
 	ops.set("logs.player", (player, payload) => {
 		const request = (typeIs(payload, "table") ? payload : {}) as { userId?: unknown; since?: unknown };
 		assert(typeIs(request.userId, "number"), "bad request");
@@ -183,13 +193,7 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 		const last = lastLogRequest.get(player);
 		if (last !== undefined && now - last < PLAYER_LOGS_INTERVAL) error("rate_limited", 0);
 		lastLogRequest.set(player, now);
-		nextLogRequest += 1;
-		const id = nextLogRequest;
-		const thread = coroutine.running();
-		const timeout = task.delay(PLAYER_LOGS_TIMEOUT, () => finishLogs(id, false, "no_reply"));
-		pendingLogs.set(id, { target, thread, timeout });
-		kernel.send(target, DEVLOGS_REQUEST, id, typeIs(request.since, "number") ? request.since : 0);
-		const [ok, result] = coroutine.yield() as LuaTuple<[boolean, unknown]>;
+		const [ok, result] = askClientLogs(target, typeIs(request.since, "number") ? request.since : 0);
 		if (!ok) error(result, 0);
 		return result;
 	});
@@ -206,7 +210,7 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 		for (const [id] of pendingLogs) finishLogs(id, false, "no_reply");
 	});
 	// Claude prompt (plans/11): claude.session / claude.prompt / claude.status / claude.cancel.
-	registerRemoteClaude(kernel, trove, ops);
+	registerRemoteClaude(kernel, trove, ops, { dispatcher, clientLogs: askClientLogs });
 	// Explorer ops (explorer.children/props/set/attr/rename/destroy/find/ancestry/instance).
 	trove.add(
 		registerExplorerOps((op, handler) => {

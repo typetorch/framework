@@ -112,6 +112,18 @@ export interface ClaudeEvent {
 	block?: number;
 	/** status: the new state. */
 	state?: string;
+	/** Game tools: the input (run_luau code) on tool_use, the full result on tool_result (capped). */
+	detail?: string;
+}
+
+/** A run_luau snippet waiting for the requesting dev's approval (shown in their chat). */
+export interface ClaudeApproval {
+	id: string;
+	description: string;
+	code: string;
+	conversationId?: string;
+	/** Seconds left before it is denied automatically. */
+	expiresIn: number;
 }
 
 /** Op "claude.events" {id, since} → the prompt's state and its events i >= since. */
@@ -134,6 +146,8 @@ export interface ClaudeEventsReply {
 	next?: number;
 	/** Another page is ready now. */
 	more?: boolean;
+	/** run_luau snippets waiting for this player's approval. */
+	approvals?: ClaudeApproval[];
 }
 
 export interface ClaudeConversationSummary {

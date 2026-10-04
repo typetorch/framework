@@ -1,8 +1,9 @@
-import { TextService } from "@rbxts/services";
+import { TextService, UserInputService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import type { ClientKernel } from "../kernel";
 import { popIn, popOut } from "../ui";
 import type {
+	ClaudeApproval,
 	ClaudeConversation,
 	ClaudeConversationSummary,
 	ClaudeEvent,
@@ -104,6 +105,8 @@ export interface ClaudeChatDeps {
 	call: (op: string, payload?: unknown) => [ok: boolean, result: unknown];
 	/** The explorer's selection as "<realm> <path>", if any (the "Dex path" context). */
 	dexSelection: () => string | undefined;
+	/** Shows text pre-selected for copying (widgets.ts copyText). Without it, replies have no Copy button. */
+	copyText?: (text: string, anchor?: GuiObject) => void;
 }
 
 // Markdown → RichText -------------------------------------------------------------------------------------------------
@@ -217,7 +220,7 @@ function roundButton(parent: Instance, color: Color3): TextButton {
 interface Rendered {
 	key: string;
 	gui: GuiObject;
-	text: TextLabel;
+	text: TextLabel | TextBox;
 	marker?: TextLabel;
 }
 
@@ -232,8 +235,12 @@ function createBlock(block: Block): Rendered {
 		const box = make("Frame", { BackgroundColor3: CODE_BG, BorderSizePixel: 0, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y });
 		corner(box, 8);
 		pad(box, 8, 10);
-		const text = label("", CODE_TEXT, SMALL, false);
-		text.Parent = box;
+		// Plain read-only TextBox: code can be selected and copied (rich text would show its tags when focused).
+		const text = style(make("TextBox", { BackgroundTransparency: 1, ClearTextOnFocus: false, TextEditable: false, MultiLine: true }, box), "", SMALL, CODE_TEXT, FONT);
+		text.TextWrapped = true;
+		text.TextYAlignment = Enum.TextYAlignment.Top;
+		text.Size = UDim2.fromScale(1, 0);
+		text.AutomaticSize = Enum.AutomaticSize.Y;
 		return { key: blockKey(block), gui: box, text };
 	}
 	if (block.kind === "rule") {
@@ -292,17 +299,57 @@ function syncBlocks(holder: Frame, rendered: Rendered[], blocks: Block[]) {
 	}
 }
 
-/** "Read src/foo.ts", "Edited ...", "Ran bun run build", "Ran luau on server". */
+/** The short tool name: "run_luau" from "mcp__typetorch-game__run_luau" (older dev servers send the full name). */
+function shortTool(tool: string | undefined): string {
+	if (tool === undefined) return "";
+	const [rest] = tool.match("^mcp__.-__(.+)$");
+	return rest !== undefined ? (rest as string) : tool;
+}
+
+/** "Read src/foo.ts", "Edited ...", "Ran bun run build", "Ran luau on server", "Checked server status". */
 function toolLine(event: ClaudeEvent): string {
 	const target = event.target ?? "";
-	const tool = event.tool ?? "";
+	const tool = shortTool(event.tool);
 	if (tool === "Read") return `Read ${target}`;
 	if (tool === "Edit") return `Edited ${target}`;
 	if (tool === "Write") return `Wrote ${target}`;
 	if (tool === "Glob" || tool === "Grep") return `Searched ${target}`;
 	if (tool === "Bash") return `Ran ${target}`;
-	if (tool.find("run_luau", 1, true)[0] !== undefined) return "Ran luau on server";
-	return event.text;
+	if (tool === "run_luau") return "Ran luau on server";
+	if (tool === "game_logs") return target === "client" ? "Read client logs" : "Read server logs";
+	if (tool === "inspect") return `Inspected ${target}`;
+	if (tool === "find") return "Searched the game";
+	if (tool === "game_status") return "Checked server status";
+	if (tool === "screenshot") return "Screenshot";
+	return tool !== "" ? tool : event.text;
+}
+
+/** A glyph drawn from Frames for the "+" menu (no emojis or font glyphs). */
+function menuIcon(parent: Instance, kind: string, color: Color3) {
+	const box = make("Frame", { BackgroundTransparency: 1, AnchorPoint: new Vector2(0, 0.5), Position: new UDim2(0, 10, 0.5, 0), Size: UDim2.fromOffset(16, 16) }, parent);
+	const bar = (x: number, y: number, w: number, h: number) =>
+		make("Frame", { BackgroundColor3: color, BorderSizePixel: 0, Position: UDim2.fromOffset(x, y), Size: UDim2.fromOffset(w, h) }, box);
+	if (kind === "dex") {
+		// A small tree: a root bar and two indented children.
+		bar(0, 1, 10, 3);
+		bar(5, 7, 10, 3);
+		bar(5, 13, 10, 3);
+		bar(2, 4, 2, 11);
+	} else if (kind === "errors") {
+		const ring = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromOffset(16, 16) }, box);
+		corner(ring, 8);
+		make("UIStroke", { Color: color, Thickness: 2, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, ring);
+		bar(7, 3, 2, 6);
+		bar(7, 11, 2, 2);
+	} else {
+		// A camera: a body and a lens.
+		const body = make("Frame", { BackgroundTransparency: 1, Position: UDim2.fromOffset(0, 3), Size: UDim2.fromOffset(16, 11) }, box);
+		corner(body, 3);
+		make("UIStroke", { Color: color, Thickness: 2, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, body);
+		const lens = make("Frame", { BackgroundColor3: color, BorderSizePixel: 0, Position: UDim2.fromOffset(5, 6), Size: UDim2.fromOffset(6, 6) }, box);
+		corner(lens, 3);
+	}
+	return box;
 }
 
 // Messages ------------------------------------------------------------------------------------------------------------
@@ -311,6 +358,8 @@ interface ToolSegment {
 	kind: "tool";
 	event: ClaudeEvent;
 	result?: string;
+	/** Game tools: the full result text. */
+	resultDetail?: string;
 	failed: boolean;
 	dot: Frame;
 }
@@ -542,9 +591,17 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 	pad(composer, 8, 10);
 	make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 6) }, composer);
 
-	// "+" menu: the context toggles (shown as chips in the bottom row when on).
-	const menu = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: 1, Visible: false }, composer);
-	make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 4) }, menu);
+	// Active context toggles: small removable chips above the message box.
+	const chips = make(
+		"Frame",
+		{ BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: 1, Visible: false },
+		composer,
+	);
+	make(
+		"UIListLayout",
+		{ FillDirection: Enum.FillDirection.Horizontal, SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 4), Wraps: true },
+		chips,
+	);
 
 	// The message box grows from 1 to 5 lines, then scrolls (its height follows TextBounds; the canvas is automatic).
 	const inputScroll = make(
@@ -595,16 +652,6 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 			plusButton,
 		);
 	}
-	const chips = make(
-		"Frame",
-		{ BackgroundTransparency: 1, Position: UDim2.fromOffset(ROUND + 8, 0), Size: new UDim2(1, -(ROUND * 2 + 16), 1, 0), ClipsDescendants: true },
-		actions,
-	);
-	make(
-		"UIListLayout",
-		{ FillDirection: Enum.FillDirection.Horizontal, SortOrder: Enum.SortOrder.LayoutOrder, VerticalAlignment: Enum.VerticalAlignment.Center, Padding: new UDim(0, 4) },
-		chips,
-	);
 	const sendButton = roundButton(actions, COLORS.accent);
 	sendButton.AnchorPoint = new Vector2(1, 0);
 	sendButton.Position = UDim2.fromScale(1, 0);
@@ -617,71 +664,139 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 	);
 	corner(stopIcon, 2);
 
-	// Context toggles: a check row in the "+" menu, a chip (tap to remove) when on.
-	interface ContextToggle {
+	// "+" menu: a floating panel above the "+" button (like the desktop app's): toggles with a checkmark when on, items
+	// for later dimmed. It closes on an outside click or Escape.
+	interface MenuItem {
 		name: string;
-		get: () => boolean;
-		set: (on: boolean) => void;
+		icon: string;
+		get?: () => boolean;
+		set?: (on: boolean) => void;
+		disabled?: boolean;
 	}
-	const toggles: ContextToggle[] = [
-		{ name: "Dex path", get: () => state.attachPath, set: (on) => (state.attachPath = on) },
-		{ name: "Errors", get: () => state.attachErrors, set: (on) => (state.attachErrors = on) },
+	const items: MenuItem[] = [
+		{ name: "Dex path", icon: "dex", get: () => state.attachPath, set: (on) => (state.attachPath = on) },
+		{ name: "Errors", icon: "errors", get: () => state.attachErrors, set: (on) => (state.attachErrors = on) },
+		{ name: "Screenshot", icon: "camera", disabled: true },
 	];
-	let paintToggles: () => void = () => {};
-	const checks = new Map<ContextToggle, Frame>();
-	toggles.forEach((toggle, index) => {
+	const MENU_WIDTH = 210;
+	const MENU_ROW = 36;
+	const menu = make(
+		"Frame",
+		{
+			Name: "PlusMenu",
+			BackgroundColor3: COLORS.header,
+			BorderSizePixel: 0,
+			AnchorPoint: new Vector2(0, 1),
+			Size: UDim2.fromOffset(MENU_WIDTH, 0),
+			AutomaticSize: Enum.AutomaticSize.Y,
+			Visible: false,
+			ZIndex: 20,
+		},
+		host,
+	);
+	corner(menu, 12);
+	make("UIStroke", { Color: COLORS.stroke, Thickness: 1, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, menu);
+	pad(menu, 6, 6);
+	make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 2) }, menu);
+	// Soft shadow: a darker, larger rounded frame behind the panel.
+	const shadow = make(
+		"Frame",
+		{ BackgroundColor3: Color3.fromRGB(0, 0, 0), BackgroundTransparency: 0.6, BorderSizePixel: 0, AnchorPoint: new Vector2(0, 1), Visible: false, ZIndex: 19 },
+		host,
+	);
+	corner(shadow, 14);
+	const checks = new Map<MenuItem, Frame>();
+	items.forEach((item, index) => {
 		const row = make(
 			"TextButton",
-			{ AutoButtonColor: true, Text: "", BackgroundColor3: COLORS.button, BorderSizePixel: 0, Size: new UDim2(1, 0, 0, ROUND), LayoutOrder: index },
+			{ AutoButtonColor: false, Text: "", BackgroundColor3: COLORS.button, BackgroundTransparency: 1, BorderSizePixel: 0, Size: new UDim2(1, 0, 0, MENU_ROW), LayoutOrder: index, ZIndex: 21 },
 			menu,
 		);
 		corner(row, 8);
-		const check = make(
-			"Frame",
-			{ AnchorPoint: new Vector2(0, 0.5), Position: new UDim2(0, 10, 0.5, 0), Size: UDim2.fromOffset(14, 14), BorderSizePixel: 0 },
-			row,
-		);
-		corner(check, 3);
-		make("UIStroke", { Color: COLORS.dim, Thickness: 2, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, check);
-		checks.set(toggle, check);
-		const text = style(make("TextLabel", { BackgroundTransparency: 1 }, row), toggle.name, SMALL, COLORS.text, FONT);
+		const color = item.disabled ? DIMMER : COLORS.text;
+		const icon = menuIcon(row, item.icon, color);
+		const text = style(make("TextLabel", { BackgroundTransparency: 1, ZIndex: 22 }, row), item.name, SMALL, color, FONT);
 		text.TextWrapped = false;
-		text.Position = UDim2.fromOffset(34, 0);
-		text.Size = new UDim2(1, -40, 1, 0);
+		text.Position = UDim2.fromOffset(36, 0);
+		text.Size = new UDim2(1, -64, 1, 0);
+		// A checkmark on the right while a toggle is on (two Frames).
+		const check = make("Frame", { BackgroundTransparency: 1, AnchorPoint: new Vector2(1, 0.5), Position: new UDim2(1, -10, 0.5, 0), Size: UDim2.fromOffset(14, 14), Visible: false, ZIndex: 22 }, row);
+		make("Frame", { BackgroundColor3: COLORS.accent, BorderSizePixel: 0, Position: UDim2.fromOffset(0, 7), Size: UDim2.fromOffset(6, 2), Rotation: 45, ZIndex: 22 }, check);
+		make("Frame", { BackgroundColor3: COLORS.accent, BorderSizePixel: 0, Position: UDim2.fromOffset(3, 5), Size: UDim2.fromOffset(11, 2), Rotation: -50, ZIndex: 22 }, check);
+		checks.set(item, check);
+		for (const part of [...icon.GetDescendants(), icon]) if (part.IsA("GuiObject")) part.ZIndex = 22;
+		if (item.disabled) return;
+		trove.connect(row.MouseEnter, () => (row.BackgroundTransparency = 0));
+		trove.connect(row.MouseLeave, () => (row.BackgroundTransparency = 1));
 		trove.connect(row.Activated, () => {
-			toggle.set(!toggle.get());
+			if (item.get && item.set) item.set(!item.get());
 			paintToggles();
 		});
 	});
+	const closeMenu = () => {
+		if (!menu.Visible) return;
+		shadow.Visible = false;
+		popOut(menu);
+	};
+	const openMenu = () => {
+		// Above the "+" button, in host coordinates.
+		const at = plusButton.AbsolutePosition.sub(host.AbsolutePosition);
+		const x = math.clamp(at.X, 4, math.max(4, host.AbsoluteSize.X - MENU_WIDTH - 4));
+		menu.Position = UDim2.fromOffset(x, at.Y - 6);
+		shadow.Position = UDim2.fromOffset(x + 2, at.Y - 2);
+		popIn(menu);
+		task.defer(() => {
+			shadow.Size = UDim2.fromOffset(menu.AbsoluteSize.X, menu.AbsoluteSize.Y);
+			shadow.Visible = menu.Visible;
+		});
+	};
+	trove.connect(plusButton.Activated, () => (menu.Visible ? closeMenu() : openMenu()));
+	const inside = (gui: GuiObject, point: Vector2) => {
+		const corner0 = gui.AbsolutePosition;
+		const size = gui.AbsoluteSize;
+		return point.X >= corner0.X && point.X <= corner0.X + size.X && point.Y >= corner0.Y && point.Y <= corner0.Y + size.Y;
+	};
+	trove.connect(UserInputService.InputBegan, (input) => {
+		if (!menu.Visible) return;
+		if (input.KeyCode === Enum.KeyCode.Escape) return closeMenu();
+		const pointer = input.UserInputType === Enum.UserInputType.MouseButton1 || input.UserInputType === Enum.UserInputType.Touch;
+		if (!pointer) return;
+		const point = new Vector2(input.Position.X, input.Position.Y);
+		// AbsolutePosition ignores the GUI inset; input positions include it when the ScreenGui ignores it, which the dev menu does.
+		if (!inside(menu, point) && !inside(plusButton, point)) closeMenu();
+	});
+
+	let paintToggles: () => void = () => {};
 	paintToggles = () => {
 		for (const child of chips.GetChildren()) if (child.IsA("GuiObject")) child.Destroy();
-		toggles.forEach((toggle, index) => {
-			const on = toggle.get();
-			const check = checks.get(toggle);
-			if (check) {
-				check.BackgroundColor3 = COLORS.accent;
-				check.BackgroundTransparency = on ? 0 : 1;
-			}
+		let count = 0;
+		items.forEach((item, index) => {
+			const on = item.get?.() === true;
+			const check = checks.get(item);
+			if (check) check.Visible = on;
 			if (!on) return;
-			const chip = style(make("TextButton", { AutoButtonColor: true, LayoutOrder: index }), toggle.name, SMALL, COLORS.dark, FONT);
-			chip.TextWrapped = false;
-			chip.BackgroundColor3 = COLORS.info;
-			chip.Size = UDim2.fromOffset(0, 26);
-			chip.AutomaticSize = Enum.AutomaticSize.X;
-			corner(chip, 13);
-			pad(chip, 0, 10);
-			chip.Parent = chips;
-			trove.connect(chip.Activated, () => {
-				toggle.set(false);
+			count += 1;
+			const chip = make("Frame", { BackgroundColor3: COLORS.button, BorderSizePixel: 0, Size: UDim2.fromOffset(0, 24), AutomaticSize: Enum.AutomaticSize.X, LayoutOrder: index }, chips);
+			corner(chip, 12);
+			make("UIPadding", { PaddingLeft: new UDim(0, 10), PaddingRight: new UDim(0, 4) }, chip);
+			make("UIListLayout", { FillDirection: Enum.FillDirection.Horizontal, VerticalAlignment: Enum.VerticalAlignment.Center, Padding: new UDim(0, 4) }, chip);
+			const text = style(make("TextLabel", { BackgroundTransparency: 1, LayoutOrder: 1 }, chip), item.name, SMALL, COLORS.text, FONT);
+			text.TextWrapped = false;
+			text.Size = UDim2.fromOffset(0, 24);
+			text.AutomaticSize = Enum.AutomaticSize.X;
+			// Remove: a small "x" drawn from two Frames.
+			const remove = make("TextButton", { AutoButtonColor: true, Text: "", BackgroundTransparency: 1, Size: UDim2.fromOffset(20, 20), LayoutOrder: 2 }, chip);
+			for (const angle of [45, -45]) {
+				make("Frame", { BackgroundColor3: COLORS.dim, BorderSizePixel: 0, AnchorPoint: new Vector2(0.5, 0.5), Position: UDim2.fromScale(0.5, 0.5), Size: UDim2.fromOffset(10, 2), Rotation: angle }, remove);
+			}
+			trove.connect(remove.Activated, () => {
+				item.set?.(false);
 				paintToggles();
 			});
 		});
+		chips.Visible = count > 0;
 	};
 	paintToggles();
-	trove.connect(plusButton.Activated, () => {
-		if (menu.Visible) menu.Visible = false;
-		else popIn(menu);
-	});
 
 	// Messages --------------------------------------------------------------------------------------------------------
 	let messages = new Array<Message>();
@@ -715,6 +830,8 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		for (const bubble of bubbles) fitBubble(bubble);
 	});
 
+	const copyButtons = new Map<string, TextButton>();
+	const approvalCards = new Map<string, Frame>();
 	const buildMessage = (id: string, prompt: string): Message => {
 		order += 1;
 		const frame = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: order }, list);
@@ -731,6 +848,19 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		fitBubble(fit);
 		const reply = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: 2 }, frame);
 		make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 8) }, reply);
+		if (deps.copyText) {
+			// Copy: the whole reply as plain Markdown, pre-selected (rich text can't be selected with its formatting).
+			const copy = make("TextButton", { AutoButtonColor: true, Text: "", BackgroundTransparency: 1, Size: UDim2.fromOffset(28, 24), LayoutOrder: 100_002, Visible: false }, reply);
+			for (const [x, y] of [
+				[4, 2],
+				[9, 7],
+			]) {
+				const sheet = make("Frame", { BackgroundTransparency: 1, Position: UDim2.fromOffset(x, y), Size: UDim2.fromOffset(12, 14) }, copy);
+				corner(sheet, 2);
+				make("UIStroke", { Color: DIMMER, Thickness: 1.5, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, sheet);
+			}
+			copyButtons.set(id, copy);
+		}
 		const outcome = label("", DIMMER, SMALL, false);
 		outcome.LayoutOrder = 100_000;
 		outcome.Visible = false;
@@ -788,10 +918,12 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 				const segment: ToolSegment = { kind: "tool", event, failed: false, dot: dotFrame };
 				message.segments.push(segment);
 				trove.connect(row.Activated, () => {
-					// Tap: the input and the output, short.
+					// Tap: the input (run_luau: the code) and the output, truncated.
 					const lines = new Array<string>();
-					if (event.target !== undefined && event.target !== "") lines.push(`input  ${event.target.sub(1, 300)}`);
-					if (segment.result !== undefined) lines.push(`output ${segment.result.sub(1, 300)}`);
+					const input = event.detail ?? event.target;
+					if (input !== undefined && input !== "") lines.push(input.sub(1, 600));
+					const output = segment.resultDetail ?? segment.result;
+					if (output !== undefined) lines.push(`-> ${output.sub(1, 600)}`);
 					details.Text = lines.join("\n");
 					details.Visible = !details.Visible && lines.size() > 0;
 				});
@@ -800,8 +932,13 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 					const segment = message.segments[index];
 					if (segment.kind === "tool" && segment.result === undefined) {
 						segment.result = event.text;
+						segment.resultDetail = event.detail;
 						segment.failed = event.text.sub(1, 6) === "error:";
 						segment.dot.BackgroundColor3 = segment.failed ? COLORS.bad : DIMMER;
+						const full = `${event.text} ${event.detail ?? ""}`;
+						if (shortTool(segment.event.tool) === "run_luau" && full.find("loadstring is unavailable", 1, true)[0] !== undefined) {
+							addNote(message, "Luau is off on this server: republish the kernel place", DIMMER);
+						}
 						break;
 					}
 				}
@@ -819,9 +956,24 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		}
 	};
 
+	/** The reply's plain text (for Copy). */
+	const replyText = (message: Message) => {
+		const parts = new Array<string>();
+		for (const segment of message.segments) if (segment.kind === "text") parts.push(segment.text);
+		return parts.join("\n\n");
+	};
+
 	/** The end of a message: dots while it runs, one short line when it finished with something to say. */
 	const paintOutcome = (message: Message) => {
 		message.dots.Visible = !message.finished;
+		const copy = copyButtons.get(message.id);
+		if (copy && deps.copyText) {
+			copy.Visible = message.finished && message.segments.some((segment) => segment.kind === "text");
+			if (copy.GetAttribute("Wired") !== true) {
+				copy.SetAttribute("Wired", true);
+				trove.connect(copy.Activated, () => deps.copyText!(replyText(message), copy));
+			}
+		}
 		let text = "";
 		let color = DIMMER;
 		if (message.finished) {
@@ -852,6 +1004,9 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		for (const message of messages) message.frame.Destroy();
 		messages = [];
 		bubbles.clear();
+		copyButtons.clear();
+		for (const [, card] of approvalCards) card.Destroy();
+		approvalCards.clear();
 		active = undefined;
 		paintComposer();
 		paintEmpty();
@@ -897,6 +1052,87 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		scrollToEnd();
 	};
 
+	// run_luau approvals: one card per snippet waiting for this dev, under the transcript.
+	const decide = (id: string, decision: string) =>
+		spawn(() => {
+			const card = approvalCards.get(id);
+			if (card) {
+				approvalCards.delete(id);
+				card.Destroy();
+			}
+			const [ok, reply] = call("claude.approve", { id, decision });
+			const answer = (typeIs(reply, "table") ? reply : {}) as { ok?: boolean; error?: string };
+			if (!ok || answer.ok !== true) notify(errorText(ok ? answer.error : reply), COLORS.warn);
+		});
+	const showApprovals = (approvals: ClaudeApproval[]) => {
+		const wanted = new Set<string>();
+		for (const approval of approvals) {
+			wanted.add(approval.id);
+			if (approvalCards.has(approval.id)) continue;
+			order += 1;
+			const card = make(
+				"Frame",
+				{ BackgroundColor3: COLORS.header, BorderSizePixel: 0, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: order + 1_000_000 },
+				list,
+			);
+			corner(card, 12);
+			make("UIStroke", { Color: COLORS.warn, Thickness: 1, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, card);
+			pad(card, 10, 12);
+			make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 8) }, card);
+			const title = label(`<b>Run on server?</b>  ${escapeRich(approval.description)}`, COLORS.text, SMALL, true);
+			title.LayoutOrder = 1;
+			title.Parent = card;
+			// The code: a scrollable, selectable monospace box (at most about 9 lines tall).
+			const codeScroll = make(
+				"ScrollingFrame",
+				{
+					BackgroundColor3: CODE_BG,
+					BorderSizePixel: 0,
+					Size: new UDim2(1, 0, 0, math.min(9, approval.code.split("\n").size()) * LINE + 16),
+					CanvasSize: new UDim2(),
+					AutomaticCanvasSize: Enum.AutomaticSize.XY,
+					ScrollBarThickness: 4,
+					ScrollBarImageColor3: COLORS.dim,
+					LayoutOrder: 2,
+				},
+				card,
+			);
+			corner(codeScroll, 8);
+			const codeHolder = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.XY }, codeScroll);
+			make("UIPadding", { PaddingTop: new UDim(0, 8), PaddingBottom: new UDim(0, 8), PaddingLeft: new UDim(0, 10), PaddingRight: new UDim(0, 10) }, codeHolder);
+			const code = style(make("TextBox", { ClearTextOnFocus: false, TextEditable: false, MultiLine: true, BackgroundTransparency: 1 }, codeHolder), approval.code, SMALL, CODE_TEXT, FONT);
+			code.TextWrapped = false;
+			code.TextYAlignment = Enum.TextYAlignment.Top;
+			code.Size = UDim2.fromOffset(0, 0);
+			code.AutomaticSize = Enum.AutomaticSize.XY;
+			const buttons = make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, ROUND), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: 3 }, card);
+			make("UIListLayout", { FillDirection: Enum.FillDirection.Horizontal, SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 6), Wraps: true }, buttons);
+			const button = (text: string, color: Color3, textColor: Color3, decision: string, index: number) => {
+				const b = style(make("TextButton", { AutoButtonColor: true, LayoutOrder: index }), text, SMALL, textColor, Enum.Font.BuilderSansMedium);
+				b.TextXAlignment = Enum.TextXAlignment.Center;
+				b.TextWrapped = false;
+				b.BackgroundColor3 = color;
+				b.Size = UDim2.fromOffset(0, ROUND);
+				b.AutomaticSize = Enum.AutomaticSize.X;
+				corner(b, 8);
+				pad(b, 0, 12);
+				b.Parent = buttons;
+				trove.connect(b.Activated, () => decide(approval.id, decision));
+			};
+			button("Run", COLORS.accent, COLORS.dark, "once", 1);
+			button("Always in this chat", COLORS.button, COLORS.text, "always", 2);
+			button("Deny", COLORS.button, COLORS.bad, "deny", 3);
+			popIn(card);
+			approvalCards.set(approval.id, card);
+		}
+		for (const [id, card] of approvalCards) {
+			if (wanted.has(id)) continue;
+			approvalCards.delete(id);
+			card.Destroy();
+		}
+	};
+
+	let failures = 0;
 	/** One round of polling for the running message (more pages right away when the dev machine has them). */
 	const poll = () => {
 		const message = active;
@@ -908,8 +1144,19 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 			const answer = (typeIs(reply, "table") ? reply : {}) as ClaudeEventsReply;
 			if (!ok || answer.ok !== true) {
 				if (ok && answer.error === "needs_pairing") refreshSession();
+				failures += 1;
+				// The dev machine is gone (stopped, restarted, unpaired): stop waiting for this run.
+				if (failures >= 15) {
+					message.finished = true;
+					message.state = "lost";
+					paintOutcome(message);
+					paintComposer();
+					showApprovals([]);
+				}
 				return;
 			}
+			failures = 0;
+			showApprovals(answer.approvals ?? []);
 			applyEvents(message, answer.events ?? []);
 			message.cursor = math.max(message.cursor, answer.next ?? message.cursor);
 			message.state = answer.state ?? message.state;
@@ -920,6 +1167,7 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 			paintOutcome(message);
 			if (message.finished) {
 				paintComposer();
+				showApprovals([]);
 				return;
 			}
 			if (answer.more !== true) return;
@@ -1111,11 +1359,19 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 	trove.connect(sendButton.Activated, () => {
 		const message = active;
 		if (!message || message.finished) return send();
-		// Stop.
+		// Stop. If the dev machine can't be told (gone, or the run already ended), the run ends here anyway.
 		spawn(() => {
 			const [ok, reply] = call("claude.cancel", message.id);
 			const answer = (typeIs(reply, "table") ? reply : {}) as { ok?: boolean; error?: string };
-			if (!ok || answer.ok !== true) notify(errorText(ok ? answer.error : reply), COLORS.bad);
+			if (ok && answer.ok === true) return;
+			const code = ok ? answer.error : reply;
+			if (code === "not_found" || code === "not_connected" || code === "unreachable" || code === "conflict" || !ok) {
+				message.finished = true;
+				message.state = "cancelled";
+				paintOutcome(message);
+				paintComposer();
+				showApprovals([]);
+			} else notify(errorText(code), COLORS.bad);
 		});
 	});
 

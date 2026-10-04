@@ -29,6 +29,7 @@ import {
 	NetStat,
 	StateSummary,
 } from "./protocol";
+import { CLAUDE_TOOL_REQUEST, CLAUDE_TOOL_RESPONSE, findTool, inspectTool } from "./claude-tools";
 import { renderClaudeChat } from "./claude-ui";
 import { describeState } from "./state";
 import {
@@ -322,9 +323,20 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		const entries = kernel.logs(typeIs(since, "number") ? since : undefined, DEVLOGS_MAX_ENTRIES);
 		kernel.send(DEVLOGS_RESPONSE, id, shareableLogs(entries));
 	});
+	// Claude's client-realm tools (inspect / find on this client's DataModel). The server asks only the dev who sent the prompt.
+	dispatcher.setRaw(CLAUDE_TOOL_REQUEST, (id, tool, args) => {
+		if (!typeIs(id, "number") || !typeIs(tool, "string")) return;
+		const input = (typeIs(args, "table") ? args : {}) as Record<string, unknown>;
+		// find yields while it walks, so it runs in its own thread.
+		task.spawn(() => {
+			const [ok, result] = pcall(() => (tool === "inspect" ? inspectTool(input) : tool === "find" ? findTool(input) : error("unknown tool", 0)));
+			kernel.send(CLAUDE_TOOL_RESPONSE, id, ok, tostring(result));
+		});
+	});
 	trove.add(() => {
 		dispatcher.removeRaw(DEV_RESPONSE);
 		dispatcher.removeRaw(DEVLOGS_REQUEST);
+		dispatcher.removeRaw(CLAUDE_TOOL_REQUEST);
 		for (const [, waiter] of waiters) {
 			if (coroutine.status(waiter.timeout) === "suspended") task.cancel(waiter.timeout);
 		}
