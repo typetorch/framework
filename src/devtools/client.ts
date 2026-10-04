@@ -159,6 +159,8 @@ interface MenuState {
 	sub?: Record<string, string>;
 	/** Window rectangle in pixels; undefined = the centered default. */
 	window?: Rect;
+	/** Sidebar groups left open (they stay open until their header is clicked again). */
+	openGroups?: string[];
 }
 
 // Formatting --------------------------------------------------------------------------------------------------------
@@ -306,6 +308,14 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	const state = kernel.persist<MenuState>(PERSIST_KEY, () => ({ open: false, tab: "Artifact" }));
 	if (state.sub === undefined) state.sub = {};
 	const subs = state.sub;
+	// Sidebar groups stay open until their own header is clicked again; opening another tab doesn't collapse them.
+	if (state.openGroups === undefined) state.openGroups = [];
+	const openGroups = new Set<string>(state.openGroups);
+	const saveOpenGroups = () => {
+		const list = new Array<string>();
+		for (const group of openGroups) list.push(group);
+		state.openGroups = list;
+	};
 
 	// Health badge: a dot on the DEV button and the Server tab while the server has warnings or errors (health.ts).
 	// Fed by the Status page and, while the menu is closed, by a slow poll.
@@ -965,6 +975,23 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	let isOpen = false;
 	let dev = false;
 
+	/** Group headers' expand state and the active sub-tab (from state.tab and subs). */
+	const paintGroups = () => {
+		if (!ui) return;
+		for (const [tab, group] of ui.groups) {
+			const expanded = openGroups.has(tab);
+			group.frame.Visible = expanded;
+			group.collapsed.Visible = !expanded;
+			group.expanded.Visible = expanded;
+			for (const [child, button] of group.children) {
+				const active = tab === state.tab && child === subs[tab];
+				button.BackgroundTransparency = active ? 0 : 1;
+				button.TextColor3 = active ? COLORS.dark : COLORS.dim;
+				button.Font = active ? Enum.Font.BuilderSansBold : Enum.Font.BuilderSansMedium;
+			}
+		}
+	};
+
 	const selectTab = (name: TabName, sub?: string) => {
 		if (!ui || !tabTrove) return;
 		tabTrove.clean();
@@ -979,8 +1006,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			subs[name] = chosen;
 			key = `${name}/${chosen}`;
 		}
-		// Sidebar: plain tabs fill when selected; a group header only tints (its active child fills); only the
-		// selected group is expanded.
+		// Sidebar: plain tabs fill when selected; a group header only tints (its active child fills). Groups stay open
+		// until their own header is clicked again (paintGroups).
 		for (const [tab, button] of ui.tabButtons) {
 			const selected = tab === name;
 			if (ui.groups.has(tab)) {
@@ -991,18 +1018,11 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				button.TextColor3 = selected ? COLORS.dark : COLORS.text;
 			}
 		}
-		for (const [tab, group] of ui.groups) {
-			const expanded = tab === name;
-			group.frame.Visible = expanded;
-			group.collapsed.Visible = !expanded;
-			group.expanded.Visible = expanded;
-			for (const [child, button] of group.children) {
-				const active = expanded && child === chosen;
-				button.BackgroundTransparency = active ? 0 : 1;
-				button.TextColor3 = active ? COLORS.dark : COLORS.dim;
-				button.Font = active ? Enum.Font.BuilderSansBold : Enum.Font.BuilderSansMedium;
-			}
+		if (tabSubs) {
+			openGroups.add(name);
+			saveOpenGroups();
 		}
+		paintGroups();
 		ui.content.CanvasPosition = Vector2.zero;
 		const page = Page.mount(ui.content);
 		pad(page.frame, 10, 10);
@@ -1150,7 +1170,16 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				button.Activated.Connect(() => selectTab(name));
 				return;
 			}
-			button.Activated.Connect(() => selectTab(name, children[0]));
+			// The header toggles its group: opening shows its last sub-tab, closing never changes the page.
+			button.Activated.Connect(() => {
+				if (openGroups.has(name)) {
+					openGroups.delete(name);
+					saveOpenGroups();
+					paintGroups();
+				} else {
+					selectTab(name, subs[name] ?? children[0]);
+				}
+			});
 			// Expand indicator: a thin chevron drawn from Frames (right = collapsed, down = expanded).
 			const icon = make(
 				"Frame",
