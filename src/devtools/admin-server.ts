@@ -1,8 +1,10 @@
-import { DataStoreService, MemoryStoreService, Players, TeleportService, TextService } from "@rbxts/services";
+import { DataStoreService, HttpService, MemoryStoreService, MessagingService, Players, TeleportService, TextService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
 import type { Channel, NewServerReport, ServerKernel, ServerType } from "../kernel";
 import { RateLimiter } from "../net/limits";
+import { AB_KERNEL, AbReply, kernelHasExperiments, NEEDS_KERNEL_AB, PIN_JOBS_PER_MESSAGE, PIN_TOPIC, PinMessage } from "./ab";
+import { versionLess } from "./health";
 
 /**
  * Server half of the dev menu's Admin tab (plans/10, "Admin"): players (teleport to, bring, respawn, kick, ban),
@@ -30,6 +32,11 @@ import { RateLimiter } from "../net/limits";
  * Migrate (`admin.migrate`, see the Migrate section): everyone moves to one new reserved server on this branch (and
  * pin), which starts on the newest place version, so a server on an old kernel gets the new one. Admins on public
  * servers, any dev elsewhere; one migration per server.
+ *
+ * A/B (`admin.ab`, owner/admin, 2 then 1 per 10 s; kernel 0.2.3): publishes TypeTorch/pin messages (devtools/ab.ts)
+ * that pin the chosen servers (by JobId, grouped by branch, 15 per message) or a random percent of one branch's servers
+ * to a known artifact as an experiment, or unpin them. Each heartbeat carries `x` (experiment) and `v` (kernel
+ * version), so the list shows which servers run what and which kernels can take a pin.
  */
 
 export type AdminRole = "owner" | "admin" | "dev";
@@ -82,6 +89,12 @@ export interface AdminServer {
 	joinable: boolean;
 	/** Why it can't be joined: here | reserved | private | studio | unknown. */
 	why?: string;
+	/** It runs an A/B experiment pin. */
+	experiment: boolean;
+	/** Its kernel version (frameworks before A/B don't report it). */
+	kernel?: string;
+	/** Its kernel takes pin messages (0.2.3+); undefined when unknown. */
+	ab?: boolean;
 }
 
 export interface AdminServersReply {
@@ -90,6 +103,8 @@ export interface AdminServersReply {
 	/** The list hit the 200-entry read cap. */
 	truncated: boolean;
 	error?: string;
+	/** This server's kernel has A/B experiments (0.2.3+), so the A/B controls work here. */
+	ab: boolean;
 }
 
 export interface AdminBanEntry {
@@ -129,12 +144,17 @@ const MIGRATE_BATCH = 25;
 const MIGRATE_IN_FLIGHT = 10;
 const MIGRATE_MAX_BACKOFF = 8;
 
-const BUCKETS: Record<"mod" | "move" | "read" | "history", [number, number]> = {
+const BUCKETS: Record<"mod" | "move" | "read" | "history" | "ab", [number, number]> = {
 	mod: [3, 1 / 6],
 	move: [4, 1],
 	read: [8, 2],
 	history: [3, 1 / 5],
+	ab: [2, 1 / 10],
 };
+/** Most JobIds one admin.ab request may name. */
+const AB_MAX_JOBS = 200;
+/** Seconds after an A/B request before the server list is read again (the pinned servers rewrite their entries). */
+const AB_REFRESH = 10;
 
 /** Survives swaps (kernel persist store): plain data only. */
 interface AdminPersist {
@@ -180,6 +200,10 @@ interface StoredServer {
 	p?: unknown;
 	/** reserved server access code (only with a kernel that exposes it) */
 	k?: unknown;
+	/** 1 while it runs an A/B experiment pin */
+	x?: unknown;
+	/** kernel version */
+	v?: unknown;
 }
 
 interface ListCache {
@@ -537,6 +561,13 @@ export function registerAdminOps(
 		);
 	}
 
+	/** Whether this server runs an experiment pin (kernel 0.2.3+). */
+	const experimentNow = (): boolean => {
+		if (!kernelHasExperiments(kernel)) return false;
+		const [ok, info] = pcall(() => kernel.experiment!());
+		return ok && info !== undefined;
+	};
+
 	const ownEntry = (): StoredServer => ({
 		t: kernel.serverType,
 		b: kernel.branch,
@@ -548,6 +579,8 @@ export function registerAdminOps(
 		u: os.time(),
 		p: game.PlaceId,
 		k: kernel.serverType === "reserved" ? accessCode() : undefined,
+		x: experimentNow() ? 1 : undefined,
+		v: kernel.kernelVersion,
 	});
 
 	const publish = () => {
@@ -630,6 +663,7 @@ export function registerAdminOps(
 		else if (kind === "public") joinable = true;
 		else if (kind === "reserved" && typeIs(value.k, "string")) joinable = true;
 		else why = kind === "reserved" || kind === "private" || kind === "studio" ? kind : "unknown";
+		const version = text(value.v);
 		return {
 			jobId,
 			type: kind,
@@ -643,6 +677,9 @@ export function registerAdminOps(
 			here,
 			joinable,
 			why,
+			experiment: value.x === 1,
+			kernel: version,
+			ab: version !== undefined ? !versionLess(version, AB_KERNEL) : undefined,
 		};
 	};
 
@@ -658,8 +695,119 @@ export function registerAdminOps(
 		// This server from live data (it may not have written yet, or it is a Studio session).
 		servers.push(rowOf(jobLabel, ownEntry(), now, true));
 		servers.sort((a, b) => (a.here !== b.here ? a.here : a.players > b.players));
-		const reply: AdminServersReply = { you: youOf(actor), servers, truncated: list.truncated, error: list.error };
+		const reply: AdminServersReply = {
+			you: youOf(actor),
+			servers,
+			truncated: list.truncated,
+			error: list.error,
+			ab: kernelHasExperiments(kernel),
+		};
 		return reply;
+	});
+
+	// A/B ---------------------------------------------------------------------------------------------------------------
+	// Pins (or unpins) servers through the kernel topic TypeTorch/pin. The servers re-check everything themselves
+	// (branch, target, owner/admin `by`, known deployment); this op checks the request, the role and the rate.
+
+	const isJobId = (value: unknown): value is string =>
+		typeIs(value, "string") && value.size() > 0 && value.size() <= 64 && value.match("^[%w%-]+$")[0] !== undefined;
+
+	register("admin.ab", (player, payload): AbReply => {
+		const actor = actorOf(player);
+		limit(actor, "ab");
+		if (!actor.admin) error("admins_only", 0);
+		if (!kernelHasExperiments(kernel)) error(NEEDS_KERNEL_AB, 0);
+		if (kernel.serverType === "studio" || game.JobId === "") error("studio", 0);
+		const unpin = field(payload, "unpin");
+		if (unpin !== undefined && !typeIs(unpin, "boolean")) error("bad_request", 0);
+		const jobIds = field(payload, "jobIds");
+		const pct = field(payload, "pct");
+		if ((jobIds === undefined) === (pct === undefined)) error("bad_request", 0);
+		const assetId = field(payload, "assetId");
+		let artifact: string | undefined;
+		if (assetId !== undefined || unpin !== true) {
+			if (!isUserId(assetId)) error("bad_request", 0);
+			// Only known deployments (the receiving kernels refuse anything else too).
+			const known = kernel.artifacts?.().find((entry) => entry.assetId === assetId);
+			if (!known) error("unknown_artifact", 0);
+			artifact = known.artifactId ?? `asset-${assetId}`;
+		}
+
+		// Targets: branch -> JobIds (a pct request: one branch, no JobIds).
+		const groups = new Map<string, string[]>();
+		let skipped = 0;
+		let servers: number | undefined;
+		if (jobIds !== undefined) {
+			if (!typeIs(jobIds, "table")) error("bad_request", 0);
+			const list = jobIds as unknown[];
+			if (list.size() === 0 || list.size() > AB_MAX_JOBS) error("bad_request", 0);
+			const rows = readServers().rows;
+			const seen = new Set<string>();
+			for (const jobId of list) {
+				if (!isJobId(jobId)) error("bad_request", 0);
+				if (seen.has(jobId)) continue;
+				seen.add(jobId);
+				// This server: its own branch, even before its first list write.
+				const branch = jobId === game.JobId ? kernel.branch : text(rows.find((row) => row.key === jobId)?.value.b);
+				if (branch === undefined) {
+					skipped += 1;
+					continue;
+				}
+				const group = groups.get(branch) ?? [];
+				group.push(jobId);
+				groups.set(branch, group);
+			}
+			servers = seen.size() - skipped;
+			if (servers === 0) error("gone", 0);
+		} else {
+			if (!typeIs(pct, "number") || pct % 1 !== 0 || pct < 1 || pct > 100) error("bad_request", 0);
+			const branch = field(payload, "branch");
+			if (!typeIs(branch, "string") || branch.size() === 0 || branch.size() > 64) error("bad_request", 0);
+			groups.set(branch, []);
+		}
+
+		let messages = 0;
+		let failed = 0;
+		const publish = (message: PinMessage) => {
+			messages += 1;
+			const [ok, err] = pcall(() => MessagingService.PublishAsync(PIN_TOPIC, HttpService.JSONEncode(message)));
+			if (!ok) {
+				failed += 1;
+				$warn(`[admin] A/B publish failed: ${err}`);
+			}
+		};
+		for (const [branch, group] of groups) {
+			const a = assetId as number | undefined;
+			const flag = unpin === true ? true : undefined;
+			if (pct !== undefined) {
+				publish({ pct: pct as number, a, b: branch, by: player.UserId, t: DateTime.now().UnixTimestampMillis, unpin: flag });
+				continue;
+			}
+			for (let first = 0; first < group.size(); first += PIN_JOBS_PER_MESSAGE) {
+				const chunk = new Array<string>();
+				for (let index = first; index < math.min(first + PIN_JOBS_PER_MESSAGE, group.size()); index++) chunk.push(group[index]);
+				publish({ j: chunk, a, b: branch, by: player.UserId, t: DateTime.now().UnixTimestampMillis, unpin: flag });
+			}
+		}
+		const branches = new Array<string>();
+		for (const [branch] of groups) branches.push(branch);
+		record(actor, unpin === true ? "ab_unpin" : "ab_pin", undefined, undefined, "", {
+			assetId,
+			artifactId: artifact,
+			servers,
+			pct,
+			branches: branches.join(","),
+			messages,
+			failed,
+		});
+		// The pinned servers rewrite their list entries within seconds of their swap: read the list again then.
+		trove.add(
+			task.delay(AB_REFRESH, () => {
+				cache = undefined;
+			}),
+		);
+		if (failed === messages) error("publish_failed", 0);
+		return { ok: true, servers, skipped, messages, failed };
 	});
 
 	register("admin.join", (player, payload) => {

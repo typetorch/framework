@@ -1,7 +1,7 @@
 import { Players, UserInputService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
-import type { ClientKernel } from "../kernel";
+import type { ArtifactEntry, ClientKernel } from "../kernel";
 import { bump, popIn, popOut, PopupQueue } from "../ui";
 import type {
 	AdminBanEntry,
@@ -12,16 +12,19 @@ import type {
 	AdminServersReply,
 	AdminYou,
 } from "./admin-server";
+import type { AbReply, AbRequest } from "./ab";
 import {
 	addButton,
 	BUTTON_HEIGHT,
 	COLORS,
 	corner,
 	escapeRich,
+	hex,
 	make,
 	pad,
 	Page,
 	paintSelected,
+	scrolling,
 	searchBox,
 	spacer,
 	style,
@@ -36,7 +39,10 @@ import {
  *    opens a small menu: Teleport to, Bring, Respawn, Kick, Ban. Kick and Ban open a card (reason; Ban adds a duration
  *    and "ban alts"); their button arms "Confirm" on the first tap.
  *  - Servers: the universe's live servers (short JobId, copyable by focusing it; type, branch, channel, artifact,
- *    players, uptime) with Join, plus New server and, for admins, Shut down (a card, then an armed button).
+ *    players, uptime, an A/B tag) with Join, plus New server and, for admins, Shut down (a card, then an armed
+ *    button). A summary line per artifact says how many servers (and players) run it. A/B (owner/admin, kernel
+ *    0.2.3): checkboxes pick servers (this one too); "Load artifact..." pins the picked servers, or a random percent of
+ *    one branch, to a known artifact as an experiment, and "Unpin" ends experiments (admin.ab, devtools/ab.ts).
  *  - Bans: Unban by user id and the ban history of a user id (admins).
  * Cards go through one PopupQueue (never two at once) and pop in and out through a UIScale; everything lives in the tab
  * trove, so a tab switch or a swap removes it.
@@ -53,6 +59,12 @@ const MENU_ROW = 36;
 const MORE_SIZE = 34;
 const SERVER_ACTION = 72;
 const ID_WIDTH = 80;
+/** A/B checkbox size (phone-sized touch target). */
+const CHECK_SIZE = 34;
+/** "Random %" choices of the A/B Load card. */
+const PERCENTS = [5, 10, 25, 50];
+/** Seconds after an A/B request before the list is read again (the server re-reads it after 10 s). */
+const AB_RELOAD = 12;
 
 const ROLE_COLORS: Record<AdminRole, Color3> = { owner: COLORS.accent, admin: COLORS.info, dev: COLORS.good };
 const ROLE_ORDER: Record<AdminRole, number> = { owner: 3, admin: 2, dev: 1 };
@@ -81,6 +93,9 @@ const ERRORS: Record<string, string> = {
 	studio: "Not in Studio",
 	no_reply: "No reply",
 	already_migrating: "Already moving",
+	needs_kernel: "Needs kernel 0.2.3",
+	unknown_artifact: "Unknown artifact",
+	publish_failed: "Couldn't send",
 	"not a dev": "Not a dev",
 };
 
@@ -836,6 +851,81 @@ function renderPlayers(tab: AdminTab, deps: AdminDeps) {
 
 // Servers -------------------------------------------------------------------------------------------------------------
 
+/** Short artifact text for cards: the commit when known, else the id. */
+function shortArtifact(entry: ArtifactEntry): string {
+	return entry.commit ?? entry.artifactId ?? `asset ${entry.assetId}`;
+}
+
+/** Branches of the listed servers, most servers first (A/B "Random %" and "All A/B" pick one). */
+function branchesOf(servers: AdminServer[]): string[] {
+	const counts = new Map<string, number>();
+	for (const server of servers) {
+		if (server.branch !== undefined && server.type !== "studio") counts.set(server.branch, (counts.get(server.branch) ?? 0) + 1);
+	}
+	const names = new Array<string>();
+	for (const [name] of counts) names.push(name);
+	names.sort((a, b) => {
+		const ca = counts.get(a)!;
+		const cb = counts.get(b)!;
+		return ca !== cb ? ca > cb : a < b;
+	});
+	return names;
+}
+
+/** A square checkbox (phone-sized) at the left of a server row. A disabled one is dim and never fills. */
+function rowCheckbox(row: Instance, enabled: boolean, get: () => boolean, toggle: () => void) {
+	const box = make(
+		"TextButton",
+		{
+			Name: "Pick",
+			AutoButtonColor: false,
+			Text: "",
+			BackgroundColor3: COLORS.window,
+			BackgroundTransparency: enabled ? 0 : 0.6,
+			BorderSizePixel: 0,
+			Size: UDim2.fromOffset(CHECK_SIZE, CHECK_SIZE),
+		},
+		row,
+	);
+	corner(box, 6);
+	make("UIStroke", { Color: COLORS.stroke, Thickness: 1, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, box);
+	const fill = make(
+		"Frame",
+		{ BackgroundColor3: COLORS.accent, BorderSizePixel: 0, AnchorPoint: new Vector2(0.5, 0.5), Position: UDim2.fromScale(0.5, 0.5), Size: UDim2.fromOffset(16, 16) },
+		box,
+	);
+	corner(fill, 4);
+	const paint = () => {
+		fill.Visible = enabled && get();
+	};
+	box.Activated.Connect(() => {
+		toggle();
+		paint();
+		bump(box);
+	});
+	paint();
+}
+
+/** A segmented choice row in a card (buttons, one selected). Returns the row and a repaint function. */
+function choiceRow<T>(card: Page, choices: Array<[T, string]>, get: () => T, set: (value: T) => void): [Frame, () => void] {
+	const row = card.buttons();
+	const buttons = new Array<[T, TextButton]>();
+	const paint = () => {
+		for (const [value, button] of buttons) paintSelected(button, value === get());
+	};
+	for (const [value, label] of choices) {
+		buttons.push([
+			value,
+			addButton(row, label, () => {
+				set(value);
+				paint();
+			}),
+		]);
+	}
+	paint();
+	return [row, paint];
+}
+
 function renderServers(tab: AdminTab, deps: AdminDeps) {
 	const { page, trove } = tab;
 	const bar = tab.toolbar();
@@ -845,12 +935,24 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 	const setResult = resultLabel(foot);
 	const cards = new Cards(tab);
 	const note = page.text("Loading...", COLORS.dim);
+	const abNote = page.text("A/B needs kernel 0.2.3", COLORS.dim);
+	abNote.Visible = false;
+	// How many servers run which artifact, one line each.
+	const summary = page.group(2);
 	const list = page.group(4);
 	let loading = false;
 	let busy = false;
 	let playersHere = 0;
 	/** The reply's view of the acting dev (Migrate on this server's row). */
 	let you: AdminYou | undefined;
+	/** The last list, for the A/B cards. */
+	let servers = new Array<AdminServer>();
+	/** A/B controls are on: an owner/admin, and this server's kernel has experiments (0.2.3+). */
+	let abOn = false;
+	/** JobIds picked for A/B; kept across refreshes, dropped when their server leaves the list. */
+	const selected = new Set<string>();
+	/** Shows the A/B footer buttons and the picked count (set up with the footer, at the end). */
+	let paintAb = () => {};
 
 	const act = (label: string, op: string, payload: unknown, doneText: string) => {
 		if (busy) return;
@@ -862,6 +964,33 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 			if (succeeded(ok, reply)) setResult(doneText, COLORS.good);
 			else setResult(`Failed: ${errorText(reply)}`, COLORS.bad);
 		});
+	};
+
+	const drawSummary = () => {
+		summary.clear();
+		const order = new Array<string>();
+		const counts = new Map<string, { servers: number; players: number; ab: number }>();
+		for (const server of servers) {
+			const key = server.artifact ?? "-";
+			let count = counts.get(key);
+			if (!count) {
+				count = { servers: 0, players: 0, ab: 0 };
+				counts.set(key, count);
+				order.push(key);
+			}
+			count.servers += 1;
+			count.players += server.players;
+			if (server.experiment) count.ab += 1;
+		}
+		order.sort((a, b) => counts.get(a)!.servers > counts.get(b)!.servers);
+		for (const key of order) {
+			const count = counts.get(key)!;
+			let line = `<b>${escapeRich(key)}</b>  ${count.servers} server${count.servers === 1 ? "" : "s"}  ${count.players} players`;
+			if (count.ab > 0) line += tag(count.ab === count.servers ? "A/B" : `A/B ${count.ab}`, COLORS.warn);
+			const label = summary.text(line, COLORS.text);
+			label.RichText = true;
+			label.TextSize = 14;
+		}
 	};
 
 	const drawServer = (server: AdminServer) => {
@@ -876,9 +1005,33 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 		);
 		corner(row, 6);
 		pad(row, 6, 8);
+		// A/B: a checkbox on the left (this server too). Kernels before 0.2.3 can't take a pin: a dim box.
+		const indent = abOn ? CHECK_SIZE + 8 : 0;
+		if (abOn) {
+			const enabled = server.ab !== false;
+			rowCheckbox(
+				row,
+				enabled,
+				() => selected.has(server.jobId),
+				() => {
+					if (!enabled) {
+						setResult(`Needs kernel 0.2.3 (${server.kernel ?? "?"})`, COLORS.warn);
+						return;
+					}
+					if (selected.has(server.jobId)) selected.delete(server.jobId);
+					else selected.add(server.jobId);
+					paintAb();
+				},
+			);
+		}
 		const left = make(
 			"Frame",
-			{ BackgroundTransparency: 1, Size: new UDim2(1, -(SERVER_ACTION + 8), 0, 0), AutomaticSize: Enum.AutomaticSize.Y },
+			{
+				BackgroundTransparency: 1,
+				Position: UDim2.fromOffset(indent, 0),
+				Size: new UDim2(1, -(SERVER_ACTION + 8 + indent), 0, 0),
+				AutomaticSize: Enum.AutomaticSize.Y,
+			},
 			row,
 		);
 		verticalList(left, 2);
@@ -896,6 +1049,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 		idBox.ClipsDescendants = true;
 		idBox.Size = new UDim2(0, ID_WIDTH, 1, 0);
 		let tags = tag(server.type.upper(), COLORS.info);
+		if (server.experiment) tags += tag("A/B", COLORS.warn);
 		if (server.here) tags = tag("HERE", COLORS.accent) + tags;
 		const tagLabel = style(make("TextLabel", { BackgroundTransparency: 1, RichText: true }, top), tags, 14);
 		tagLabel.TextWrapped = false;
@@ -916,6 +1070,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 		});
 		let lineTwo = `${server.players}/${server.maxPlayers}  up ${duration(server.uptime)}`;
 		if (!server.here && server.age > 90) lineTwo += `  seen ${duration(server.age)} ago`;
+		if (abOn && server.ab === false) lineTwo += `  kernel ${server.kernel ?? "?"}`;
 		const detail = style(
 			make("TextLabel", { BackgroundTransparency: 1, LayoutOrder: 2 }, left),
 			`${server.branch ?? "?"} (${server.channel ?? "?"})  ${server.artifact ?? "-"}\n${lineTwo}`,
@@ -972,18 +1127,263 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 			const data = reply as AdminServersReply;
 			footButtons.Visible = data.you.admin;
 			you = data.you;
+			abOn = data.you.admin && data.ab === true;
+			abNote.Visible = data.you.admin && data.ab !== true;
+			servers = data.servers;
+			// Servers that left drop out of the selection.
+			const listed = new Set<string>();
+			for (const server of servers) listed.add(server.jobId);
+			const gone = new Array<string>();
+			for (const jobId of selected) if (!listed.has(jobId)) gone.push(jobId);
+			for (const jobId of gone) selected.delete(jobId);
+			paintAb();
 			list.clear();
-			const count = data.servers.size();
+			const count = servers.size();
 			note.Text = `${count}${data.truncated ? "+" : ""} server${count === 1 ? "" : "s"}${
 				data.error !== undefined ? `  (list failed: ${data.error})` : ""
 			}`;
 			note.TextColor3 = data.error !== undefined ? COLORS.warn : COLORS.dim;
-			for (const server of data.servers) {
+			drawSummary();
+			for (const server of servers) {
 				if (server.here) playersHere = server.players;
 				drawServer(server);
 			}
 		});
 	};
+
+	/** Sends one admin.ab request from a card; closes the card and re-reads the list once the servers moved. */
+	const sendAb = (
+		payload: AbRequest,
+		status: (text: string, color: Color3) => void,
+		close: () => void,
+		cardTrove: Trove,
+		onFail: () => void,
+	) => {
+		status("Sending...", COLORS.dim);
+		spawnIn(cardTrove, () => {
+			const [ok, reply] = deps.call("admin.ab", payload);
+			if (!succeeded(ok, reply)) {
+				onFail();
+				status(`Failed: ${errorText(reply)}`, COLORS.bad);
+				return;
+			}
+			const result = reply as AbReply;
+			const target = result.servers !== undefined ? `${result.servers} server${result.servers === 1 ? "" : "s"}` : `${payload.pct}%`;
+			const missed = result.failed > 0 || result.skipped > 0 ? `, ${result.failed + result.skipped} missed` : "";
+			setResult(`${payload.unpin === true ? "Unpinning" : "Loading on"} ${target}${missed}`, missed !== "" ? COLORS.warn : COLORS.good);
+			close();
+			// The servers swap within seconds (random picks wait up to 10 s more), then rewrite their list entries.
+			trove.add(task.delay(AB_RELOAD, load));
+		});
+	};
+
+	/** This server's branch when it is among `branches`, else the busiest one. */
+	const defaultBranch = (branches: string[]): string | undefined => {
+		const here = servers.find((server) => server.here)?.branch;
+		return here !== undefined && branches.includes(here) ? here : branches[0];
+	};
+
+	/** The picked JobIds as a list. */
+	const pickedJobs = (): string[] => {
+		const jobIds = new Array<string>();
+		for (const jobId of selected) jobIds.push(jobId);
+		return jobIds;
+	};
+
+	// "Load artifact...": the picked servers, or a random percent of one branch's servers, run a known artifact as an
+	// experiment. The card is the first confirm and the armed Load button the second; a one-line warning says who.
+	const openLoad = () =>
+		cards.open((card, close, cardTrove) => {
+			cardTitle(card, "Load artifact");
+			const branches = branchesOf(servers);
+			let mode: "picked" | "random" = selected.size() > 0 ? "picked" : "random";
+			let pct = 10;
+			let branch = defaultBranch(branches);
+			let chosen: ArtifactEntry | undefined;
+			let refresh = () => {};
+			const [, paintMode] = choiceRow<"picked" | "random">(
+				card,
+				[
+					["picked", `Picked (${selected.size()})`],
+					["random", "Random %"],
+				],
+				() => mode,
+				(value) => {
+					mode = value;
+					refresh();
+				},
+			);
+			const [pctRow] = choiceRow(
+				card,
+				PERCENTS.map((value): [number, string] => [value, `${value}%`]),
+				() => pct,
+				(value) => {
+					pct = value;
+					refresh();
+				},
+			);
+			let branchRow: Frame | undefined;
+			if (branches.size() > 1) {
+				[branchRow] = choiceRow(
+					card,
+					branches.map((name): [string | undefined, string] => [name, name]),
+					() => branch,
+					(value) => {
+						branch = value;
+						refresh();
+					},
+				);
+			}
+
+			// Known artifacts in a script-free scrolling list (layout + AutomaticCanvasSize), sized to fit the tab body.
+			const [, area] = hostOf(tab);
+			const listHeight = math.clamp(area.AbsoluteSize.Y - 260, 80, 220);
+			const scroller = card.place(scrolling(card.frame, { Size: new UDim2(1, 0, 0, listHeight) }));
+			const rows = Page.mount(scroller, 4);
+			rows.text("Loading...", COLORS.dim);
+			const rowButtons = new Array<[ArtifactEntry, TextButton, UIStroke]>();
+			const paintRows = () => {
+				for (const [entry, button, stroke] of rowButtons) {
+					button.BackgroundColor3 = entry === chosen ? COLORS.button : COLORS.row;
+					stroke.Enabled = entry === chosen;
+				}
+			};
+			spawnIn(cardTrove, () => {
+				const [ok, reply] = deps.call("artifacts");
+				rows.clear();
+				const answer = (typeIs(reply, "table") ? reply : {}) as { supported?: boolean; list?: ArtifactEntry[] };
+				if (!ok || answer.supported !== true) {
+					rows.text(ok ? "Kernel 0.2 needed for artifacts" : `Failed: ${errorText(reply)}`, COLORS.bad);
+					return;
+				}
+				const entries = answer.list ?? [];
+				if (entries.size() === 0) rows.text("None yet", COLORS.dim);
+				for (const entry of entries) {
+					const button = make("TextButton", {
+						AutoButtonColor: false,
+						Text: "",
+						BackgroundColor3: COLORS.row,
+						BorderSizePixel: 0,
+						Size: UDim2.fromScale(1, 0),
+						AutomaticSize: Enum.AutomaticSize.Y,
+					});
+					corner(button, 6);
+					pad(button, 6, 8);
+					const stroke = make("UIStroke", { Color: COLORS.accent, Thickness: 1, Enabled: false, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, button);
+					let title = `<b>${entry.seq !== undefined ? `#${entry.seq}  ` : ""}${escapeRich(shortArtifact(entry))}</b>  ${escapeRich(entry.branch)}`;
+					if (entry.channel === "dev") title += tag("DEV", COLORS.warn);
+					if (entry.live) title += tag("LIVE", COLORS.info);
+					if (entry.running) title += tag("HERE", COLORS.good);
+					const label = style(
+						make("TextLabel", { BackgroundTransparency: 1, RichText: true }, button),
+						`${title}\n<font size="14" color="${hex(COLORS.dim)}">${escapeRich(entry.artifactId ?? `asset-${entry.assetId}`)}</font>`,
+						15,
+					);
+					label.Size = UDim2.fromScale(1, 0);
+					label.AutomaticSize = Enum.AutomaticSize.Y;
+					button.Activated.Connect(() => {
+						chosen = entry;
+						paintRows();
+						refresh();
+					});
+					rows.place(button);
+					rowButtons.push([entry, button, stroke]);
+				}
+			});
+
+			const warning = card.text("", COLORS.warn);
+			const status = cardStatus(card);
+			const buttons = card.buttons();
+			addButton(buttons, "Cancel", close);
+			spacer(buttons);
+			let sending = false;
+			armButton(buttons, "Load", COLORS.accent, () => {
+				if (sending) return;
+				if (!chosen) return status("Pick an artifact", COLORS.bad);
+				if (mode === "picked" && selected.size() === 0) return status("Pick servers first", COLORS.bad);
+				if (mode === "random" && branch === undefined) return status("No servers", COLORS.bad);
+				sending = true;
+				const payload: AbRequest =
+					mode === "picked" ? { jobIds: pickedJobs(), assetId: chosen.assetId } : { pct, branch, assetId: chosen.assetId };
+				sendAb(payload, status, close, cardTrove, () => (sending = false));
+			});
+
+			refresh = () => {
+				paintMode();
+				pctRow.Visible = mode === "random";
+				if (branchRow) branchRow.Visible = mode === "random";
+				if (!chosen) {
+					warning.Visible = false;
+					return;
+				}
+				const name = shortArtifact(chosen);
+				const count = selected.size();
+				warning.Text =
+					mode === "picked"
+						? `Everyone on ${count} server${count === 1 ? "" : "s"} runs ${name}`
+						: `About ${pct}% of ${branch ?? "?"} servers run ${name}`;
+				warning.Visible = true;
+			};
+			refresh();
+		});
+
+	// "Unpin": the picked servers, or every A/B server of one branch, go back to their branch head.
+	const openUnpin = () =>
+		cards.open((card, close, cardTrove) => {
+			cardTitle(card, "Unpin");
+			const branches = branchesOf(servers);
+			let mode: "picked" | "all" = selected.size() > 0 ? "picked" : "all";
+			let branch = defaultBranch(branches);
+			let refresh = () => {};
+			const [, paintMode] = choiceRow<"picked" | "all">(
+				card,
+				[
+					["picked", `Picked (${selected.size()})`],
+					["all", "All A/B"],
+				],
+				() => mode,
+				(value) => {
+					mode = value;
+					refresh();
+				},
+			);
+			let branchRow: Frame | undefined;
+			if (branches.size() > 1) {
+				[branchRow] = choiceRow(
+					card,
+					branches.map((name): [string | undefined, string] => [name, name]),
+					() => branch,
+					(value) => {
+						branch = value;
+						refresh();
+					},
+				);
+			}
+			const warning = card.text("", COLORS.warn);
+			const status = cardStatus(card);
+			const buttons = card.buttons();
+			addButton(buttons, "Cancel", close);
+			spacer(buttons);
+			let sending = false;
+			armButton(buttons, "Unpin", COLORS.accent, () => {
+				if (sending) return;
+				if (mode === "picked" && selected.size() === 0) return status("Pick servers first", COLORS.bad);
+				if (mode === "all" && branch === undefined) return status("No servers", COLORS.bad);
+				sending = true;
+				const payload: AbRequest = mode === "picked" ? { jobIds: pickedJobs(), unpin: true } : { pct: 100, branch, unpin: true };
+				sendAb(payload, status, close, cardTrove, () => (sending = false));
+			});
+			refresh = () => {
+				paintMode();
+				if (branchRow) branchRow.Visible = mode === "all";
+				const count = selected.size();
+				warning.Text =
+					mode === "picked"
+						? `${count} server${count === 1 ? "" : "s"} go back to the branch head`
+						: `Every A/B server on ${branch ?? "?"} goes back to the head`;
+			};
+			refresh();
+		});
 
 	const openShutdown = () =>
 		cards.open((card, close, cardTrove) => {
@@ -1012,8 +1412,28 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 
 	addButton(bar, "Refresh", load);
 	addButton(bar, "New server", () => act("Opening a server", "admin.newServer", undefined, "Teleporting..."));
+	// Footer: A/B on the picked servers (owner/admin, kernel 0.2.3), then Shut down for this server.
+	const loadButton = colorButton(footButtons, "Load artifact...", COLORS.accent, openLoad);
+	const unpinButton = addButton(footButtons, "Unpin", openUnpin);
+	const countLabel = style(
+		make("TextLabel", { BackgroundTransparency: 1, Size: UDim2.fromOffset(0, BUTTON_HEIGHT), AutomaticSize: Enum.AutomaticSize.X }),
+		"",
+		14,
+		COLORS.dim,
+		Enum.Font.BuilderSansMedium,
+	);
+	countLabel.TextWrapped = false;
+	countLabel.LayoutOrder = footButtons.GetChildren().size();
+	countLabel.Parent = footButtons;
+	paintAb = () => {
+		loadButton.Visible = abOn;
+		unpinButton.Visible = abOn;
+		countLabel.Visible = abOn && selected.size() > 0;
+		countLabel.Text = `${selected.size()} picked`;
+	};
 	spacer(footButtons);
 	colorButton(footButtons, "Shut down", COLORS.bad, openShutdown);
+	paintAb();
 	every(trove, SERVERS_REFRESH, load);
 }
 
