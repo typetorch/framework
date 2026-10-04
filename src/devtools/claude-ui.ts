@@ -586,7 +586,7 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 	pairHint.Parent = pairing;
 
 	// Middle: messages ----------------------------------------------------------------------------------------------
-	const middle = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 1), LayoutOrder: 2 }, host);
+	const middle = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 1), LayoutOrder: 2, ZIndex: 2 }, host);
 	make("UIFlexItem", { FlexMode: Enum.UIFlexMode.Fill }, middle);
 	const scroller = make(
 		"ScrollingFrame",
@@ -789,7 +789,8 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 			Visible: false,
 			ZIndex: 20,
 		},
-		host,
+		// In `middle` (no layout), not `host`: host's UIListLayout would stack the menu and its shadow at the top.
+		middle,
 	);
 	corner(menu, 12);
 	make("UIStroke", { Color: COLORS.stroke, Thickness: 1, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, menu);
@@ -799,7 +800,7 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 	const shadow = make(
 		"Frame",
 		{ BackgroundColor3: Color3.fromRGB(0, 0, 0), BackgroundTransparency: 0.6, BorderSizePixel: 0, AnchorPoint: new Vector2(0, 1), Visible: false, ZIndex: 19 },
-		host,
+		middle,
 	);
 	corner(shadow, 14);
 	const checks = new Map<MenuItem, Frame>();
@@ -836,9 +837,9 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		popOut(menu);
 	};
 	const openMenu = () => {
-		// Above the "+" button, in host coordinates.
-		const at = plusButton.AbsolutePosition.sub(host.AbsolutePosition);
-		const x = math.clamp(at.X, 4, math.max(4, host.AbsoluteSize.X - MENU_WIDTH - 4));
+		// Above the "+" button, in `middle` coordinates (the menu hangs past middle's bottom over the composer).
+		const at = plusButton.AbsolutePosition.sub(middle.AbsolutePosition);
+		const x = math.clamp(at.X, 4, math.max(4, middle.AbsoluteSize.X - MENU_WIDTH - 4));
 		menu.Position = UDim2.fromOffset(x, at.Y - 6);
 		shadow.Position = UDim2.fromOffset(x + 2, at.Y - 2);
 		popIn(menu);
