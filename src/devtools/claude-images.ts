@@ -1,4 +1,4 @@
-import { AssetService, CaptureService, GuiService, RunService, UserInputService, Workspace } from "@rbxts/services";
+import { AssetService, CaptureService, GuiService, RunService, StarterGui, UserInputService, Workspace } from "@rbxts/services";
 import type { Trove } from "@rbxts/trove";
 import { popIn, popOut } from "../ui";
 import { COLORS, corner, make, style } from "./widgets";
@@ -162,13 +162,31 @@ export function takeScreenshot(hide: ScreenGui[] = [], timeout = 8): Outcome<Tak
 		RunService.RenderStepped.Wait();
 		RunService.RenderStepped.Wait();
 	}
+	// Roblox hides the game's UI (PlayerGui) from captures by default; the dev wants to see it. The dev menu itself is
+	// hidden above. Both knobs: ScreenshotHud.HidePlayerGuiForCaptures (restored after) and UICaptureMode = All on the
+	// call (newer clients). Either may be missing on a client, so both are best effort.
+	const hud = StarterGui.FindFirstChildOfClass("ScreenshotHud" as keyof Instances) as unknown as { HidePlayerGuiForCaptures?: boolean } | undefined;
+	let hudBefore: boolean | undefined;
+	pcall(() => {
+		if (hud !== undefined && hud.HidePlayerGuiForCaptures !== false) {
+			hudBefore = hud.HidePlayerGuiForCaptures;
+			hud.HidePlayerGuiForCaptures = false;
+		}
+	});
+	const [paramsOk, uiAll] = pcall(() => (Enum as unknown as Record<string, Record<string, EnumItem>>).UICaptureMode.All);
+	const captureParams = paramsOk && uiAll !== undefined ? { UICaptureMode: uiAll } : undefined;
+	const takeCapture = CaptureService.TakeScreenshotCaptureAsync as unknown as (
+		self: CaptureService,
+		onCaptured: (status: Enum.ScreenshotCaptureResult, capture?: ScreenshotCapture) => void,
+		params?: object,
+	) => void;
 	let result: Outcome<TakenCapture> | undefined;
 	const waitFor = (seconds: number) => {
 		const deadline = os.clock() + seconds;
 		while (result === undefined && os.clock() < deadline) task.wait(0.05);
 	};
 	const [started] = pcall(() =>
-		CaptureService.TakeScreenshotCaptureAsync((status: Enum.ScreenshotCaptureResult, capture?: ScreenshotCapture) => {
+		takeCapture(CaptureService, (status: Enum.ScreenshotCaptureResult, capture?: ScreenshotCapture) => {
 			if (result !== undefined) return;
 			const [ok, taken] = pcall((): TakenCapture | undefined => {
 				if (status !== Enum.ScreenshotCaptureResult.Success || capture === undefined) return undefined;
@@ -176,7 +194,7 @@ export function takeScreenshot(hide: ScreenGui[] = [], timeout = 8): Outcome<Tak
 			});
 			if (ok && taken !== undefined) result = { ok: true, value: taken };
 			else result = { ok: false, error: status === Enum.ScreenshotCaptureResult.NoSpaceOnDevice ? "capture_no_space" : "capture_failed" };
-		}),
+		}, captureParams),
 	);
 	if (started) waitFor(timeout / 2);
 	if (result === undefined || !result.ok) {
@@ -192,6 +210,7 @@ export function takeScreenshot(hide: ScreenGui[] = [], timeout = 8): Outcome<Tak
 		if (result === undefined) result = failed;
 	}
 	for (const gui of restore) gui.Enabled = true;
+	if (hudBefore !== undefined) pcall(() => (hud!.HidePlayerGuiForCaptures = hudBefore));
 	return result ?? { ok: false, error: "capture_failed" };
 }
 
