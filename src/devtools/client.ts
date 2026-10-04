@@ -17,9 +17,6 @@ import { runningModules } from "../runtime/registry";
 import { bump, popIn, popOut } from "../ui";
 import { ExplorerPersist, mountExplorer } from "./explorer";
 import {
-	ClaudePromptRequest,
-	ClaudeRequestView,
-	ClaudeSessionView,
 	DEV_REQUEST,
 	DEV_RESPONSE,
 	DEVLOGS_MAX_BYTES,
@@ -32,6 +29,7 @@ import {
 	NetStat,
 	StateSummary,
 } from "./protocol";
+import { renderClaudeChat } from "./claude-ui";
 import { describeState } from "./state";
 import {
 	addButton,
@@ -39,7 +37,6 @@ import {
 	buttonRow,
 	COLORS,
 	corner,
-	fixedRow,
 	escapeRich,
 	make,
 	pad,
@@ -48,8 +45,6 @@ import {
 	playerSelector,
 	scrolling,
 	searchBox,
-	sideButton,
-	SIDE_BUTTON,
 	style,
 	tag,
 	upButton,
@@ -69,7 +64,6 @@ const REQUEST_TIMEOUT = 15;
 const REFRESH = 2;
 /** Logs > Others polls slower (the server allows one request per dev every 2 s). */
 const OTHER_LOGS_REFRESH = 4;
-const CLAUDE_POLL = 2.5;
 const MAX_LOG_ROWS = 300;
 const HEADER = 46;
 const TAB_WIDTH = 116;
@@ -95,54 +89,12 @@ const LOG_COLORS: Record<string, Color3> = {
 	error: COLORS.bad,
 };
 
-const CLAUDE_STATE_COLORS: Record<string, Color3> = {
-	queued: COLORS.dim,
-	running: COLORS.info,
-	committed: COLORS.info,
-	building: COLORS.info,
-	deployed: COLORS.good,
-	failed: COLORS.bad,
-	cancelled: COLORS.dim,
-	lost: COLORS.dim,
-};
-
-/** Short text for the remote-claude error codes of devtools/claude.ts. */
-const CLAUDE_ERRORS: Record<string, string> = {
-	not_connected: "Not connected: start `typetorch remote-claude` on this branch",
-	needs_pairing: "Pair first: paste the pairing code",
-	bad_code: "Wrong or expired code",
-	not_allowed: "Not on the session's user list",
-	prod_channel: "Prompts work on dev-channel servers only.",
-	busy: "Wait for your running request",
-	rate_limited: "Too many tries, wait a bit",
-	empty: "Write a prompt first",
-	too_long: "Prompt too long (4000 max)",
-	context_too_large: "Attached context too large",
-	unreachable: "Can't reach the dev machine",
-	unauthorized: "Rejected by the dev machine",
-	forbidden: "Rejected by the dev machine",
-	remote_rate_limited: "Dev machine busy, try again",
-	not_yours: "Only the requester can cancel",
-	not_found: "Request not found",
-};
-
-function claudeError(code: unknown): string {
-	if (typeIs(code, "string")) return CLAUDE_ERRORS[code] ?? `Failed: ${code}`;
-	return "Failed";
-}
-
 /** Short text for the "logs.player" errors of devtools/server.ts. */
 const OTHER_LOG_ERRORS: Record<string, string> = {
 	no_reply: "No reply from that player",
 	not_in_server: "That player left",
 	rate_limited: "Slow down",
 };
-
-interface ClaudeReply {
-	ok?: boolean;
-	error?: string;
-	request?: ClaudeRequestView;
-}
 
 const TABS = ["Artifact", "Server", "Logs", "Dex", "Network", "State", "Claude"] as const;
 type TabName = (typeof TABS)[number];
@@ -924,303 +876,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		});
 	};
 
-	let claudeDraft = "";
-	let attachPath = false;
-	let attachErrors = false;
-	const renderClaude = ({ page, trove: tabTrove }: TabContext) => {
-		page.field("Branch", str(kernel.branch));
-		page.field("Channel", str(kernel.channel));
-		if (kernel.channel !== "dev") {
-			page.text(claudeError("prod_channel"), COLORS.dim);
-			return;
-		}
-
-		// Every row here is a fixed-height Frame with a scale-sized left part and a fixed-width button pinned right
-		// (fixedRow + sideButton): nothing can reach past the content's right edge at any window size.
-		const sideGap = -(SIDE_BUTTON + 8);
-
-		// Row 1: session status (one line) + Unpair once paired.
-		const sessionRow = page.place(fixedRow());
-		const sessionLine = style(
-			make("TextLabel", { BackgroundTransparency: 1 }, sessionRow),
-			"Checking session...",
-			15,
-			COLORS.dim,
-			Enum.Font.BuilderSansMedium,
-		);
-		sessionLine.TextWrapped = false;
-		sessionLine.TextTruncate = Enum.TextTruncate.AtEnd;
-		sessionLine.Size = UDim2.fromScale(1, 1);
-		const unpairButton = sideButton(sessionRow, "Unpair");
-		unpairButton.Visible = false;
-		const showUnpair = (visible: boolean) => {
-			unpairButton.Visible = visible;
-			sessionLine.Size = new UDim2(1, visible ? sideGap : 0, 1, 0);
-		};
-		const hint = page.text("", COLORS.dim);
-		hint.Visible = false;
-
-		// Pairing (allowed, not paired yet): a masked code box. A TextBox can't mask, so its real text is invisible
-		// (TextTransparency 1) under a label that shows one dot per character.
-		const pairing = page.group(6);
-		pairing.frame.Visible = false;
-		const codeRow = pairing.place(fixedRow());
-		const codeBox = style(make("TextBox", { ClearTextOnFocus: false }, codeRow), "", 15, COLORS.text, Enum.Font.Code);
-		codeBox.TextTransparency = 1;
-		codeBox.PlaceholderText = "";
-		codeBox.TextWrapped = false;
-		codeBox.ClipsDescendants = true;
-		codeBox.BackgroundColor3 = COLORS.row;
-		codeBox.Size = new UDim2(1, sideGap, 1, 0);
-		corner(codeBox, 6);
-		pad(codeBox, 0, 8);
-		const mask = style(make("TextLabel", { BackgroundTransparency: 1, Interactable: false }, codeBox), "", 15, COLORS.dim, Enum.Font.Code);
-		mask.Size = UDim2.fromScale(1, 1);
-		mask.TextWrapped = false;
-		mask.TextTruncate = Enum.TextTruncate.AtEnd;
-		const paintMask = () => {
-			const length = math.min(codeBox.Text.size(), 64);
-			mask.Text = length > 0 ? string.rep("•", length) : "Pairing code";
-			mask.TextColor3 = length > 0 ? COLORS.text : COLORS.dim;
-		};
-		paintMask();
-		tabTrove.connect(codeBox.GetPropertyChangedSignal("Text"), paintMask);
-		const pairButton = sideButton(codeRow, "Pair", COLORS.accent, COLORS.dark);
-		pairing.text("Paste the pairing code printed by typetorch-dev-server", COLORS.dim);
-		const pairResult = pairing.text("", COLORS.dim);
-		pairResult.Visible = false;
-		const showPairResult = (text: string, color: Color3) => {
-			pairResult.Text = text;
-			pairResult.TextColor3 = color;
-			pairResult.Visible = text !== "";
-		};
-
-		// Composer (paired): prompt, then [Dex path] [Errors] ... [Send].
-		const composer = page.group(6);
-		composer.frame.Visible = false;
-		const list = page.group(8);
-
-		const box = composer.input("Describe a change", 110, true);
-		box.Text = claudeDraft;
-		tabTrove.connect(box.GetPropertyChangedSignal("Text"), () => (claudeDraft = box.Text));
-		// Row: [Dex path] [Errors] on the left (half of the left part each, capped), Send pinned right.
-		const actions = composer.place(fixedRow());
-		const toggles = make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, sideGap, 1, 0) }, actions);
-		make(
-			"UIListLayout",
-			{ FillDirection: Enum.FillDirection.Horizontal, SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 6) },
-			toggles,
-		);
-		const toggle = (text: string, order: number, onClick: () => void) => {
-			const button = style(make("TextButton", { AutoButtonColor: true }), text, 15, COLORS.text, Enum.Font.BuilderSansMedium);
-			button.TextXAlignment = Enum.TextXAlignment.Center;
-			button.TextWrapped = false;
-			button.TextTruncate = Enum.TextTruncate.AtEnd;
-			button.Size = new UDim2(0.5, -3, 1, 0);
-			button.LayoutOrder = order;
-			make("UISizeConstraint", { MaxSize: new Vector2(130, math.huge) }, button);
-			corner(button, 6);
-			pad(button, 0, 6);
-			button.Parent = toggles;
-			button.Activated.Connect(onClick);
-			return button;
-		};
-		const pathToggle = toggle("Dex path", 1, () => {
-			attachPath = !attachPath;
-			paintSelected(pathToggle, attachPath, COLORS.info);
-		});
-		const errorsToggle = toggle("Errors", 2, () => {
-			attachErrors = !attachErrors;
-			paintSelected(errorsToggle, attachErrors, COLORS.info);
-		});
-		paintSelected(pathToggle, attachPath, COLORS.info);
-		paintSelected(errorsToggle, attachErrors, COLORS.info);
-		const sendButton = sideButton(actions, "Send", COLORS.accent, COLORS.dark);
-		const result = composer.text("", COLORS.dim);
-		result.Visible = false;
-		const showResult = (text: string, color: Color3) => {
-			result.Text = text;
-			result.TextColor3 = color;
-			result.Visible = text !== "";
-		};
-
-		let requests = new Array<ClaudeRequestView>();
-		let sending = false;
-		let pairingBusy = false;
-
-		const replace = (updated: ClaudeRequestView) => {
-			const index = requests.findIndex((request) => request.id === updated.id);
-			if (index === -1) requests.unshift(updated);
-			else requests[index] = updated;
-		};
-
-		let drawList: () => void;
-		let refreshSession: () => void;
-		const cancel = (id: string) =>
-			spawnIn(tabTrove, () => {
-				const [ok, reply] = call("claude.cancel", id);
-				const answer = (typeIs(reply, "table") ? reply : {}) as ClaudeReply;
-				if (ok && answer.ok === true && answer.request) replace(answer.request);
-				else showResult(claudeError(ok ? answer.error : reply), COLORS.bad);
-				drawList();
-			});
-
-		drawList = () => {
-			list.clear();
-			if (requests.size() === 0) return;
-			list.section("Requests");
-			for (const request of requests) {
-				const card = list.group(2);
-				const color = CLAUDE_STATE_COLORS[request.state] ?? COLORS.text;
-				const title = card.text(`${request.state.upper()}  ${request.prompt}`, color);
-				title.Font = Enum.Font.BuilderSansBold;
-				const details = new Array<string>();
-				if (!request.mine) details.push(`by ${request.by}`);
-				if (request.summary !== undefined) details.push(request.summary);
-				if (request.commit !== undefined) details.push(`commit ${request.commit}`);
-				if (request.artifactId !== undefined) details.push(request.artifactId);
-				if (request.error !== undefined) details.push(request.error);
-				if (details.size() > 0) card.text(details.join("  "), COLORS.dim);
-				const log = request.log ?? [];
-				for (let index = math.max(0, log.size() - 3); index < log.size(); index++) {
-					card.text(log[index], COLORS.dim, true);
-				}
-				if (request.mine && !request.finished) {
-					sideButton(card.place(fixedRow()), "Cancel", COLORS.bad, COLORS.dark).Activated.Connect(() => cancel(request.id));
-				}
-			}
-		};
-
-		refreshSession = () => {
-			const [ok, reply] = call("claude.session");
-			if (!ok || !typeIs(reply, "table")) {
-				sessionLine.Text = `Failed: ${str(reply)}`;
-				sessionLine.TextColor3 = COLORS.bad;
-				return;
-			}
-			const session = reply as ClaudeSessionView;
-			const paired = session.paired === true;
-			let hintText = "";
-			if (!session.available) {
-				sessionLine.Text = "Not connected";
-				sessionLine.TextColor3 = COLORS.warn;
-				hintText = "Start `typetorch remote-claude` on this branch";
-			} else if (!session.allowed) {
-				sessionLine.Text = `Connected · ${session.label} · not allowed`;
-				sessionLine.TextColor3 = COLORS.warn;
-				hintText = "You are not on the session's user list";
-			} else if (!paired) {
-				sessionLine.Text = `Connected · ${session.label} · not paired`;
-				sessionLine.TextColor3 = COLORS.warn;
-			} else {
-				sessionLine.Text = `Connected · ${session.label} · ${str(session.branch)}`;
-				sessionLine.TextColor3 = COLORS.good;
-			}
-			hint.Text = hintText;
-			hint.Visible = hintText !== "";
-			const usable = session.available && session.allowed;
-			pairing.frame.Visible = usable && !paired;
-			composer.frame.Visible = usable && paired;
-			showUnpair(usable && paired);
-			requests = session.requests;
-			drawList();
-		};
-
-		const pollActive = () => {
-			let polled = 0;
-			for (const request of [...requests]) {
-				if (request.finished || polled >= 3) continue;
-				polled += 1;
-				const [ok, reply] = call("claude.status", request.id);
-				const answer = (typeIs(reply, "table") ? reply : {}) as ClaudeReply;
-				if (ok && answer.ok === true && answer.request) replace(answer.request);
-			}
-			if (polled > 0) drawList();
-		};
-
-		const lastClientErrors = (): string[] => {
-			const errors = new Array<string>();
-			for (const entry of kernel.logs(undefined, 300)) {
-				if (entry.kind === "error") errors.push(entry.text.sub(1, 500));
-			}
-			return errors.filter((_, index) => index >= errors.size() - 5);
-		};
-
-		// The code goes to the server once and is cleared at once; it is never logged.
-		const pair = () => {
-			const code = (codeBox.Text.match("^%s*(.-)%s*$")[0] as string | undefined) ?? "";
-			codeBox.Text = "";
-			if (code === "") return showPairResult("Paste a code first", COLORS.warn);
-			showPairResult("Pairing...", COLORS.dim);
-			const [ok, reply] = call("claude.pair", { code });
-			const answer = (typeIs(reply, "table") ? reply : {}) as ClaudeReply;
-			if (ok && answer.ok === true) {
-				showPairResult("", COLORS.dim);
-				showResult("Paired", COLORS.good);
-				refreshSession();
-			} else {
-				showPairResult(claudeError(ok ? answer.error : reply), COLORS.bad);
-			}
-		};
-		const startPair = () => {
-			if (pairingBusy) return;
-			pairingBusy = true;
-			spawnIn(tabTrove, () => {
-				const [ok, err] = pcall(pair);
-				pairingBusy = false;
-				if (!ok) showPairResult(`Failed: ${err}`, COLORS.bad);
-			});
-		};
-		pairButton.Activated.Connect(startPair);
-		tabTrove.connect(codeBox.FocusLost, (enterPressed) => {
-			if (enterPressed) startPair();
-		});
-		unpairButton.Activated.Connect(() =>
-			spawnIn(tabTrove, () => {
-				call("claude.unpair");
-				showResult("", COLORS.dim);
-				refreshSession();
-			}),
-		);
-
-		const send = () => {
-			const prompt = (box.Text.match("^%s*(.-)%s*$")[0] as string | undefined) ?? "";
-			if (prompt === "") return showResult(claudeError("empty"), COLORS.warn);
-			showResult("Sending...", COLORS.dim);
-			const request: ClaudePromptRequest = { prompt: prompt.sub(1, 4000), errors: attachErrors };
-			if (attachPath && dexSelection !== undefined) request.path = dexSelection;
-			if (attachErrors) request.clientErrors = lastClientErrors();
-			const [ok, reply] = call("claude.prompt", request);
-			const answer = (typeIs(reply, "table") ? reply : {}) as ClaudeReply;
-			if (ok && answer.ok === true && answer.request) {
-				showResult("Sent", COLORS.good);
-				box.Text = "";
-				replace(answer.request);
-				drawList();
-			} else {
-				showResult(claudeError(ok ? answer.error : reply), COLORS.bad);
-				// The dev machine dropped this pairing: show the code box again.
-				if (ok && answer.error === "needs_pairing") refreshSession();
-			}
-		};
-		sendButton.Activated.Connect(() => {
-			if (sending) return;
-			sending = true;
-			spawnIn(tabTrove, () => {
-				const [ok, err] = pcall(send);
-				sending = false;
-				if (!ok) showResult(`Failed: ${err}`, COLORS.bad);
-			});
-		});
-
-		// The session every 10 s; active requests every 2.5 s in between (only while this tab is open).
-		let tick = 0;
-		every(tabTrove, CLAUDE_POLL, () => {
-			if (tick % 4 === 0) refreshSession();
-			else pollActive();
-			tick += 1;
-		});
-	};
+	// Claude: a Claude Code style chat (devtools/claude-ui.ts); "Dex path" sends the explorer's selection.
+	const renderClaude = (tab: TabContext) => renderClaudeChat(tab, { kernel, call, dexSelection: () => dexSelection });
 
 	/** Keys: a tab name, or "Tab/Sub" for tabs with sub-tabs. */
 	const RENDER: Record<string, (tab: TabContext) => void> = {

@@ -2,7 +2,18 @@ import { HttpService, MessagingService, RunService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
 import type { ServerKernel } from "../kernel";
-import type { ClaudePromptRequest, ClaudeRequestView, ClaudeSessionView, DevOp } from "./protocol";
+import type {
+	ClaudeConversation,
+	ClaudeConversationSummary,
+	ClaudeEvent,
+	ClaudeEventKind,
+	ClaudeEventsReply,
+	ClaudeMessage,
+	ClaudePromptRequest,
+	ClaudeRequestView,
+	ClaudeSessionView,
+	DevOp,
+} from "./protocol";
 
 /**
  * Game side of `typetorch remote-claude` (plans/11). A dev's machine announces a session over MessagingService; this
@@ -17,6 +28,11 @@ import type { ClaudePromptRequest, ClaudeRequestView, ClaudeSessionView, DevOp }
  * SECRECY: the session URL, the pairing code and every token stay in server memory. They are never sent to a client,
  * never printed (server logs reach dev clients through the Logs tab) and never put in attributes. HTTP failures are
  * reported as short codes only, because Roblox error text can contain the URL.
+ *
+ * CHAT: prompts belong to conversations on the dev machine (a follow-up resumes the same Claude Code session). The
+ * client polls "claude.events" about once a second while a prompt runs; replies are re-checked here field by field
+ * (types, lengths, counts) before they reach a client. "claude.conversations" / "claude.conversation" reopen a chat
+ * after a swap or a rejoin; the dev machine only shows a user their own conversations.
  */
 
 const TOPIC = "TypeTorch/remote-claude";
@@ -36,7 +52,15 @@ const MAX_TOKEN = 4096;
 /** Pairing attempts per user per minute (the dev-server limits too). */
 const PAIR_MAX = 5;
 const PAIR_WINDOW = 60;
-const FINISHED_STATES = new Set(["deployed", "failed", "cancelled"]);
+const FINISHED_STATES = new Set(["deployed", "answered", "failed", "cancelled", "lost"]);
+const EVENT_KINDS = new Set<string>(["assistant_text", "tool_use", "tool_result", "status", "error"]);
+/** Events relayed per "claude.events" reply (the dev machine pages at 300). */
+const MAX_EVENTS = 300;
+const MAX_EVENT_TEXT = 4000;
+/** Characters of event text in one "claude.conversation" reply; older messages lose their events past it. */
+const CONVERSATION_TEXT_BUDGET = 120_000;
+const MAX_MESSAGES = 30;
+const MAX_CONVERSATIONS = 20;
 
 interface Session {
 	sid: string;
@@ -60,6 +84,8 @@ interface RequestRecord {
 	artifactId?: string;
 	error?: string;
 	log?: string[];
+	/** Added with chats: records from older generations lack it. */
+	conversationId?: string;
 }
 
 /** A user's refresh token for one session. Server memory only. */
@@ -93,6 +119,53 @@ function matches(text: string, pattern: string): boolean {
 
 function shortString(value: unknown, max: number): string | undefined {
 	return typeIs(value, "string") ? value.sub(1, max) : undefined;
+}
+
+function shortNumber(value: unknown): number | undefined {
+	return typeIs(value, "number") && value === value && value !== math.huge && value !== -math.huge ? value : undefined;
+}
+
+/** Dev-server prompt ids are 22 base64url characters; conversation ids too. */
+function isServerId(value: unknown): value is string {
+	return typeIs(value, "string") && value.size() === 22 && matches(value, "^[%w_%-]+$");
+}
+
+/** Items of a JSON array (or nothing), in order. */
+function listOf(value: unknown): unknown[] {
+	return typeIs(value, "table") ? (value as unknown[]) : [];
+}
+
+function cleanEvent(raw: unknown): ClaudeEvent | undefined {
+	if (!typeIs(raw, "table")) return undefined;
+	const data = raw as Record<string, unknown>;
+	const index = shortNumber(data.i);
+	const kind = data.kind;
+	const text = data.text;
+	if (index === undefined || !typeIs(kind, "string") || !EVENT_KINDS.has(kind) || !typeIs(text, "string")) return undefined;
+	const event: ClaudeEvent = { i: index, kind: kind as ClaudeEventKind, text: text.sub(1, MAX_EVENT_TEXT) };
+	const tool = shortString(data.tool, 40);
+	if (tool !== undefined) event.tool = tool;
+	const target = shortString(data.target, 200);
+	if (target !== undefined) event.target = target;
+	const block = shortNumber(data.block);
+	if (block !== undefined) event.block = block;
+	const state = shortString(data.state, 20);
+	if (state !== undefined) event.state = state;
+	return event;
+}
+
+function cleanEvents(raw: unknown, max: number): ClaudeEvent[] {
+	const events = new Array<ClaudeEvent>();
+	for (const item of listOf(raw)) {
+		if (events.size() >= max) break;
+		const event = cleanEvent(item);
+		if (event) events.push(event);
+	}
+	return events;
+}
+
+function isFinished(state: string | undefined, finishedAt: unknown): boolean {
+	return (state !== undefined && FINISHED_STATES.has(state)) || finishedAt !== undefined;
 }
 
 /** Host-only https URL; plain http to localhost only in Studio (dev-server without a tunnel). */
@@ -321,6 +394,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 
 	// Records ---------------------------------------------------------------------------------------------------------
 	const view = (record: RequestRecord, player: Player): ClaudeRequestView => ({
+		conversationId: record.conversationId,
 		id: record.id,
 		state: record.state,
 		prompt: record.prompt,
@@ -354,7 +428,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 			}
 			record.log = log;
 		}
-		record.finished = FINISHED_STATES.has(record.state) || reply.finishedAt !== undefined;
+		record.finished = isFinished(record.state, reply.finishedAt);
 	};
 
 	const refresh = (session: Session, record: RequestRecord, userId: number): HttpResult => {
@@ -443,6 +517,8 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 
 		const request = (typeIs(payload, "string") ? { prompt: payload } : payload) as Partial<ClaudePromptRequest>;
 		if (!typeIs(request, "table") || !typeIs(request.prompt, "string")) return fail("bad_request");
+		const conversationId = request.conversationId;
+		if (conversationId !== undefined && !isServerId(conversationId)) return fail("bad_request");
 		const prompt = request.prompt.match("^%s*(.-)%s*$")[0] as string;
 		if (prompt === "") return fail("empty");
 		if (prompt.size() > MAX_PROMPT) return fail("too_long");
@@ -474,9 +550,16 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 
 		recent.push(now);
 		store.sent.set(player.UserId, recent);
-		const result = authed(session, player.UserId, "POST", "/v1/prompts", { prompt, context });
-		if (!result.ok) return result;
-		const reply = (typeIs(result.data, "table") ? result.data : {}) as { id?: unknown; state?: unknown };
+		const body: { prompt: string; context: typeof context; conversationId?: string } = { prompt, context };
+		if (conversationId !== undefined) body.conversationId = conversationId;
+		const result = authed(session, player.UserId, "POST", "/v1/prompts", body);
+		if (!result.ok) {
+			// The dev machine forgot the chat (it restarted): the client starts a new one.
+			if (result.error === "not_found" && conversationId !== undefined) return fail("conversation_gone");
+			if (result.error === "conflict") return fail("busy");
+			return result;
+		}
+		const reply = (typeIs(result.data, "table") ? result.data : {}) as { id?: unknown; state?: unknown; conversationId?: unknown };
 		const id = reply.id;
 		if (!typeIs(id, "string") || id.size() > 64 || !matches(id, "^[%w_%-]+$")) return fail("bad_reply");
 		const record: RequestRecord = {
@@ -488,6 +571,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 			state: shortString(reply.state, 20) ?? "queued",
 			finished: false,
 			createdAt: now,
+			conversationId: isServerId(reply.conversationId) ? reply.conversationId : undefined,
 		};
 		store.requests.push(record);
 		while (store.requests.size() > MAX_RECORDS) store.requests.shift();
@@ -520,5 +604,121 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		if (!result.ok) return result;
 		refresh(session, record, player.UserId);
 		return { ok: true, request: view(record, player) };
+	});
+	// Chat ------------------------------------------------------------------------------------------------------------
+	const chatSession = (player: Player): Session | Failure => {
+		const session = activeSession();
+		if (!session) return fail("not_connected");
+		if (!session.users.includes(player.UserId)) return fail("not_allowed");
+		return session;
+	};
+	const isFailure = (value: Session | Failure): value is Failure => (value as Failure).ok === false;
+
+	// {id, since} → the prompt's state and its events i >= since (any allowed user of the session may read; the dev
+	// machine decides). Polled about once a second per open chat while a prompt runs.
+	ops.set("claude.events", (player, payload): ClaudeEventsReply => {
+		const session = chatSession(player);
+		if (isFailure(session)) return session;
+		const request = (typeIs(payload, "table") ? payload : {}) as { id?: unknown; since?: unknown };
+		const id = request.id;
+		if (!isServerId(id)) return fail("bad_request");
+		const since = math.clamp(math.floor(shortNumber(request.since) ?? 0), 0, 9_999_999);
+		const result = authed(session, player.UserId, "GET", `/v1/prompts/${id}?since=${since}`);
+		if (!result.ok) {
+			if (result.error !== "not_found") return result;
+			const lost = find(session, id);
+			if (lost) {
+				lost.state = "lost";
+				lost.finished = true;
+			}
+			return { ok: true, id, state: "lost", finished: true, events: [], next: since };
+		}
+		const reply = (typeIs(result.data, "table") ? result.data : {}) as Record<string, unknown>;
+		const record = find(session, id);
+		if (record) apply(record, reply);
+		const state = shortString(reply.state, 20) ?? "queued";
+		const nextIndex = shortNumber(reply.next);
+		return {
+			ok: true,
+			id,
+			state,
+			finished: isFinished(state, reply.finishedAt),
+			conversationId: isServerId(reply.conversationId) ? reply.conversationId : undefined,
+			summary: shortString(reply.summary, 300),
+			commit: shortString(reply.commit, 64),
+			artifactId: shortString(reply.artifactId, 128),
+			runError: shortString(reply.error, 300),
+			costUsd: shortNumber(reply.costUsd),
+			events: cleanEvents(reply.events, MAX_EVENTS),
+			next: nextIndex !== undefined ? math.max(since, math.floor(nextIndex)) : since,
+			more: reply.more === true,
+		};
+	});
+
+	// The player's own conversations on the dev machine, latest first.
+	ops.set("claude.conversations", (player) => {
+		const session = chatSession(player);
+		if (isFailure(session)) return session;
+		const result = authed(session, player.UserId, "GET", "/v1/conversations");
+		if (!result.ok) return result;
+		const reply = (typeIs(result.data, "table") ? result.data : {}) as { conversations?: unknown };
+		const conversations = new Array<ClaudeConversationSummary>();
+		for (const item of listOf(reply.conversations)) {
+			if (conversations.size() >= MAX_CONVERSATIONS || !typeIs(item, "table")) continue;
+			const data = item as Record<string, unknown>;
+			const id = data.id;
+			if (!isServerId(id)) continue;
+			conversations.push({
+				id,
+				title: shortString(data.title, 80) ?? "chat",
+				updatedAt: shortNumber(data.updatedAt) ?? 0,
+				prompts: shortNumber(data.prompts) ?? 0,
+				state: shortString(data.state, 20),
+			});
+		}
+		return { ok: true, conversations };
+	});
+
+	// One of the player's conversations with its messages (replay after a swap or a rejoin). Text is capped per reply:
+	// the newest messages keep their events, older ones past the budget keep only their prompt and fields.
+	ops.set("claude.conversation", (player, payload) => {
+		const session = chatSession(player);
+		if (isFailure(session)) return session;
+		if (!isServerId(payload)) return fail("bad_request");
+		const result = authed(session, player.UserId, "GET", `/v1/conversations/${payload}`);
+		if (!result.ok) return result.error === "not_found" ? fail("conversation_gone") : result;
+		const reply = (typeIs(result.data, "table") ? result.data : {}) as Record<string, unknown>;
+		const raw = listOf(reply.messages);
+		const messages = new Array<ClaudeMessage>();
+		let budget = CONVERSATION_TEXT_BUDGET;
+		for (let index = raw.size() - 1; index >= 0 && messages.size() < MAX_MESSAGES; index--) {
+			const item = raw[index];
+			if (!typeIs(item, "table")) continue;
+			const data = item as Record<string, unknown>;
+			const id = data.id;
+			const prompt = data.prompt;
+			if (!isServerId(id) || !typeIs(prompt, "string")) continue;
+			const state = shortString(data.state, 20) ?? "queued";
+			let events = cleanEvents(data.events, 400);
+			let size = 0;
+			for (const event of events) size += event.text.size();
+			if (size > budget) events = [];
+			else budget -= size;
+			messages.unshift({
+				id,
+				prompt: prompt.sub(1, MAX_PROMPT),
+				state,
+				finished: isFinished(state, data.finishedAt),
+				summary: shortString(data.summary, 300),
+				commit: shortString(data.commit, 64),
+				artifactId: shortString(data.artifactId, 128),
+				error: shortString(data.error, 300),
+				costUsd: shortNumber(data.costUsd),
+				events,
+				next: math.max(0, math.floor(shortNumber(data.next) ?? 0)),
+			});
+		}
+		const conversation: ClaudeConversation = { id: payload, title: shortString(reply.title, 80) ?? "chat", messages };
+		return { ok: true, conversation };
 	});
 }

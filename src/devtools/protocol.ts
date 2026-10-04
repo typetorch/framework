@@ -70,6 +70,8 @@ export interface ClaudeRequestView {
 	artifactId?: string;
 	error?: string;
 	log?: string[];
+	/** The conversation the prompt belongs to (dev-server chats). */
+	conversationId?: string;
 }
 
 export interface ClaudeSessionView {
@@ -92,4 +94,72 @@ export interface ClaudePromptRequest {
 	errors?: boolean;
 	/** The client's last errors. */
 	clientErrors?: string[];
+	/** Continue this conversation (Claude resumes its session); absent = a new chat. */
+	conversationId?: string;
+}
+
+/** Terminal states: deployed | committed | answered | failed | cancelled (plus "lost" when the dev machine forgot it). */
+export type ClaudeEventKind = "assistant_text" | "tool_use" | "tool_result" | "status" | "error";
+
+/** One event of a prompt (dev-server GET /v1/prompts/:id?since=n), already redacted by the dev machine. */
+export interface ClaudeEvent {
+	i: number;
+	kind: ClaudeEventKind;
+	text: string;
+	tool?: string;
+	target?: string;
+	/** assistant_text: chunks with the same block number form one text block. */
+	block?: number;
+	/** status: the new state. */
+	state?: string;
+}
+
+/** Op "claude.events" {id, since} → the prompt's state and its events i >= since. */
+export interface ClaudeEventsReply {
+	ok: boolean;
+	error?: string;
+	id?: string;
+	state?: string;
+	finished?: boolean;
+	conversationId?: string;
+	summary?: string;
+	commit?: string;
+	artifactId?: string;
+	/** Why the run failed (the op itself failed when ok = false; see error). */
+	runError?: string;
+	/** Claude Code's own estimate (runs use the dev's subscription, never per-token billing). */
+	costUsd?: number;
+	events?: ClaudeEvent[];
+	/** Pass as `since` next time. */
+	next?: number;
+	/** Another page is ready now. */
+	more?: boolean;
+}
+
+export interface ClaudeConversationSummary {
+	id: string;
+	title: string;
+	updatedAt: number;
+	prompts: number;
+	state?: string;
+}
+
+export interface ClaudeMessage {
+	id: string;
+	prompt: string;
+	state: string;
+	finished: boolean;
+	summary?: string;
+	commit?: string;
+	artifactId?: string;
+	error?: string;
+	costUsd?: number;
+	events: ClaudeEvent[];
+	next: number;
+}
+
+export interface ClaudeConversation {
+	id: string;
+	title: string;
+	messages: ClaudeMessage[];
 }
