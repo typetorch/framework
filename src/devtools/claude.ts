@@ -51,6 +51,13 @@ import type {
  * polls GET /v1/game/pending while a dev's prompt runs. A request is served only when: this server's effective channel
  * is "dev", j is this server's JobId, s is the session, u is in the session's users, is in this server, is still a
  * dev and is paired here. The request itself is fetched with that user's token (the dev machine checks user AND job).
+ *
+ * TRANSPORT (2026-10-04): one HTTP long-poll per paired dev, GET /v1/game/poll?since=<cursor> (held up to 20 s by the
+ * dev machine), carries the streamed events of the prompts this server sent plus the tool requests for this JobId.
+ * It runs only while the dev is here, paired, and has a run going or the Claude tab open; it backs off with jitter on
+ * errors and stops with the session or the generation. "claude.events" answers from what the poll brought (falling
+ * back to GET /v1/prompts/:id?since for anything the cache doesn't hold). The wake message on TypeTorch/tool is only for
+ * when no poll is open.
  * run_luau needs the dev's approval in their chat (or "always" for that chat) and LoadStringEnabled; every run is
  * logged (description and outcome, never the code) and the last 20 are kept.
  */
@@ -82,9 +89,12 @@ const CONVERSATION_TEXT_BUDGET = 120_000;
 const MAX_MESSAGES = 30;
 const MAX_CONVERSATIONS = 20;
 const TOOL_TOPIC = "TypeTorch/tool";
-const TOOL_POLL = 2;
-/** Prompts older than this are not polled for tool requests. */
-const TOOL_POLL_WINDOW = 30 * 60;
+/** A dev's chat counts as open this long after its last claude.* op. */
+const CHAT_OPEN_WINDOW = 20;
+/** Runs older than this don't keep the poll going. */
+const RUN_WINDOW = 30 * 60;
+/** Events kept per prompt in the poll cache. */
+const CACHE_EVENTS = 3000;
 const APPROVAL_SECONDS = 60;
 const CLIENT_TOOL_TIMEOUT = 10;
 const MAX_EXEC_LOG = 20;
@@ -250,6 +260,15 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	const pairings = store.pairings;
 	/** run_luau snippets waiting for a player's approval (set up in the game tools section below). */
 	let approvalsFor: (player: Player) => ClaudeApproval[] | undefined = () => undefined;
+	/** What the long-poll brought per prompt: contiguous events from `start`, and the prompt's latest fields. */
+	interface PromptCache {
+		start: number;
+		events: ClaudeEvent[];
+		fields?: Record<string, unknown>;
+	}
+	const cache = new Map<string, PromptCache>();
+	/** userId -> os.clock() of their last claude.* op (the chat is open). */
+	const lastSeen = new Map<number, number>();
 	// userId -> [access token, expires at (unix)]. Generation memory only: never persisted, sent or printed.
 	const tokens = new Map<number, [string, number]>();
 	const exchanging = new Set<number>();
@@ -498,6 +517,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 
 	// Ops -------------------------------------------------------------------------------------------------------------
 	ops.set("claude.session", (player): ClaudeSessionView => {
+		lastSeen.set(player.UserId, os.clock());
 		const session = activeSession();
 		if (!session) return { available: false, allowed: false, branch: kernel.branch, label: "", requests: [] };
 		const allowed = session.users.includes(player.UserId);
@@ -667,6 +687,33 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		const id = request.id;
 		if (!isServerId(id)) return fail("bad_request");
 		const since = math.clamp(math.floor(shortNumber(request.since) ?? 0), 0, 9_999_999);
+		lastSeen.set(player.UserId, os.clock());
+		const cached = cache.get(id);
+		if (cached && cached.fields && since >= cached.start && since <= cached.start + cached.events.size()) {
+			const events = new Array<ClaudeEvent>();
+			for (let index = since - cached.start; index < cached.events.size() && events.size() < MAX_EVENTS; index++) events.push(cached.events[index]);
+			const fields = cached.fields;
+			const state = shortString(fields.state, 20) ?? "queued";
+			const record = find(session, id);
+			if (record) apply(record, fields);
+			const nextIndex = since + events.size();
+			return {
+				ok: true,
+				id,
+				state,
+				finished: isFinished(state, fields.finishedAt) && nextIndex >= cached.start + cached.events.size(),
+				conversationId: isServerId(fields.conversationId) ? fields.conversationId : undefined,
+				summary: shortString(fields.summary, 300),
+				commit: shortString(fields.commit, 64),
+				artifactId: shortString(fields.artifactId, 128),
+				runError: shortString(fields.error, 300),
+				costUsd: shortNumber(fields.costUsd),
+				events,
+				next: nextIndex,
+				more: nextIndex < cached.start + cached.events.size(),
+				approvals: approvalsFor(player),
+			};
+		}
 		const result = authed(session, player.UserId, "GET", `/v1/prompts/${id}?since=${since}`);
 		if (!result.ok) {
 			if (result.error !== "not_found") return result;
@@ -680,6 +727,9 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		const reply = (typeIs(result.data, "table") ? result.data : {}) as Record<string, unknown>;
 		const record = find(session, id);
 		if (record) apply(record, reply);
+		// The poll cache has events but no fields yet (no state change since it started): take them from here.
+		const partial = cache.get(id);
+		if (partial && partial.fields === undefined) partial.fields = reply;
 		const state = shortString(reply.state, 20) ?? "queued";
 		const nextIndex = shortNumber(reply.next);
 		return {
@@ -702,6 +752,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 
 	// The player's own conversations on the dev machine, latest first.
 	ops.set("claude.conversations", (player) => {
+		lastSeen.set(player.UserId, os.clock());
 		const session = chatSession(player);
 		if (isFailure(session)) return session;
 		const result = authed(session, player.UserId, "GET", "/v1/conversations");
@@ -938,16 +989,22 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		return { ok: false, error: `unknown tool ${tostring(tool).sub(1, 40)}` };
 	};
 
-	/** Serves one game-tool request id for `player` (from a wake message or the pending poll). */
-	const serveToolRequest = (session: Session, player: Player, requestId: string) => {
-		if (handled.has(requestId)) return;
+	/** Runs one tool request and posts the answer (once per id). */
+	const answerRequest = (session: Session, player: Player, request: Record<string, unknown>) => {
+		const requestId = request.id;
+		if (!typeIs(requestId, "string") || requestId.size() !== 32 || !matches(requestId, "^%x+$") || handled.has(requestId)) return;
 		handled.add(requestId);
-		const fetched = authed(session, player.UserId, "GET", `/v1/game/requests/${requestId}`);
-		if (!fetched.ok || !typeIs(fetched.data, "table")) return;
-		const request = fetched.data as Record<string, unknown>;
 		const [ok, answer] = pcall(() => runTool(player, request));
 		const body: ToolAnswer = ok ? answer : { ok: false, error: tostring(answer).sub(1, 2000) };
-		authed(session, player.UserId, "POST", `/v1/game/requests/${requestId}/result`, { output: [], ...body });
+		authed(session, player.UserId, "POST", "/v1/game/tool-result", { output: [], ...body, id: requestId });
+	};
+
+	/** Serves one game-tool request id from a wake message (no poll was open). */
+	const serveToolRequest = (session: Session, player: Player, requestId: string) => {
+		if (handled.has(requestId)) return;
+		const fetched = authed(session, player.UserId, "GET", `/v1/game/requests/${requestId}`);
+		if (!fetched.ok || !typeIs(fetched.data, "table")) return;
+		answerRequest(session, player, fetched.data as Record<string, unknown>);
 	};
 
 	/** Who may use the game tools here right now: the session's user, in this server, a dev, paired here. */
@@ -958,13 +1015,82 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		return player;
 	};
 
-	const pollPending = (session: Session, player: Player) => {
-		const result = authed(session, player.UserId, "GET", "/v1/game/pending");
-		if (!result.ok || !typeIs(result.data, "table")) return;
-		for (const item of listOf((result.data as { requests?: unknown }).requests)) {
-			const id = typeIs(item, "table") ? (item as { id?: unknown }).id : undefined;
-			if (typeIs(id, "string") && id.size() === 32 && matches(id, "^%x+$")) task.spawn(serveToolRequest, session, player, id);
+	/** The poll runs while the dev has a run going here or the Claude tab open. */
+	const wantsPoll = (session: Session, userId: number): boolean => {
+		const seen = lastSeen.get(userId);
+		if (seen !== undefined && os.clock() - seen < CHAT_OPEN_WINDOW) return true;
+		const now = os.time();
+		for (const record of store.requests) {
+			if (record.sid === session.sid && record.user === userId && !record.finished && now - record.createdAt < RUN_WINDOW) return true;
 		}
+		return false;
+	};
+
+	/** Applies one long-poll reply: events into the cache, prompt fields, tool requests. */
+	const applyPoll = (session: Session, player: Player, data: Record<string, unknown>) => {
+		if (data.reset === true) {
+			// The dev machine restarted or the cursor fell behind: reads fall back to HTTP until new events arrive.
+			cache.clear();
+		}
+		for (const item of listOf(data.items)) {
+			if (!typeIs(item, "table")) continue;
+			const entry = item as Record<string, unknown>;
+			if (entry.type === "event" && isServerId(entry.promptId)) {
+				const event = cleanEvent(entry.event);
+				if (!event) continue;
+				let cached = cache.get(entry.promptId);
+				if (cached && event.i !== cached.start + cached.events.size()) {
+					// A gap: drop it (reads fall back to HTTP for this prompt).
+					cache.delete(entry.promptId);
+					cached = undefined;
+					continue;
+				}
+				if (!cached) {
+					cached = { start: event.i, events: [] };
+					cache.set(entry.promptId, cached);
+				}
+				if (cached.events.size() < CACHE_EVENTS) cached.events.push(event);
+				else cache.delete(entry.promptId);
+			} else if (entry.type === "prompt" && typeIs(entry.prompt, "table")) {
+				const fields = entry.prompt as Record<string, unknown>;
+				if (!isServerId(fields.id)) continue;
+				const cached = cache.get(fields.id);
+				if (cached) cached.fields = fields;
+				const record = find(session, fields.id);
+				if (record) apply(record, fields);
+			}
+		}
+		for (const request of listOf(data.requests)) {
+			if (typeIs(request, "table")) task.spawn(answerRequest, session, player, request as Record<string, unknown>);
+		}
+	};
+
+	// One poll thread per dev (at most), started by the manager below.
+	const polling = new Set<number>();
+	const pollLoop = (userId: number, isStopped: () => boolean) => {
+		polling.add(userId);
+		let cursor: number | undefined;
+		let failures = 0;
+		while (!isStopped()) {
+			const session = activeSession();
+			const player = session ? toolPlayer(session, userId) : undefined;
+			if (!session || !player || !wantsPoll(session, userId)) break;
+			const result = authed(session, userId, "GET", cursor === undefined ? "/v1/game/poll" : `/v1/game/poll?since=${cursor}`);
+			if (isStopped()) break;
+			if (!result.ok || !typeIs(result.data, "table")) {
+				failures += 1;
+				if (result.ok === false && (result.error === "needs_pairing" || result.error === "not_allowed")) break;
+				// Backoff with jitter: 1, 2, 4 ... 30 s.
+				task.wait(math.min(30, 2 ** math.min(failures - 1, 5)) * (0.5 + math.random()));
+				continue;
+			}
+			failures = 0;
+			const data = result.data as Record<string, unknown>;
+			const nextCursor = shortNumber(data.cursor);
+			pcall(applyPoll, session, player, data);
+			if (nextCursor !== undefined) cursor = math.floor(nextCursor);
+		}
+		polling.delete(userId);
 	};
 
 	if (kernel.channel === "dev") {
@@ -996,21 +1122,16 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 			if (stopped) result.Disconnect();
 			else toolConnection = result;
 		});
-		// Backup poll: while a dev's prompt from this server is running (messages can be lost).
+		// The poll manager: starts a dev's long-poll when they need one (run going or chat open), once per dev.
 		trove.add(
 			task.spawn(() => {
 				while (!stopped) {
-					task.wait(TOOL_POLL);
+					task.wait(1);
 					const session = activeSession();
 					if (!session) continue;
-					const users = new Set<number>();
-					const now = os.time();
-					for (const record of store.requests) {
-						if (record.sid === session.sid && !record.finished && now - record.createdAt < TOOL_POLL_WINDOW) users.add(record.user);
-					}
-					for (const userId of users) {
-						const player = toolPlayer(session, userId);
-						if (player) pcall(pollPending, session, player);
+					for (const userId of session.users) {
+						if (polling.has(userId) || !wantsPoll(session, userId) || !toolPlayer(session, userId)) continue;
+						task.spawn(pollLoop, userId, () => stopped);
 					}
 				}
 			}),

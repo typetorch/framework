@@ -33,7 +33,8 @@ import { chevron, COLORS, corner, escapeRich, hex, make, pad, SIDE_BUTTON, sideB
  */
 
 const PERSIST_KEY = "typetorch/claude-chat";
-const POLL_ACTIVE = 1;
+/** The chat asks this server (not the dev machine) for new events: cheap, so it can be quick. */
+const POLL_ACTIVE = 0.5;
 const POLL_IDLE = 2;
 const SESSION_REFRESH = 10;
 const FONT = Enum.Font.Code;
@@ -111,6 +112,70 @@ export interface ClaudeChatDeps {
 
 // Markdown → RichText -------------------------------------------------------------------------------------------------
 
+/** Emojis Claude might still send, as text where the meaning would be lost. */
+const EMOJI_TEXT = new Map<number, string>([
+	[0x2705, "ok"],
+	[0x2714, "ok"],
+	[0x274c, "failed"],
+	[0x2716, "failed"],
+	[0x26a0, "warning"],
+	[0x23ed, "skipped"],
+]);
+
+function isEmoji(code: number): boolean {
+	return (
+		(code >= 0x1f000 && code <= 0x1faff) ||
+		(code >= 0x2600 && code <= 0x27bf) ||
+		(code >= 0x2b00 && code <= 0x2bff) ||
+		(code >= 0x23e9 && code <= 0x23fa) ||
+		code === 0xfe0f ||
+		code === 0x200d
+	);
+}
+
+/** No emojis in game UI (user rule): drops them, keeping a word for the few that carry meaning. */
+export function stripEmoji(text: string): string {
+	let plain = true;
+	for (const [, code] of utf8.codes(text)) {
+		if (isEmoji(code)) {
+			plain = false;
+			break;
+		}
+	}
+	if (plain) return text;
+	const out = new Array<string>();
+	for (const [, code] of utf8.codes(text)) {
+		const word = EMOJI_TEXT.get(code);
+		if (word !== undefined) out.push(word);
+		else if (!isEmoji(code)) out.push(utf8.char(code));
+	}
+	return out.join("");
+}
+
+/** A GFM table as monospace text: columns padded to the widest cell, a rule under the header. */
+function tableText(rows: string[]): string {
+	const cells = new Array<string[]>();
+	for (const row of rows) {
+		const inner = row.gsub("^%s*|", "")[0].gsub("|%s*$", "")[0];
+		// The separator row (|---|:--:|) becomes the rule.
+		if (inner.match("^[%s%-:|]+$")[0] !== undefined) continue;
+		cells.push(inner.split("|").map((cell) => (cell.match("^%s*(.-)%s*$")[0] as string).gsub("%*%*", "")[0].gsub("`", "")[0]));
+	}
+	const width = (cell: string) => {
+		const [length] = utf8.len(cell);
+		return typeIs(length, "number") ? length : cell.size();
+	};
+	const widths = new Array<number>();
+	for (const row of cells) row.forEach((cell, index) => (widths[index] = math.max(widths[index] ?? 0, width(cell))));
+	const line = (row: string[]) => row.map((cell, index) => cell + string.rep(" ", (widths[index] ?? 0) - width(cell))).join("  ");
+	const lines = new Array<string>();
+	cells.forEach((row, index) => {
+		lines.push(line(row));
+		if (index === 0) lines.push(widths.map((width) => string.rep("-", width)).join("  "));
+	});
+	return lines.join("\n");
+}
+
 type Block =
 	| { kind: "p"; text: string }
 	| { kind: "h"; text: string; level: number }
@@ -127,9 +192,22 @@ export function parseMarkdown(text: string): Block[] {
 		if (paragraph.size() > 0) blocks.push({ kind: "p", text: paragraph.join("\n") });
 		paragraph = [];
 	};
+	let tableRows: string[] | undefined;
+	const flushTable = () => {
+		if (tableRows) blocks.push({ kind: "code", text: tableText(tableRows) });
+		tableRows = undefined;
+	};
 	for (const raw of text.split("\n")) {
 		const line = raw.gsub("\r$", "")[0];
 		const fence = line.match("^%s*```")[0] !== undefined;
+		// GFM table rows (outside code): collected and shown as one monospace block.
+		if (code === undefined && line.match("^%s*|.*|%s*$")[0] !== undefined) {
+			flush();
+			tableRows ??= [];
+			tableRows.push(line);
+			continue;
+		}
+		flushTable();
 		if (code !== undefined) {
 			if (fence) {
 				blocks.push({ kind: "code", text: code.join("\n") });
@@ -171,6 +249,7 @@ export function parseMarkdown(text: string): Block[] {
 		}
 		paragraph.push(line);
 	}
+	flushTable();
 	flush();
 	// Still streaming: an open fence shows as a code block already.
 	if (code !== undefined) blocks.push({ kind: "code", text: code.join("\n") });
@@ -637,7 +716,25 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		}
 	};
 	trove.connect(box.GetPropertyChangedSignal("TextBounds"), fitBox);
-	trove.connect(box.GetPropertyChangedSignal("Text"), () => (state.draft = box.Text));
+	let previousText = box.Text;
+	let sendFromEnter: () => void = () => {};
+	trove.connect(box.GetPropertyChangedSignal("Text"), () => {
+		const text = box.Text;
+		// Enter inserts "\n" in a multi-line box: without Shift held, take it back out and send instead.
+		const at = box.CursorPosition - 1;
+		const typedNewline = text.size() === previousText.size() + 1 && at >= 1 && text.sub(at, at) === "\n";
+		const shift = UserInputService.IsKeyDown(Enum.KeyCode.LeftShift) || UserInputService.IsKeyDown(Enum.KeyCode.RightShift);
+		if (typedNewline && !shift && !UserInputService.TouchEnabled) {
+			const restored = text.sub(1, at - 1) + text.sub(at + 1);
+			previousText = restored;
+			box.Text = restored;
+			state.draft = restored;
+			task.defer(() => sendFromEnter());
+			return;
+		}
+		previousText = text;
+		state.draft = text;
+	});
 	fitBox();
 
 	const actions = make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, ROUND), LayoutOrder: 3 }, composer);
@@ -831,6 +928,8 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 	});
 
 	const copyButtons = new Map<string, TextButton>();
+	/** tool_use event index → its one-line error label. */
+	const problems = new Map<number, TextLabel>();
 	const approvalCards = new Map<string, Frame>();
 	const buildMessage = (id: string, prompt: string): Message => {
 		order += 1;
@@ -915,6 +1014,15 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 				details.LayoutOrder = 2;
 				details.Visible = false;
 				details.Parent = row;
+				const problem = label("", COLORS.bad, SMALL, false);
+				problem.TextWrapped = false;
+				problem.TextTruncate = Enum.TextTruncate.AtEnd;
+				problem.AutomaticSize = Enum.AutomaticSize.None;
+				problem.Size = new UDim2(1, -14, 0, LINE);
+				problem.Position = UDim2.fromOffset(14, LINE);
+				problem.Visible = false;
+				problem.Parent = lineRow;
+				problems.set(event.i, problem);
 				const segment: ToolSegment = { kind: "tool", event, failed: false, dot: dotFrame };
 				message.segments.push(segment);
 				trove.connect(row.Activated, () => {
@@ -935,6 +1043,11 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 						segment.resultDetail = event.detail;
 						segment.failed = event.text.sub(1, 6) === "error:";
 						segment.dot.BackgroundColor3 = segment.failed ? COLORS.bad : DIMMER;
+						const problem = problems.get(segment.event.i);
+						if (problem && segment.failed) {
+							problem.Text = stripEmoji(event.text.sub(7).gsub("^%s+", "")[0]).sub(1, 140);
+							problem.Visible = true;
+						}
 						const full = `${event.text} ${event.detail ?? ""}`;
 						if (shortTool(segment.event.tool) === "run_luau" && full.find("loadstring is unavailable", 1, true)[0] !== undefined) {
 							addNote(message, "Luau is off on this server: republish the kernel place", DIMMER);
@@ -951,7 +1064,7 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		for (const segment of message.segments) {
 			if (segment.kind === "text" && segment.dirty) {
 				segment.dirty = false;
-				syncBlocks(segment.holder, segment.rendered, parseMarkdown(segment.text));
+				syncBlocks(segment.holder, segment.rendered, parseMarkdown(stripEmoji(segment.text)));
 			}
 		}
 	};
@@ -1311,6 +1424,7 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		return errors.filter((_, index) => index >= errors.size() - 5);
 	};
 
+	sendFromEnter = () => send();
 	const send = () => {
 		if (sending) return;
 		const prompt = trim(box.Text);
