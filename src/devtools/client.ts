@@ -8,9 +8,12 @@ import type {
 	ClientKernel,
 	DevInfo,
 	KernelStatus,
+	KeyRow,
+	KeyTrust,
 	LogEntry,
 	NewServerReport,
 	SwapReport,
+	Verified,
 } from "../kernel";
 import type { ClientDispatcher, LeafStats } from "../net/runtime";
 import { runningModules } from "../runtime/registry";
@@ -185,6 +188,19 @@ function duration(seconds: unknown): string {
 	if (hours > 0) return "%dh %02dm %02ds".format(hours, minutes, total % 60);
 	if (minutes > 0) return "%dm %02ds".format(minutes, total % 60);
 	return `${total}s`;
+}
+
+/** Roblox's verified badge: a private-use character (U+E000) that Roblox fonts draw as the badge. */
+const VERIFIED_BADGE = utf8.char(0xe000);
+
+/**
+ * Kernel 0.3: one verified badge per signature of a deploy that checks out (two when the main and the fallback key
+ * both do, one for either alone), as RichText; "" for unsigned or unverified deploys and on older kernels.
+ */
+function verifiedBadges(verified: Verified | undefined): string {
+	if (!typeIs(verified, "table")) return "";
+	const count = (verified.main === true ? 1 : 0) + (verified.fallback === true ? 1 : 0);
+	return count > 0 ? ` <font color="${hex(COLORS.info)}">${VERIFIED_BADGE.rep(count)}</font>` : "";
 }
 
 function utc(unix: unknown): string {
@@ -426,6 +442,46 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 
 	// Tabs ------------------------------------------------------------------------------------------------------------
 
+	/** One public key: its fingerprint (and a tag); tapping the row copies the full base64. */
+	const keyRow = (target: Page, key: KeyRow, extra: string, color = COLORS.text) => {
+		const row = target.row(`<font color="${hex(color)}"><b>${escapeRich(key.fingerprint)}</b></font>${extra}`, escapeRich(`${key.key.sub(1, 16)}...`));
+		const hit = make("TextButton", { Name: "Copy", Text: "", AutoButtonColor: false, BackgroundTransparency: 1, Size: UDim2.fromScale(1, 1), ZIndex: 0 }, row);
+		hit.Activated.Connect(() => copyText(key.key, row));
+	};
+
+	const drawSigning = (target: Page, keys: KeyTrust) => {
+		const modeText = keys.mode === "key asset" ? "Key asset" : keys.mode === "fallback only" ? "Fallback key only" : "No keys";
+		const modeColor = keys.mode === "key asset" ? COLORS.good : keys.mode === "fallback only" || !keys.signedOnly ? COLORS.warn : COLORS.bad;
+		target.field("Mode", modeText, modeColor);
+		target.field("This server", keys.signedOnly ? "Signed deploys only" : "Unsigned allowed (dev)");
+		const assetText = keys.keyAssetId !== undefined ? `${keys.keyAssetId}${keys.version !== undefined ? `  v${keys.version}` : ""}` : "-";
+		target.field("Key asset", assetText);
+		target.field("Loaded", keys.loaded ? utc(keys.loadedAt) : "Never", keys.loaded ? COLORS.text : COLORS.warn);
+		if (keys.lastError !== undefined) {
+			const when = keys.lastErrorAt !== undefined ? `  ${utc(keys.lastErrorAt)}` : "";
+			target.field("Last error", `${keys.lastError}${when}`, keys.lastReadOk === false ? COLORS.warn : COLORS.dim);
+		}
+		if (keys.configError !== undefined) target.field("Setup", keys.configError, COLORS.bad);
+		const change = keys.lastChange;
+		if (change) {
+			const fingerprints = `${change.before.publicKeys.join(" ")} > ${change.after.publicKeys.join(" ")}`;
+			target.field(change.hinted ? "Rotated" : "Changed", `${utc(change.at)}  ${fingerprints}${change.hinted ? "" : "  (no rekey hint)"}`, change.hinted ? COLORS.warn : COLORS.bad);
+		}
+		const rejected = keys.rejected;
+		target.field("Rejected", rejected.total > 0 ? `${rejected.total}  ${rejected.last?.why ?? ""}` : "0", rejected.total > 0 ? COLORS.warn : COLORS.text);
+		target.text("Public keys", COLORS.dim);
+		if (keys.publicKeys.size() === 0) target.text("None", keys.loaded ? COLORS.bad : COLORS.dim);
+		for (const key of keys.publicKeys) keyRow(target, key, key.revoked === true ? tag("REVOKED", COLORS.bad) : "");
+		if (keys.revokedKeys.size() > 0) {
+			target.text("Revoked", COLORS.dim);
+			for (const key of keys.revokedKeys) keyRow(target, key, "", COLORS.dim);
+		}
+		target.text("Fallback key", COLORS.dim);
+		const fallback = keys.fallback;
+		if (fallback) keyRow(target, fallback, fallback.revoked ? tag("REVOKED", COLORS.bad) : "", fallback.revoked ? COLORS.bad : COLORS.text);
+		else target.text("None", keys.signedOnly ? COLORS.warn : COLORS.dim);
+	};
+
 	const renderArtifact = ({ page, trove: tabTrove }: TabContext) => {
 		page.section("Client");
 		page.field("Artifact", kernel.artifact.id);
@@ -442,6 +498,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		}
 		const server = page.group();
 		server.text("Loading server...", COLORS.dim);
+		const signing = page.group();
 		spawnIn(tabTrove, () => {
 			const [ok, reply] = call("status");
 			server.clear();
@@ -451,7 +508,12 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			}
 			const { artifact, modules, server: status } = reply as StatusReply;
 			server.section("Server artifact");
-			server.field("Id", str(artifact.id));
+			const idBox = server.field("Id", str(artifact.id));
+			const idBadges = verifiedBadges(status.generation?.artifact.verified);
+			if (idBadges !== "") {
+				idBox.RichText = true;
+				idBox.Text = escapeRich(str(artifact.id)) + idBadges;
+			}
 			server.field("Channel", str(artifact.channel));
 			server.field("Branch", str(artifact.branch));
 			server.field("Commit", str(artifact.commit));
@@ -461,7 +523,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			server.field("Built", utc(artifact.builtAt));
 			server.section("Server generation");
 			server.field("Generation", status.generation ? `${status.generation.name} (#${status.generation.number})` : "-");
-			server.field("Kernel", `${status.kernelVersion} (API ${status.kernelApi})`);
+			server.field("Kernel", `${status.kernelVersion}${status.kernelBuild !== undefined ? `@${status.kernelBuild}` : ""} (API ${status.kernelApi})`);
 			server.section("Server modules");
 			if (modules.size() === 0) server.text("None", COLORS.dim);
 			for (const mod of modules) {
@@ -469,6 +531,16 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				const deps = mod.dependencies.size() > 0 ? `, needs ${mod.dependencies.join(", ")}` : "";
 				server.field(mod.name, init + deps);
 			}
+		});
+		// Signing (kernel 0.3): the trust state, compact; tap a key row for its full base64.
+		spawnIn(tabTrove, () => {
+			const [ok, reply] = call("keys");
+			signing.clear();
+			signing.section("Signing");
+			const keysReply = (typeIs(reply, "table") ? reply : {}) as { supported?: boolean; keys?: KeyTrust };
+			if (!ok) signing.text(`Failed: ${str(reply)}`, COLORS.bad);
+			else if (keysReply.supported !== true || keysReply.keys === undefined) signing.text("Signing needs kernel 0.3", COLORS.dim);
+			else drawSigning(signing, keysReply.keys);
 		});
 	};
 
@@ -511,7 +583,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			body.field("Memory", typeIs(status.memoryMb, "number") ? "%.0f MB".format(status.memoryMb) : "-");
 			body.field("Lua heap", typeIs(status.luaHeapKb, "number") ? "%.1f MB".format(status.luaHeapKb / 1024) : "-");
 			body.field("Registry seq", str(status.appliedSeq));
-			body.field("Kernel", `${status.kernelVersion} (API ${status.kernelApi})`);
+			body.field("Kernel", `${status.kernelVersion}${status.kernelBuild !== undefined ? `@${status.kernelBuild}` : ""} (API ${status.kernelApi})`);
 			if (status.registryError !== undefined) body.field("Registry error", status.registryError, COLORS.bad);
 
 			body.section("Last deploy message");
@@ -843,7 +915,12 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				if (running?.commit !== undefined && artifactText.find(running.commit, 1, true)[0] === undefined) {
 					artifactText += `  ${running.commit}`;
 				}
-				body.field("Running", artifactText);
+				const runningBox = body.field("Running", artifactText);
+				const runningBadges = verifiedBadges(running?.verified);
+				if (runningBadges !== "") {
+					runningBox.RichText = true;
+					runningBox.Text = escapeRich(artifactText) + runningBadges;
+				}
 				const pinned = status.pinned === true;
 				const pinText = status.experiment !== undefined ? "A/B experiment, until the next deploy" : pinned ? "yes, until the next deploy" : "no";
 				body.field("Pinned", pinText, pinned ? COLORS.warn : COLORS.text);
@@ -913,6 +990,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 					if (!showAll && index >= ARTIFACTS_PER_BRANCH) return;
 					const short = entry.commit ?? entry.artifactId ?? `asset ${entry.assetId}`;
 					let title = `<b>${entry.seq !== undefined ? `#${entry.seq}  ` : ""}${escapeRich(short)}</b>`;
+					title += verifiedBadges(entry.verified);
 					if (entry.running) {
 						const how = status?.experiment !== undefined ? "RUNNING, A/B" : status?.pinned === true ? "RUNNING, PINNED" : "RUNNING";
 						title += tag(how, COLORS.good);

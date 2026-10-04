@@ -187,6 +187,12 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 		if (!kernelHasArtifacts(kernel)) return { supported: false };
 		return { supported: true, list: kernel.artifacts!() };
 	});
+	// Artifact > Signing (kernel 0.3+): the trust state (public keys aren't secret; devs only like every op here).
+	ops.set("keys", () => {
+		const api = kernel as unknown as Record<string, unknown>;
+		if (!typeIs(api.keys, "function")) return { supported: false };
+		return { supported: true, keys: kernel.keys!() };
+	});
 	// What changed in an artifact (Branch tab, tap a row): its payload asset's description (artifact-notes.ts).
 	// Descriptions don't change, so each asset is read once per generation.
 	const notesCache = new Map<number, ArtifactNotes>();

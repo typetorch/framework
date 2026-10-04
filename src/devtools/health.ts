@@ -1,7 +1,7 @@
 import type { KernelStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
-export const LATEST_KERNEL = "0.2.3";
+export const LATEST_KERNEL = "0.3.0";
 /** The oldest kernel API this framework runs on. */
 export const REQUIRED_KERNEL_API = 1;
 /** Auto-rollbacks newer than this (seconds) are reported. */
@@ -46,6 +46,43 @@ function secondsSince(iso: string): number | undefined {
 	return DateTime.now().UnixTimestamp - time.UnixTimestamp;
 }
 
+function clock(unix: number): string {
+	return DateTime.fromUnixTimestamp(unix).FormatUniversalTime("MMM D HH:mm", "en-us") + " UTC";
+}
+
+/**
+ * Kernel 0.3 signing (status().signing / rejected; nothing on older kernels). Shared with Artifact > Signing.
+ * - a key change without a rekey hint before it: error (a rotation the user may not have done);
+ * - the fallback key revoked: error; no trust root on a signed-only server: error;
+ * - fallback-only mode (the key asset never loaded): warn; refusals: warn with the last reason;
+ * - a key change after a rekey hint: info.
+ */
+export function signingIssues(status: KernelStatus): HealthIssue[] {
+	const issues = new Array<HealthIssue>();
+	const signing = status.signing;
+	if (signing === undefined) return issues;
+	if (signing.lastChangeAt !== undefined) {
+		if (signing.lastChangeHinted === true) {
+			issues.push({ level: "info", title: "Keys rotated", detail: clock(signing.lastChangeAt) });
+		} else {
+			issues.push({ level: "error", title: "Keys changed", detail: `${clock(signing.lastChangeAt)}, no rekey hint. Rotated by you?` });
+		}
+	}
+	if (signing.fallbackRevoked === true) {
+		issues.push({ level: "error", title: "Fallback key revoked", detail: "Replace it, then kernel deploy." });
+	}
+	if (signing.mode === "none" && status.signedOnly === true) {
+		issues.push({ level: "error", title: "No signing keys", detail: "Prod refuses every deploy. Run keys init." });
+	} else if (signing.mode === "fallback only") {
+		issues.push({ level: "warn", title: "Fallback key only", detail: "The key asset never loaded here." });
+	}
+	const rejected = status.rejected;
+	if (rejected !== undefined && rejected.total > 0) {
+		issues.push({ level: "warn", title: `Rejected ${rejected.total}`, detail: rejected.last?.why ?? "-" });
+	}
+	return issues;
+}
+
 /** Everything about this server a dev should notice, worst first. */
 export function checkHealth(status: KernelStatus, facts?: ServerFacts): HealthIssue[] {
 	const issues = new Array<HealthIssue>();
@@ -86,6 +123,7 @@ export function checkHealth(status: KernelStatus, facts?: ServerFacts): HealthIs
 	if (facts?.loadstring === false && status.channel === "dev") {
 		issues.push({ level: "info", title: "run_luau off", detail: "LoadStringEnabled is off in this place." });
 	}
+	for (const issue of signingIssues(status)) issues.push(issue);
 	if (status.experiment !== undefined) {
 		issues.push({ level: "info", title: "A/B experiment", detail: `${status.experiment.artifactId} until the next deploy` });
 	} else if (status.pinned === true) {

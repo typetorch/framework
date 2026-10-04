@@ -16,6 +16,116 @@ export interface ArtifactInfo {
 	readonly commitHash?: string;
 	readonly builtAt?: number;
 	readonly seq?: number;
+	/** Kernel 0.3+, in `status().generation.artifact` only: its deploy's signatures (absent when unsigned). */
+	readonly verified?: Verified;
+}
+
+/**
+ * Kernel 0.3+: which signatures of a signed prod deploy check out, each on its own (plans/03 "Signed prod messages").
+ * Absent for unsigned (dev) deploys. The dev menu shows one verified badge per `true`.
+ */
+export interface Verified {
+	/** `sig` verifies with a key in the key asset's PublicKeys that isn't in RevokedKeys. */
+	main: boolean;
+	/** `sigF` verifies with the FallbackPublicKey baked into the place (and the key asset doesn't revoke it). */
+	fallback: boolean;
+}
+
+/** Kernel 0.3+: how signatures are checked now. "none": no trust root, so prod servers refuse every deploy. */
+export type SigningMode = "key asset" | "fallback only" | "none";
+
+/** Kernel 0.3+: one refused message, head, pin or swap. */
+export interface Refusal {
+	/** "deploy", "head", "pin", "swap", "private-branch". */
+	kind: string;
+	why: string;
+	/** Unix seconds. */
+	at: number;
+	branch?: string;
+	seq?: number;
+	assetId?: number;
+	artifactId?: string;
+}
+
+/** Kernel 0.3+: refusals since this server booted. */
+export interface Rejections {
+	total: number;
+	byKind: Record<string, number>;
+	last?: Refusal;
+}
+
+/** Kernel 0.3+: `status().signing`, a summary of the trust state (`keys()` has all of it). */
+export interface SigningSummary {
+	mode: SigningMode;
+	/** The key asset has loaded on this server. */
+	loaded: boolean;
+	/** Trusted main keys (PublicKeys minus RevokedKeys). */
+	trusted: number;
+	fallbackRevoked?: boolean;
+	/** Unix seconds of the last detected change of PublicKeys/RevokedKeys. */
+	lastChangeAt?: number;
+	/** That change came shortly after a rekey hint (likely the user's own `typetorch keys rotate`). */
+	lastChangeHinted?: boolean;
+	lastReadOk?: boolean;
+}
+
+/** Kernel 0.3+: a public key; `fingerprint` = the first 8 hex digits of the SHA-256 of its raw 32 bytes. */
+export interface KeyRow {
+	/** base64 of the raw 32-byte Ed25519 public key. */
+	key: string;
+	fingerprint: string;
+	/** In PublicKeys and RevokedKeys both. */
+	revoked?: boolean;
+}
+
+/** Kernel 0.3+: a change of the key asset's lists versus what this server loaded before. */
+export interface KeyChange {
+	/** Unix seconds. */
+	at: number;
+	/** The read that found it: "boot", "hint", "failure", "periodic". */
+	reason: string;
+	hinted: boolean;
+	version?: number;
+	previousVersion?: number;
+	added: string[];
+	removed: string[];
+	revokedAdded: string[];
+	revokedRemoved: string[];
+	/** Fingerprints. */
+	before: { publicKeys: string[]; revokedKeys: string[] };
+	after: { publicKeys: string[]; revokedKeys: string[] };
+}
+
+/** Kernel 0.3+: `keys()`, the trust state for devs. Public keys aren't secret. */
+export interface KeyTrust {
+	keyAssetId?: number;
+	loaded: boolean;
+	mode: SigningMode;
+	/** The key asset version last loaded. */
+	version?: number;
+	/** Unix seconds of the last successful read. */
+	loadedAt?: number;
+	lastReadOk?: boolean;
+	/** The last failed read (short); kept after later successes, see lastErrorAt. */
+	lastError?: string;
+	lastErrorAt?: number;
+	reads: number;
+	/** The stamped attributes were unusable. */
+	configError?: string;
+	publicKeys: KeyRow[];
+	revokedKeys: KeyRow[];
+	trusted: number;
+	invalid?: string[];
+	fallback?: KeyRow & { revoked: boolean };
+	lastHintAt?: number;
+	lastChange?: KeyChange;
+	/** Changes seen since boot. */
+	changes: number;
+	/** This server takes only signed prod artifacts. */
+	signedOnly: boolean;
+	rejected: Rejections;
+	/** The last 10 refusals, oldest first. */
+	refusals: Refusal[];
 }
 
 export type Role = "owner" | "admin" | "dev";
@@ -184,6 +294,8 @@ export interface ArtifactEntry {
 	rollback?: boolean;
 	/** Kernel 0.2.3+: the deploy went to this percent of servers only (`ro`). */
 	rollout?: number;
+	/** Kernel 0.3+: its signatures, each checked on its own; absent for unsigned (dev) deploys. */
+	verified?: Verified;
 	/** The current head of its branch. */
 	live: boolean;
 	/** This server's current generation. */
@@ -239,6 +351,15 @@ export interface KernelStatus {
 	rolloutBucket?: number;
 	/** Kernel 0.2.3+: the last TypeTorch/pin message this server acted on. */
 	lastPin?: { assetId?: number; unpin?: boolean; by: number; pct?: number; listed: boolean; receivedMs: number; sentMs: number; ok?: boolean; error?: string };
+	/** Kernel 0.3+: the kernel build (short commit, "*" = dirty) and content hash stamped by `typetorch kernel deploy`. */
+	kernelBuild?: string;
+	kernelHash?: string;
+	/** Kernel 0.3+: this server takes only signed prod artifacts (public, or a private server on a prod branch). */
+	signedOnly?: boolean;
+	/** Kernel 0.3+: the trust state, in short. */
+	signing?: SigningSummary;
+	/** Kernel 0.3+: refused messages and heads since boot. */
+	rejected?: Rejections;
 }
 
 export interface ServerKernel {
@@ -304,6 +425,12 @@ export interface ServerKernel {
 	experiment?(): ExperimentInfo | undefined;
 	/** End this server's experiment (back to its branch head). Owner/admin on public servers, devs elsewhere. */
 	unpin?(player: Player): SwapReport;
+
+	// Kernel 0.3+ (additive): signed prod deploys. `keys` doubles as the feature test.
+	/** The kernel build (short commit) stamped by `typetorch kernel deploy`, if any. */
+	readonly kernelBuild?: string;
+	/** The trust state (key asset, keys, fallback key, last change, refusals). Devs only: check the asking player. */
+	keys?(): KeyTrust;
 }
 
 export interface ClientKernel {
