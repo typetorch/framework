@@ -1,4 +1,4 @@
-import { Players } from "@rbxts/services";
+import { HttpService, Players } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
 import type { ServerKernel } from "../kernel";
@@ -20,6 +20,8 @@ import {
 } from "./protocol";
 import type { LogEntry } from "../kernel";
 import { describeState } from "./state";
+import type { ServerFacts } from "./health";
+import { loadstringAvailable } from "./claude-tools";
 
 function isAssetId(value: unknown): value is number {
 	return typeIs(value, "number") && value > 0 && value % 1 === 0 && value < 2 ** 53;
@@ -37,6 +39,16 @@ export function kernelHasArtifacts(kernel: ServerKernel): boolean {
 
 /** The error the dev menu shows on kernel 0.1.0 (the client matches it to show a short note). */
 export const NEEDS_KERNEL_02 = "kernel 0.2 needed for artifacts";
+
+let loadstringWorks: boolean | undefined;
+
+/** Place settings the Status page warns about (health.ts). loadstring is probed once per generation. */
+function serverFacts(): ServerFacts {
+	if (loadstringWorks === undefined) {
+		loadstringWorks = loadstringAvailable();
+	}
+	return { loadstring: loadstringWorks, http: HttpService.HttpEnabled };
+}
 
 const LOG_KINDS = new Set(["output", "info", "warning", "error"]);
 /** Seconds a dev waits between "logs.player" requests, and for the target client's answer. */
@@ -98,7 +110,7 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 				initMs: running.initSeconds !== undefined ? math.floor(running.initSeconds * 1000) : undefined,
 			}),
 		);
-		return { server: kernel.status(), artifact: kernel.artifact, modules, you: kernel.devInfo(player) };
+		return { server: kernel.status(), artifact: kernel.artifact, modules, you: kernel.devInfo(player), facts: serverFacts() };
 	});
 	ops.set("logs", (_, payload) => kernel.logs(typeIs(payload, "number") ? payload : undefined, 200));
 	ops.set("branches", () => kernel.branches());

@@ -32,6 +32,7 @@ import {
 import { CLAUDE_TOOL_REQUEST, CLAUDE_TOOL_RESPONSE, findTool, inspectTool } from "./claude-tools";
 import { renderClaudeChat } from "./claude-ui";
 import { describeState } from "./state";
+import { badgeLevel, checkHealth, HealthIssue, HealthLevel, ServerFacts } from "./health";
 import {
 	addButton,
 	chevron,
@@ -107,6 +108,26 @@ interface StatusReply {
 	artifact: ArtifactInfo;
 	modules: ModuleSummary[];
 	you: DevInfo;
+	/** Missing on frameworks before the health checks. */
+	facts?: ServerFacts;
+}
+
+/** How often a dev's client re-checks server health for the badge while the menu is closed. */
+const HEALTH_INTERVAL = 30;
+const ISSUE_COLORS: Record<HealthLevel, Color3> = { error: COLORS.bad, warn: COLORS.warn, info: COLORS.info };
+
+/** A small round status dot on `parent` (created once, then recolored or hidden). */
+function paintDot(parent: GuiObject, level: HealthLevel | undefined, position: UDim2, anchor: Vector2) {
+	let dot = parent.FindFirstChild("Badge") as Frame | undefined;
+	if (!dot) {
+		dot = make("Frame", { Name: "Badge", BorderSizePixel: 0, Size: UDim2.fromOffset(9, 9), ZIndex: 3 }, parent);
+		make("UICorner", { CornerRadius: new UDim(1, 0) }, dot);
+		make("UIStroke", { Color: COLORS.window, Thickness: 1.5 }, dot);
+	}
+	dot.Position = position;
+	dot.AnchorPoint = anchor;
+	dot.Visible = level !== undefined;
+	if (level) dot.BackgroundColor3 = ISSUE_COLORS[level];
 }
 
 interface TabContext {
@@ -282,6 +303,15 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	const state = kernel.persist<MenuState>(PERSIST_KEY, () => ({ open: false, tab: "Artifact" }));
 	if (state.sub === undefined) state.sub = {};
 	const subs = state.sub;
+
+	// Health badge: a dot on the DEV button and the Server tab while the server has warnings or errors (health.ts).
+	// Fed by the Status page and, while the menu is closed, by a slow poll.
+	let healthLevel: HealthLevel | undefined;
+	let paintBadges = () => {};
+	const setHealth = (issues: HealthIssue[]) => {
+		healthLevel = badgeLevel(issues);
+		paintBadges();
+	};
 	// Before sub-tabs, Branch was a top-level tab.
 	if (state.tab === "Branch") {
 		state.tab = "Server";
@@ -420,6 +450,12 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				return;
 			}
 			const status = (reply as StatusReply).server;
+			const issues = checkHealth(status, (reply as StatusReply).facts);
+			setHealth(issues);
+			if (issues.size() > 0) {
+				body.section("Attention");
+				for (const issue of issues) body.field(issue.title, issue.detail, ISSUE_COLORS[issue.level]);
+			}
 			body.section("Server");
 			body.field("Type", status.serverType);
 			body.field("Job", str(status.jobId));
@@ -803,11 +839,15 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 					// public server only owner/admin, and only prod-channel artifacts. Otherwise open a reserved server
 					// pinned to it.
 					const canLoad = !isPublic || (isAdmin && entry.channel === "prod");
+					// A dev-channel artifact on a prod-channel server: a dark "Dev channel" button instead of the orange
+					// Load, so it isn't loaded by mistake. Still works (tap twice); switching the branch first is the
+					// usual way.
+					const crossChannel = status?.channel === "prod" && entry.channel === "dev";
 					if (canLoad) {
-						let armed = !isPublic; // a public server swaps every player: tap twice
+						let armed = !isPublic && !crossChannel; // public server or cross-channel: tap twice
 						body.row(title, detail, {
-							label: "Load",
-							color: COLORS.accent,
+							label: crossChannel ? "Dev channel" : "Load",
+							color: crossChannel ? undefined : COLORS.accent,
 							onClick: (button) => {
 								if (!armed) {
 									armed = true;
@@ -820,8 +860,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 					} else {
 						// Same button as above; here it moves only you to a reserved server pinned to this artifact.
 						body.row(title, detail, {
-							label: "Load",
-							color: COLORS.accent,
+							label: crossChannel ? "Dev channel" : "Load",
+							color: crossChannel ? undefined : COLORS.accent,
 							onClick: () =>
 								act(`Moving you to a server on ${short}`, "newServer", { branch: entry.branch, assetId: entry.assetId }),
 						});
@@ -1299,6 +1339,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		if (dev) {
 			if (!ui) ui = build();
 			ui.toggle.Visible = true;
+			paintBadges();
 			// Reopen after a swap if the menu was open in the previous generation.
 			if (state.open) open();
 		} else if (ui) {
@@ -1313,6 +1354,19 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		const [ok, info] = pcall(() => kernel.devStatus());
 		setDev(ok && typeIs(info, "table") && info.dev === true);
 	};
+
+	paintBadges = () => {
+		if (!ui) return;
+		paintDot(ui.toggle, healthLevel, UDim2.fromOffset(-2, -2), new Vector2(0, 0));
+		const serverTab = ui.tabButtons.get("Server");
+		if (serverTab) paintDot(serverTab, healthLevel, new UDim2(1, -18, 0.5, 0), new Vector2(1, 0.5));
+	};
+	// The Status page refreshes health while it's open; otherwise poll slowly (status is an in-memory kernel read).
+	every(trove, HEALTH_INTERVAL, () => {
+		if (!dev || (isOpen && state.tab === "Server")) return;
+		const [ok, reply] = call("status");
+		if (ok && typeIs(reply, "table")) setHealth(checkHealth((reply as StatusReply).server, (reply as StatusReply).facts));
+	});
 
 	every(trove, REFRESH, refreshDev);
 	trove.add(
