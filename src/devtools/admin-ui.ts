@@ -222,6 +222,49 @@ function armButton(row: Instance, label: string, color: Color3, run: () => void)
 	return button;
 }
 
+/**
+ * Like armButton, for one-shot actions (Migrate): the first tap turns it green and says "Confirm"; the confirming tap
+ * runs it once and locks the button (dark, dimmed, `busyLabel`). `run` gets `unlock`, to call when the action failed.
+ */
+function armLockButton(row: Instance, label: string, color: Color3, busyLabel: string, run: (unlock: () => void) => void): TextButton {
+	let armedAt = -math.huge;
+	let locked = false;
+	const paint = (background: Color3, text: Color3, caption: string) => {
+		button.BackgroundColor3 = background;
+		button.TextColor3 = text;
+		button.Text = caption;
+	};
+	const unlock = () => {
+		locked = false;
+		button.AutoButtonColor = true;
+		paint(color, COLORS.dark, label);
+	};
+	const button: TextButton = addButton(
+		row,
+		label,
+		() => {
+			if (locked) return;
+			if (os.clock() - armedAt < ARM_SECONDS) {
+				armedAt = -math.huge;
+				locked = true;
+				button.AutoButtonColor = false;
+				paint(COLORS.button, COLORS.dim, busyLabel);
+				run(unlock);
+				return;
+			}
+			armedAt = os.clock();
+			paint(COLORS.good, COLORS.dark, "Confirm");
+			bump(button);
+			task.delay(ARM_SECONDS, () => {
+				if (button.Parent && !locked && os.clock() - armedAt >= ARM_SECONDS - 0.05) paint(color, COLORS.dark, label);
+			});
+		},
+		color,
+	);
+	button.TextColor3 = COLORS.dark;
+	return button;
+}
+
 /** The window (overlay host) and the body (the area overlays cover) around a tab's content. */
 function hostOf(tab: AdminTab): [host: GuiObject, area: GuiObject] {
 	const body = tab.content.Parent;
@@ -559,17 +602,15 @@ function openMigrate(cards: Cards, deps: AdminDeps, info: MigrateInfo) {
 			return;
 		}
 		spacer(buttons);
-		let sending = false;
-		armButton(buttons, "Migrate", COLORS.accent, () => {
-			if (sending) return;
-			sending = true;
+		// Migrate → green "Confirm" → locked dark "Migrating..." (unlocks only if it fails).
+		armLockButton(buttons, "Migrate", COLORS.accent, "Migrating...", (unlock) => {
 			status("Reserving a server...", COLORS.dim);
 			spawnIn(cardTrove, () => {
 				const [ok, reply] = deps.call("admin.migrate");
 				if (succeeded(ok, reply)) {
 					status("Moving everyone...", COLORS.good);
 				} else {
-					sending = false;
+					unlock();
 					status(`Failed: ${errorText(reply)}`, COLORS.bad);
 				}
 			});
