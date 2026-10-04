@@ -45,8 +45,11 @@ const LIMITS = {
 	coordinate: 100_000,
 } as const;
 const TYPES = new ReadonlySet<string>(["Model", "MeshPart", "Decal", "Audio"]);
-/** The capability set kept scripts run with ("Keep scripts", spike T4): no network, data stores, players or loading. */
-const KEPT_CAPABILITIES = [
+/**
+ * The capability set kept scripts run with ("Keep scripts", spike T4): no network, data stores, players or loading.
+ * Built only when used (inside a pcall), so a missing enum item can't break loading this module.
+ */
+const keptCapabilities = () => [
 	Enum.SecurityCapability.RunServerScript,
 	Enum.SecurityCapability.Basic,
 	Enum.SecurityCapability.Physics,
@@ -472,7 +475,8 @@ export function toolboxInsert(player: Player, request: Record<string, unknown>, 
 		return { ok: false, error: `too_large: ${scan.instances} instances (over ${LIMITS.instances}).` };
 	}
 	if (isLoaded && root.IsA("PVInstance")) {
-		const [, size] = boxOf(root);
+		const [boxOk, measured] = pcall(() => boxOf(root)[1]);
+		const size = boxOk ? measured : Vector3.zero;
 		if (size.X > LIMITS.studs || size.Y > LIMITS.studs || size.Z > LIMITS.studs) {
 			root.Destroy();
 			return { ok: false, error: `too_large: ${math.floor(size.X)} x ${math.floor(size.Y)} x ${math.floor(size.Z)} studs (over ${LIMITS.studs}).` };
@@ -512,7 +516,7 @@ export function toolboxInsert(player: Player, request: Record<string, unknown>, 
 		// Sandboxed stays true; kept scripts get only the fixed safe set (spike T4 verifies what it blocks).
 		const [ok, err] = pcall(() => {
 			root.Sandboxed = true;
-			root.Capabilities = new SecurityCapabilities(...KEPT_CAPABILITIES);
+			root.Capabilities = new SecurityCapabilities(...keptCapabilities());
 		});
 		capabilities = ok ? "RunServerScript, Basic, Physics, Animation, Audio, CreateInstances" : `none (${tostring(err).sub(1, 80)}): kept scripts can't run`;
 	}
@@ -556,8 +560,8 @@ export function toolboxInsert(player: Player, request: Record<string, unknown>, 
 		if (report.toolsConverted > 0) reply.toolsConverted = report.toolsConverted;
 	}
 	if (shown.IsA("PVInstance")) {
-		const [, size] = boxOf(shown);
-		reply.size = [math.floor(size.X * 10) / 10, math.floor(size.Y * 10) / 10, math.floor(size.Z * 10) / 10];
+		const [boxOk, size] = pcall(() => boxOf(shown)[1]);
+		if (boxOk) reply.size = [math.floor(size.X * 10) / 10, math.floor(size.Y * 10) / 10, math.floor(size.Z * 10) / 10];
 	}
 	if (note !== undefined) reply.note = note;
 	return { ok: true, data: toJson(reply), ms };
