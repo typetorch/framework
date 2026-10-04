@@ -336,8 +336,9 @@ export function animateDots(target: TextLabel, text: string): () => void {
 // Client: crop view ------------------------------------------------------------------------------------------------
 
 /**
- * The crop view over `host`: the capture fitted in, a selection rectangle drawn by dragging (mouse or touch), corner
- * handles to adjust it, and Reset / Use full / Done (plus a close button that discards the capture). `done` gets the
+ * The crop view over `host`: the capture fitted in with a selection that starts as the whole capture: drag a corner to
+ * resize it, drag inside it to move it (mouse or touch); Reset / Use full / Done, plus a close button that discards the
+ * capture. `done` gets the
  * normalized crop (undefined = the whole capture); `cancel` runs when the dev discards it. Everything lives in `trove`.
  */
 export function openCropView(host: GuiObject, trove: Trove, taken: TakenCapture, done: (crop: Crop | undefined) => void, cancel: () => void) {
@@ -357,23 +358,27 @@ export function openCropView(host: GuiObject, trove: Trove, taken: TakenCapture,
 	make("UIAspectRatioConstraint", { AspectRatio: taken.aspect }, photo);
 	if (!showCapture(photo, taken)) cameraMark(photo, COLORS.dim);
 
-	// Outside the selection is dimmed by four frames; the selection has an outline and four corner handles.
-	const shade = () => make("Frame", { BackgroundColor3: Color3.fromRGB(0, 0, 0), BackgroundTransparency: 0.45, BorderSizePixel: 0, ZIndex: 62, Visible: false }, photo);
+	// Outside the selection is dimmed by four frames; the selection has an outline, a drag area (moves it) and four
+	// corner handles (resize it). It starts as the whole capture. Drags use the pointer's movement since the press,
+	// never absolute positions, so screen insets (top bar, IgnoreGuiInset) can't shift anything.
+	const shade = () => make("Frame", { BackgroundColor3: Color3.fromRGB(0, 0, 0), BackgroundTransparency: 0.45, BorderSizePixel: 0, ZIndex: 62 }, photo);
 	const [top, bottom, left, right] = [shade(), shade(), shade(), shade()];
-	const outline = make("Frame", { BackgroundTransparency: 1, BorderSizePixel: 0, ZIndex: 63, Visible: false }, photo);
+	const outline = make("Frame", { BackgroundTransparency: 1, BorderSizePixel: 0, ZIndex: 63 }, photo);
 	make("UIStroke", { Color: COLORS.accent, Thickness: 2 }, outline);
-	const handles = new Array<Frame>();
+	const moveArea = make("TextButton", { Name: "Move", Text: "", AutoButtonColor: false, BackgroundTransparency: 1, BorderSizePixel: 0, ZIndex: 64 }, photo);
+	const handles = new Array<TextButton>();
 	for (let index = 0; index < 4; index++) {
-		const handle = make("Frame", { BackgroundColor3: COLORS.accent, BorderSizePixel: 0, AnchorPoint: new Vector2(0.5, 0.5), Size: UDim2.fromOffset(14, 14), ZIndex: 64, Visible: false }, photo);
-		corner(handle, 7);
+		// A 32 px touch target around a 14 px dot.
+		const handle = make("TextButton", { Name: "Handle", Text: "", AutoButtonColor: false, BackgroundTransparency: 1, AnchorPoint: new Vector2(0.5, 0.5), Size: UDim2.fromOffset(32, 32), ZIndex: 65 }, photo);
+		const dot = make("Frame", { BackgroundColor3: COLORS.accent, BorderSizePixel: 0, AnchorPoint: new Vector2(0.5, 0.5), Position: UDim2.fromScale(0.5, 0.5), Size: UDim2.fromOffset(14, 14), ZIndex: 66 }, handle);
+		corner(dot, 7);
 		handles.push(handle);
 	}
 
-	let rect: Crop | undefined;
+	const FULL: Crop = { x: 0, y: 0, w: 1, h: 1 };
+	const MIN = 0.05;
+	let rect: Crop = FULL;
 	const paint = () => {
-		const on = rect !== undefined;
-		for (const gui of [top, bottom, left, right, outline, ...handles]) gui.Visible = on;
-		if (!rect) return;
 		const { x, y, w, h } = rect;
 		top.Position = UDim2.fromScale(0, 0);
 		top.Size = UDim2.fromScale(1, y);
@@ -385,6 +390,8 @@ export function openCropView(host: GuiObject, trove: Trove, taken: TakenCapture,
 		right.Size = UDim2.fromScale(1 - x - w, h);
 		outline.Position = UDim2.fromScale(x, y);
 		outline.Size = UDim2.fromScale(w, h);
+		moveArea.Position = UDim2.fromScale(x, y);
+		moveArea.Size = UDim2.fromScale(w, h);
 		const corners: [number, number][] = [
 			[x, y],
 			[x + w, y],
@@ -393,65 +400,47 @@ export function openCropView(host: GuiObject, trove: Trove, taken: TakenCapture,
 		];
 		corners.forEach(([cx, cy], index) => (handles[index].Position = UDim2.fromScale(cx, cy)));
 	};
+	paint();
 
-	const normalized = (input: InputObject): Vector2 => {
-		const point = pointerPosition(input, photo).sub(photo.AbsolutePosition);
-		const size = photo.AbsoluteSize;
-		return new Vector2(math.clamp(point.X / math.max(1, size.X), 0, 1), math.clamp(point.Y / math.max(1, size.Y), 0, 1));
-	};
-	const fromCorners = (a: Vector2, b: Vector2): Crop => ({ x: math.min(a.X, b.X), y: math.min(a.Y, b.Y), w: math.abs(a.X - b.X), h: math.abs(a.Y - b.Y) });
-
-	// Drag: a new rectangle, a corner (the opposite corner stays), or the whole selection.
-	let drag: { kind: "draw" | "corner" | "move"; anchor: Vector2; start?: Crop; input?: InputObject } | undefined;
+	// Drag: a corner (index 0 top-left, 1 top-right, 2 bottom-left, 3 bottom-right) or the whole selection.
+	let drag: { corner?: number; start: Crop; from: Vector2; input: InputObject } | undefined;
 	const isPointer = (input: InputObject) => input.UserInputType === Enum.UserInputType.MouseButton1 || input.UserInputType === Enum.UserInputType.Touch;
-	own.connect(photo.InputBegan, (input) => {
-		if (!isPointer(input)) return;
-		const p = normalized(input);
-		const size = photo.AbsoluteSize;
-		const near = (cx: number, cy: number) => math.abs((cx - p.X) * size.X) <= 20 && math.abs((cy - p.Y) * size.Y) <= 20;
-		if (rect) {
-			const { x, y, w, h } = rect;
-			const corners: [number, number, number, number][] = [
-				[x, y, x + w, y + h],
-				[x + w, y, x, y + h],
-				[x, y + h, x + w, y],
-				[x + w, y + h, x, y],
-			];
-			for (const [cx, cy, ox, oy] of corners) {
-				if (near(cx, cy)) {
-					drag = { kind: "corner", anchor: new Vector2(ox, oy), input };
-					return;
-				}
-			}
-			if (p.X >= x && p.X <= x + w && p.Y >= y && p.Y <= y + h) {
-				drag = { kind: "move", anchor: p, start: rect, input };
-				return;
-			}
-		}
-		drag = { kind: "draw", anchor: p, input };
-		rect = undefined;
-		paint();
-	});
+	const begin = (input: InputObject, cornerIndex?: number) => {
+		if (!isPointer(input) || drag) return;
+		drag = { corner: cornerIndex, start: rect, from: new Vector2(input.Position.X, input.Position.Y), input };
+	};
+	handles.forEach((handle, index) => own.connect(handle.InputBegan, (input) => begin(input, index)));
+	own.connect(moveArea.InputBegan, (input) => begin(input));
 	own.connect(UserInputService.InputChanged, (input) => {
 		if (!drag) return;
 		if (input.UserInputType !== Enum.UserInputType.MouseMovement && input.UserInputType !== Enum.UserInputType.Touch) return;
-		if (input.UserInputType === Enum.UserInputType.Touch && drag.input?.UserInputType === Enum.UserInputType.Touch && input !== drag.input) return;
-		const p = normalized(input);
-		if (drag.kind === "move" && drag.start) {
-			const s = drag.start;
-			const dx = math.clamp(p.X - drag.anchor.X, -s.x, 1 - s.x - s.w);
-			const dy = math.clamp(p.Y - drag.anchor.Y, -s.y, 1 - s.y - s.h);
-			rect = { x: s.x + dx, y: s.y + dy, w: s.w, h: s.h };
-		} else rect = fromCorners(drag.anchor, p);
+		if (drag.input.UserInputType === Enum.UserInputType.Touch && input !== drag.input) return;
+		const size = photo.AbsoluteSize;
+		const dx = (input.Position.X - drag.from.X) / math.max(1, size.X);
+		const dy = (input.Position.Y - drag.from.Y) / math.max(1, size.Y);
+		const s = drag.start;
+		if (drag.corner === undefined) {
+			const nx = math.clamp(s.x + dx, 0, 1 - s.w);
+			const ny = math.clamp(s.y + dy, 0, 1 - s.h);
+			rect = { x: nx, y: ny, w: s.w, h: s.h };
+		} else {
+			let [x0, y0, x1, y1] = [s.x, s.y, s.x + s.w, s.y + s.h];
+			const movesLeft = drag.corner === 0 || drag.corner === 2;
+			const movesTop = drag.corner === 0 || drag.corner === 1;
+			if (movesLeft) x0 = math.clamp(x0 + dx, 0, x1 - MIN);
+			else x1 = math.clamp(x1 + dx, x0 + MIN, 1);
+			if (movesTop) y0 = math.clamp(y0 + dy, 0, y1 - MIN);
+			else y1 = math.clamp(y1 + dy, y0 + MIN, 1);
+			rect = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+		}
 		paint();
 	});
 	own.connect(UserInputService.InputEnded, (input) => {
 		if (!drag || !isPointer(input)) return;
+		if (drag.input.UserInputType === Enum.UserInputType.Touch && input !== drag.input) return;
 		drag = undefined;
-		// A tap (or a sliver) is no selection.
-		if (rect && (rect.w < 0.02 || rect.h < 0.02)) rect = undefined;
-		paint();
 	});
+	const isFull = (crop: Crop) => crop.x <= 0.001 && crop.y <= 0.001 && crop.w >= 0.999 && crop.h >= 0.999;
 
 	const close = () => {
 		popOut(overlay, () => own.destroy());
@@ -472,7 +461,7 @@ export function openCropView(host: GuiObject, trove: Trove, taken: TakenCapture,
 		return b;
 	};
 	button("Reset", 1, COLORS.button, COLORS.text, () => {
-		rect = undefined;
+		rect = FULL;
 		paint();
 	});
 	button("Use full", 2, COLORS.button, COLORS.text, () => {
@@ -482,7 +471,7 @@ export function openCropView(host: GuiObject, trove: Trove, taken: TakenCapture,
 	button("Done", 3, COLORS.accent, COLORS.dark, () => {
 		const picked = rect;
 		close();
-		done(picked !== undefined ? cleanCrop(picked) : undefined);
+		done(isFull(picked) ? undefined : cleanCrop(picked));
 	});
 	// Discard: a round "x" at the top right.
 	const discard = make(
