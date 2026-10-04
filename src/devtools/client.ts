@@ -29,6 +29,7 @@ import {
 	NetStat,
 	StateSummary,
 } from "./protocol";
+import { CLAUDE_IMAGE_CHUNK, ImageInbox, takeScreenshot } from "./claude-images";
 import { CLAUDE_TOOL_REQUEST, CLAUDE_TOOL_RESPONSE, findTool, inspectTool } from "./claude-tools";
 import { renderClaudeChat } from "./claude-ui";
 import { adminTabs, migrateControl } from "./admin-ui";
@@ -372,16 +373,33 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	dispatcher.setRaw(CLAUDE_TOOL_REQUEST, (id, tool, args) => {
 		if (!typeIs(id, "number") || !typeIs(tool, "string")) return;
 		const input = (typeIs(args, "table") ? args : {}) as Record<string, unknown>;
-		// find yields while it walks, so it runs in its own thread.
+		// find yields while it walks (and a screenshot waits for the capture), so it runs in its own thread.
 		task.spawn(() => {
-			const [ok, result] = pcall(() => (tool === "inspect" ? inspectTool(input) : tool === "find" ? findTool(input) : error("unknown tool", 0)));
+			const [ok, result] = pcall(() => {
+				if (tool === "inspect") return inspectTool(input);
+				if (tool === "find") return findTool(input);
+				if (tool === "screenshot") {
+					// What the dev sees, without the dev menu; only the capture time leaves this client (the dev machine
+					// picks the file up on its PC).
+					const devGui = Players.LocalPlayer.FindFirstChildOfClass("PlayerGui")?.FindFirstChild("TypeTorchDev");
+					const taken = takeScreenshot(devGui !== undefined && devGui.IsA("ScreenGui") ? [devGui] : []);
+					if (!taken.ok) error(taken.error, 0);
+					return HttpService.JSONEncode({ captureTime: taken.value.captureTime, localId: taken.value.localId });
+				}
+				return error("unknown tool", 0);
+			});
 			kernel.send(CLAUDE_TOOL_RESPONSE, id, ok, tostring(result));
 		});
 	});
+	// Images Claude showed: chunks pushed by the server for this dev only, joined by the Claude tab.
+	const imageInbox = new ImageInbox();
+	dispatcher.setRaw(CLAUDE_IMAGE_CHUNK, (id, index, count, data) => imageInbox.push(id, index, count, data));
 	trove.add(() => {
 		dispatcher.removeRaw(DEV_RESPONSE);
 		dispatcher.removeRaw(DEVLOGS_REQUEST);
 		dispatcher.removeRaw(CLAUDE_TOOL_REQUEST);
+		dispatcher.removeRaw(CLAUDE_IMAGE_CHUNK);
+		imageInbox.clear();
 		for (const [, waiter] of waiters) {
 			if (coroutine.status(waiter.timeout) === "suspended") task.cancel(waiter.timeout);
 		}
@@ -996,7 +1014,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	};
 
 	// Claude: a Claude Code style chat (devtools/claude-ui.ts); "Dex path" sends the explorer's selection.
-	const renderClaude = (tab: TabContext) => renderClaudeChat(tab, { kernel, call, dexSelection: () => dexSelection, copyText });
+	const renderClaude = (tab: TabContext) => renderClaudeChat(tab, { kernel, call, dexSelection: () => dexSelection, copyText, imageInbox });
 
 	/** Keys: a tab name, or "Tab/Sub" for tabs with sub-tabs. */
 	const RENDER: Record<string, (tab: TabContext) => void> = {

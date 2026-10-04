@@ -1,3 +1,5 @@
+import type { ClaudeImageMeta } from "./claude-images";
+
 /** Dev menu wire format (raw channels on the kernel transport; plans/10). */
 export const DEV_REQUEST = "__tt/dev";
 export const DEV_RESPONSE = "__tt/devres";
@@ -101,6 +103,10 @@ export interface ClaudePromptRequest {
 	clientLogs?: string;
 	/** "Server logs": attach this server's log history (gathered on the server). */
 	serverLogs?: boolean;
+	/** Screenshots from op "claude.attach" (ids from the dev machine, at most 4). */
+	attachments?: string[];
+	/** "Player logs": the UserId of a player in this server whose client logs go with the message (fetched on the server). */
+	playerLogs?: number;
 	/** Continue this conversation (Claude resumes its session); absent = a new chat. */
 	conversationId?: string;
 }
@@ -109,7 +115,7 @@ export interface ClaudePromptRequest {
  * Terminal states: deployed | discarded | committed | answered | failed | cancelled (plus "lost" when the dev machine
  * forgot it). "proposed" (a code change waits for Deploy / Discard) and "building" are not terminal.
  */
-export type ClaudeEventKind = "assistant_text" | "tool_use" | "tool_result" | "status" | "error" | "deploy_proposal";
+export type ClaudeEventKind = "assistant_text" | "tool_use" | "tool_result" | "status" | "error" | "deploy_proposal" | "image";
 
 /** One changed file of a deploy proposal (-1 lines = binary). */
 export interface ClaudeFileChange {
@@ -147,6 +153,8 @@ export interface ClaudeEvent {
 	commit?: string;
 	files?: ClaudeFileChange[];
 	expiresAt?: number;
+	/** image: an image Claude showed (op "claude.image" fetches it to this client). */
+	image?: ClaudeImageMeta;
 }
 
 /** A run_luau snippet waiting for the requesting dev's approval (shown in their chat). */
@@ -207,6 +215,8 @@ export interface ClaudeMessage {
 	error?: string;
 	costUsd?: number;
 	events: ClaudeEvent[];
+	/** The ids of the screenshots sent with it. */
+	attachments?: string[];
 	next: number;
 }
 

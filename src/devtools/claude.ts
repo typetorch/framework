@@ -31,6 +31,7 @@ import type {
 	ClaudeSessionView,
 	DevOp,
 } from "./protocol";
+import { CLAUDE_IMAGE_CHUNK, cleanAttachmentIds, cleanCrop, cleanImageMeta, decodeImageChunk } from "./claude-images";
 import { CODE_ALPHABET, CODE_LENGTH, CODE_SECRET_LENGTH, codeFingerprint, sha256 } from "./sha256";
 
 /**
@@ -111,7 +112,7 @@ const MAX_TOKEN = 4096;
 const PAIR_MAX = 5;
 const PAIR_WINDOW = 60;
 const FINISHED_STATES = new Set(["deployed", "discarded", "answered", "failed", "cancelled", "lost"]);
-const EVENT_KINDS = new Set<string>(["assistant_text", "tool_use", "tool_result", "status", "error", "deploy_proposal"]);
+const EVENT_KINDS = new Set<string>(["assistant_text", "tool_use", "tool_result", "status", "error", "deploy_proposal", "image"]);
 const PROPOSAL_STATUSES = new Set<string>(["pending", "deploying", "deployed", "discarded", "expired", "failed"]);
 const MAX_PROPOSAL_FILES = 50;
 /** Session ids remembered with their URL (a sid is bound to the first URL heard for it). */
@@ -256,6 +257,13 @@ function cleanEvent(raw: unknown): ClaudeEvent | undefined {
 	if (files !== undefined) event.files = files;
 	const expiresAt = shortNumber(data.expiresAt);
 	if (expiresAt !== undefined) event.expiresAt = expiresAt;
+	if (kind === "image") {
+		// An image Claude showed: without a valid meta there is nothing to fetch, so the event is dropped.
+		const image = cleanImageMeta(data.image);
+		if (!image) return undefined;
+		event.image = image;
+		event.text = event.text.sub(1, 200);
+	}
 	return event;
 }
 
@@ -290,6 +298,16 @@ function cleanProposal(raw: unknown): ClaudeProposal | undefined {
 		files: cleanFiles(data.files) ?? [],
 		error: shortString(data.error, 300),
 	};
+}
+
+/** The ids of a message's attachments ([{id, width, height}] from the dev machine). */
+function attachmentIdsOf(raw: unknown): string[] | undefined {
+	const ids = new Array<string>();
+	for (const item of listOf(raw)) {
+		const id = typeIs(item, "table") ? (item as { id?: unknown }).id : undefined;
+		if (typeIs(id, "string") && id.size() === 32 && matches(id, "^%x+$") && ids.size() < 4) ids.push(id);
+	}
+	return ids.size() > 0 ? ids : undefined;
 }
 
 function cleanMode(raw: unknown): ClaudeMode | undefined {
@@ -763,25 +781,42 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		const recent = (store.sent.get(player.UserId) ?? []).filter((at) => now - at < RATE_WINDOW);
 		if (recent.size() >= RATE_MAX) return fail("rate_limited");
 
-		const context: { path?: string; artifact?: string; logs?: { client?: string; server?: string } } = { artifact: kernel.artifact.id.sub(1, 128) };
+		// Screenshots from claude.attach (the dev machine checks they are this user's and unused).
+		const attachments = cleanAttachmentIds(request.attachments);
+		if (attachments === undefined) return fail("bad_request");
+
+		type Logs = { client?: string; server?: string; player?: { name: string; text: string } };
+		const context: { path?: string; artifact?: string; logs?: Logs } = { artifact: kernel.artifact.id.sub(1, 128) };
 		if (typeIs(request.path, "string")) context.path = request.path.sub(1, MAX_PATH);
 		if (encodedSize(context) > MAX_CONTEXT_BYTES) return fail("context_too_large");
-		// "My logs" (from the client, capped again here) and "Server logs" (this server's log ring): untrusted context,
-		// about 64 KB each, newest kept. They can hold other players' names and chat: they are never printed here.
-		const logs: { client?: string; server?: string } = {};
+		// "My logs" (from the client, capped again here), "Server logs" (this server's log ring) and "Player logs" (another
+		// player's client logs, asked from that client like Logs > Others): untrusted context, about 64 KB each, newest
+		// kept. They can hold other players' names and chat: they are never printed here.
+		const logs: Logs = {};
 		if (typeIs(request.clientLogs, "string") && request.clientLogs !== "") logs.client = capLogText(request.clientLogs);
 		if (request.serverLogs === true) logs.server = formatLogHistory(kernel.logs(undefined, SERVER_LOG_LINES));
-		if (logs.client !== undefined || logs.server !== undefined) context.logs = logs;
+		if (request.playerLogs !== undefined) {
+			const target = typeIs(request.playerLogs, "number") ? Players.GetPlayerByUserId(request.playerLogs) : undefined;
+			if (!target) return fail("player_gone");
+			if (!deps) return fail("player_logs_unavailable");
+			const [logsOk, entries] = deps.clientLogs(target, 0);
+			if (!logsOk || !typeIs(entries, "table")) return fail("player_logs_failed");
+			logs.player = { name: target.Name, text: formatLogHistory(entries as LogEntry[]) };
+		}
+		if (logs.client !== undefined || logs.server !== undefined || logs.player !== undefined) context.logs = logs;
 
 		recent.push(now);
 		store.sent.set(player.UserId, recent);
-		const body: { prompt: string; mode: ClaudeMode; context: typeof context; conversationId?: string } = { prompt, mode, context };
+		const body: { prompt: string; mode: ClaudeMode; context: typeof context; conversationId?: string; attachments?: string[] } = { prompt, mode, context };
 		if (conversationId !== undefined) body.conversationId = conversationId;
+		if (attachments.size() > 0) body.attachments = attachments;
 		const result = authed(session, player.UserId, "POST", "/v1/prompts", body);
 		if (!result.ok) {
 			// The dev machine forgot the chat (it restarted): the client starts a new one.
 			if (result.error === "not_found" && conversationId !== undefined) return fail("conversation_gone");
 			if (result.error === "conflict") return fail("busy");
+			// A screenshot that expired (unsent for 30 min) or was already used.
+			if (result.error === "bad_request" && attachments.size() > 0) return fail("attachment_gone");
 			return result;
 		}
 		const reply = (typeIs(result.data, "table") ? result.data : {}) as { id?: unknown; state?: unknown; conversationId?: unknown };
@@ -992,11 +1027,100 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 				error: shortString(data.error, 300),
 				costUsd: shortNumber(data.costUsd),
 				events,
+				attachments: attachmentIdsOf(data.attachments),
 				next: math.max(0, math.floor(shortNumber(data.next) ?? 0)),
 			});
 		}
 		const conversation: ClaudeConversation = { id: payload, title: shortString(reply.title, 80) ?? "chat", messages };
 		return { ok: true, conversation };
+	});
+
+	// Images (spike S11, claude-images.ts) ------------------------------------------------------------------------------
+	/** userId -> unix times of screenshot requests (the dev machine limits too). */
+	const attachTimes = new Map<number, number[]>();
+	const imageTimes = new Map<number, number[]>();
+	/** Players with an image transfer running (one at a time each). */
+	const imageBusy = new Set<number>();
+	const allow = (times: Map<number, number[]>, userId: number, max: number, window: number): boolean => {
+		const now = os.time();
+		const recent = (times.get(userId) ?? []).filter((at) => now - at < window);
+		if (recent.size() >= max) return false;
+		recent.push(now);
+		times.set(userId, recent);
+		return true;
+	};
+
+	// The screenshot the dev's client just took: {captureTime, localId?, crop?} (the dev machine picks up the file Roblox
+	// wrote on its PC: only this user's, the closest time) or {assetId, crop?} (the upload fallback, downloaded there).
+	ops.set("claude.attach", (player, payload) => {
+		if (kernel.channel !== "dev") return fail("prod_channel");
+		const session = chatSession(player);
+		if (isFailure(session)) return session;
+		lastSeen.set(player.UserId, os.clock());
+		const request = (typeIs(payload, "table") ? payload : {}) as { captureTime?: unknown; localId?: unknown; assetId?: unknown; crop?: unknown };
+		const crop = request.crop === undefined ? undefined : cleanCrop(request.crop);
+		if (request.crop !== undefined && crop === undefined) return fail("bad_request");
+		let path: string;
+		let body: Record<string, unknown>;
+		const assetId = request.assetId;
+		const captureTime = request.captureTime;
+		if (assetId !== undefined) {
+			if (!typeIs(assetId, "number") || assetId < 1 || assetId % 1 !== 0 || assetId >= 2 ** 53) return fail("bad_request");
+			path = "/v1/attachments/asset";
+			body = { assetId, crop };
+		} else {
+			if (!typeIs(captureTime, "number") || captureTime % 1 !== 0 || captureTime < 1e12 || captureTime >= 1e13) return fail("bad_request");
+			path = "/v1/attachments/capture";
+			body = { captureTime, placeId: game.PlaceId, crop };
+			const localId = request.localId;
+			if (typeIs(localId, "string") && localId.size() <= 128 && matches(localId, "^[%w%._:/{}%-]+$")) body.localId = localId;
+		}
+		if (!allow(attachTimes, player.UserId, 8, 60)) return fail("rate_limited");
+		const result = authed(session, player.UserId, "POST", path, body);
+		if (!result.ok) {
+			if (result.error === "not_found") return fail("no_capture");
+			if (result.error === "http_422") return fail("bad_image");
+			if (result.error === "remote_error") return fail(assetId !== undefined ? "download_failed" : "remote_error");
+			return result;
+		}
+		const reply = (typeIs(result.data, "table") ? result.data : {}) as { id?: unknown; width?: unknown; height?: unknown };
+		const id = reply.id;
+		if (!typeIs(id, "string") || id.size() !== 32 || !matches(id, "^%x+$")) return fail("bad_reply");
+		return { ok: true, id, width: shortNumber(reply.width) ?? 0, height: shortNumber(reply.height) ?? 0 };
+	});
+
+	// An image Claude showed: fetched from the dev machine in chunks and pushed only to this player (CLAUDE_IMAGE_CHUNK,
+	// paced). The dev machine serves it only to the prompt's requester on this server (the token's user and job).
+	ops.set("claude.image", (player, payload) => {
+		if (kernel.channel !== "dev") return fail("prod_channel");
+		const session = chatSession(player);
+		if (isFailure(session)) return session;
+		const id = typeIs(payload, "table") ? (payload as { id?: unknown }).id : payload;
+		if (!typeIs(id, "string") || id.size() !== 32 || !matches(id, "^%x+$")) return fail("bad_request");
+		if (imageBusy.has(player.UserId)) return fail("busy");
+		if (!allow(imageTimes, player.UserId, 30, 600)) return fail("rate_limited");
+		lastSeen.set(player.UserId, os.clock());
+		const first = authed(session, player.UserId, "GET", `/v1/images/${id}?chunk=0`);
+		if (!first.ok) return first.error === "not_found" ? fail("image_gone") : first;
+		const chunk0 = decodeImageChunk(first.data, id, 0);
+		if (!chunk0) return fail("bad_reply");
+		const meta = chunk0.meta;
+		imageBusy.add(player.UserId);
+		task.spawn(() => {
+			pcall(() => {
+				kernel.send(player, CLAUDE_IMAGE_CHUNK, id, 0, meta.chunks, chunk0.data);
+				for (let index = 1; index < meta.chunks; index++) {
+					if (player.Parent === undefined) break;
+					const fetched = authed(session, player.UserId, "GET", `/v1/images/${id}?chunk=${index}`);
+					const chunk = fetched.ok ? decodeImageChunk(fetched.data, id, index) : undefined;
+					if (!chunk) break;
+					kernel.send(player, CLAUDE_IMAGE_CHUNK, id, index, meta.chunks, chunk.data);
+					task.wait(0.03);
+				}
+			});
+			imageBusy.delete(player.UserId);
+		});
+		return { ok: true, id, width: meta.width, height: meta.height, chunks: meta.chunks };
 	});
 	// Game tools ------------------------------------------------------------------------------------------------------
 	if (store.alwaysRun === undefined) store.alwaysRun = new Map();
@@ -1180,6 +1304,17 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 			}
 			const [ok, result] = pcall(() => (tool === "inspect" ? inspectTool(args) : findTool(args)));
 			return ok ? { ok: true, data: result } : { ok: false, error: tostring(result) };
+		}
+		if (tool === "screenshot") {
+			// The requester's own client takes it (dev menu hidden for that frame) and answers with the capture time; the
+			// dev machine picks the file up on its PC. No pixels pass through here.
+			if (!deps) return { ok: false, error: "screenshots are not available here" };
+			const [ok, result] = askClient(player, "screenshot", {});
+			if (!ok) return { ok: false, error: tostring(result).sub(1, 200) };
+			const shot = (typeIs(result, "string") ? decode(result) : undefined) as { captureTime?: unknown; localId?: unknown } | undefined;
+			if (!typeIs(shot, "table") || !typeIs(shot.captureTime, "number")) return { ok: false, error: "the client sent no capture" };
+			const localId = typeIs(shot.localId, "string") && shot.localId.size() <= 128 && matches(shot.localId, "^[%w%._:/{}%-]+$") ? shot.localId : undefined;
+			return { ok: true, data: HttpService.JSONEncode({ captureTime: math.floor(shot.captureTime), localId, placeId: game.PlaceId }) };
 		}
 		if (tool === "run_luau") {
 			const code = request.args !== undefined && typeIs(args.code, "string") ? args.code : "";

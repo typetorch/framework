@@ -1,4 +1,4 @@
-import { GuiService, HttpService, TextService, UserInputService } from "@rbxts/services";
+import { GuiService, HttpService, Players, TextService, UserInputService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import type { ClientKernel } from "../kernel";
 import { popIn, popOut } from "../ui";
@@ -16,6 +16,23 @@ import type {
 	ClaudeSessionView,
 } from "./protocol";
 import { formatLogHistory } from "./claude-tools";
+import {
+	animateDots,
+	cameraMark,
+	captureThumb,
+	editableFromZstd,
+	enlargeImage,
+	MAX_ATTACHMENTS,
+	openCropView,
+	pointerPosition,
+	showCapture,
+	takeScreenshot,
+	uploadCapture,
+	type ClaudeImageMeta,
+	type Crop,
+	type ImageInbox,
+	type TakenCapture,
+} from "./claude-images";
 import { chevron, COLORS, corner, escapeRich, hex, make, pad, SIDE_BUTTON, sideButton, style } from "./widgets";
 
 /**
@@ -28,8 +45,12 @@ import { chevron, COLORS, corner, escapeRich, hex, make, pad, SIDE_BUTTON, sideB
  *     one red line; three animated dots while a run is active. It sticks to the bottom unless the dev scrolls up, and
  *     a round button scrolls back down;
  *   - bottom: the composer, always visible: a growing message box (1 to 5 lines, then it scrolls), a "+" menu with the
- *     Dex path / My logs / Server logs context toggles (shown as chips when on), the Live / Code mode toggle (each user
- *     bubble shows the mode it was sent in) and a round Send button that becomes Stop while a run is active.
+ *     Dex path / My logs / Server logs context toggles (shown as chips when on), Player logs... (another player's client
+ *     logs, picked from a list) and Screenshot (claude-images.ts: capture, crop view, pickup on the dev machine or the
+ *     upload fallback; a "Capturing..." / "Uploading..." chip, then a thumbnail chip with a remove button; the user's
+ *     bubble shows the thumbnails), the Live / Code mode toggle (each user bubble shows the mode it was sent in) and a
+ *     round Send button that becomes Stop while a run is active;
+ *   - images Claude shows (`image` events) are fetched to this client and drawn with an EditableImage; tap to enlarge.
  *   - tool calls are one line with a short result; tapping one shows its input and output (game-data wrappers removed,
  *     JSON pretty-printed); results are paired with their calls by tool_use id;
  *   - a code-mode change that touched files ends in a deploy card (files with +/- lines): Deploy or Discard, by the
@@ -84,6 +105,24 @@ const ERRORS: Record<string, string> = {
 	not_yours: "Only the requester can stop it",
 	not_found: "Not found on the dev machine",
 	conversation_gone: "That chat is gone (the dev machine restarted)",
+	capture_failed: "Screenshot failed",
+	capture_no_space: "No space for a screenshot",
+	no_capture: "Screenshot not found",
+	upload_permission: "Upload not allowed",
+	upload_not_saved: "Not saved, nothing sent",
+	upload_moderated: "Upload refused by moderation",
+	upload_quota: "Upload limit reached",
+	upload_failed: "Upload failed",
+	upload_timeout: "Upload timed out",
+	bad_image: "Not a readable image",
+	download_failed: "The dev machine couldn't download it",
+	attachment_gone: "Screenshot expired: take it again",
+	image_gone: "Image expired",
+	image_api: "Images need Allow Mesh / Image APIs",
+	image_data: "Image unreadable",
+	player_gone: "That player left",
+	player_logs_failed: "Couldn't get their logs",
+	player_logs_unavailable: "Player logs unavailable",
 	api_billing_refused: "Refused: Claude Code must use a subscription login",
 	cancelled: "Stopped",
 	"claude timed out": "Claude timed out",
@@ -113,6 +152,10 @@ interface ChatState {
 	mode?: ClaudeMode;
 	/** The mode each conversation used last. */
 	modes?: Map<string, ClaudeMode>;
+	/** "Player logs": the player whose client logs go with the next message. */
+	playerLogs?: { userId: number; name: string };
+	/** Sent screenshots by attachment id (the newest 30): the user bubbles show them again after a swap. */
+	shots?: Map<string, { taken: TakenCapture; crop?: Crop; at: number }>;
 }
 
 /** Strips RichText tags and entities: the text a label shows. */
@@ -194,6 +237,8 @@ export interface ClaudeChatDeps {
 	dexSelection: () => string | undefined;
 	/** Shows text pre-selected for copying (widgets.ts copyText). Without it, replies have no Copy button. */
 	copyText?: (text: string, anchor?: GuiObject) => void;
+	/** Image chunks the server pushes for this dev (client.ts); without it, images Claude shows stay a dim line. */
+	imageInbox?: ImageInbox;
 }
 
 // Markdown → RichText -------------------------------------------------------------------------------------------------
@@ -521,6 +566,14 @@ function menuIcon(parent: Instance, kind: string, color: Color3) {
 			make("UIStroke", { Color: color, Thickness: 2, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, unit);
 			bar(11, y + 2, 2, 2);
 		}
+	} else if (kind === "player") {
+		// A person (head and shoulders) with a log line beside it.
+		const head = make("Frame", { BackgroundColor3: color, BorderSizePixel: 0, Position: UDim2.fromOffset(2, 1), Size: UDim2.fromOffset(6, 6) }, box);
+		corner(head, 3);
+		const shoulders = make("Frame", { BackgroundColor3: color, BorderSizePixel: 0, Position: UDim2.fromOffset(0, 9), Size: UDim2.fromOffset(10, 6) }, box);
+		corner(shoulders, 3);
+		bar(12, 4, 4, 2);
+		bar(12, 9, 4, 2);
 	} else {
 		// A camera: a body and a lens.
 		const body = make("Frame", { BackgroundTransparency: 1, Position: UDim2.fromOffset(0, 3), Size: UDim2.fromOffset(16, 11) }, box);
@@ -562,7 +615,8 @@ type Segment =
 	| { kind: "text"; block?: number; text: string; holder: Frame; rendered: Rendered[]; dirty: boolean }
 	| ToolSegment
 	| ProposalCard
-	| { kind: "note"; line: TextLabel };
+	| { kind: "note"; line: TextLabel }
+	| { kind: "image"; frame: Frame };
 
 const DETAIL_CHARS = 1500;
 
@@ -974,13 +1028,29 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		icon: string;
 		get?: () => boolean;
 		set?: (on: boolean) => void;
+		/** An action instead of a toggle (Screenshot, Player logs...); the menu closes first. */
+		action?: () => void;
+		/** The chip's text when the toggle is on (default: the name). */
+		chip?: () => string;
 		disabled?: boolean;
 	}
+	let screenshot: () => void = () => {};
+	let pickPlayer: () => void = () => {};
 	const items: MenuItem[] = [
 		{ name: "Dex path", icon: "dex", get: () => state.attachPath, set: (on) => (state.attachPath = on) },
 		{ name: "My logs", icon: "logs", get: () => state.attachMyLogs === true, set: (on) => (state.attachMyLogs = on) },
 		{ name: "Server logs", icon: "server", get: () => state.attachServerLogs === true, set: (on) => (state.attachServerLogs = on) },
-		{ name: "Screenshot", icon: "camera", disabled: true },
+		{
+			name: "Player logs...",
+			icon: "player",
+			get: () => state.playerLogs !== undefined,
+			set: (on) => {
+				if (!on) state.playerLogs = undefined;
+			},
+			action: () => pickPlayer(),
+			chip: () => `Logs: ${state.playerLogs?.name ?? "?"}`,
+		},
+		{ name: "Screenshot", icon: "camera", action: () => screenshot() },
 	];
 	const MENU_WIDTH = 210;
 	const MENU_ROW = 36;
@@ -1031,11 +1101,18 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		trove.connect(row.MouseEnter, () => (row.BackgroundTransparency = 0));
 		trove.connect(row.MouseLeave, () => (row.BackgroundTransparency = 1));
 		trove.connect(row.Activated, () => {
+			if (item.action) {
+				closeMenu();
+				item.action();
+				return;
+			}
 			if (item.get && item.set) item.set(!item.get());
 			paintToggles();
 		});
 	});
 	let menuOpen = false;
+	/** When the menu last closed: a click on "+" that closed it (outside-click handler first) must not reopen it. */
+	let closedAt = -math.huge;
 	/** Bottom-left 6 px above the "+" button, kept inside `middle` horizontally; both in the same (absolute) space. */
 	const placeMenu = () => {
 		const at = plusButton.AbsolutePosition.sub(middle.AbsolutePosition);
@@ -1045,6 +1122,7 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 	const closeMenu = () => {
 		if (!menuOpen) return;
 		menuOpen = false;
+		closedAt = os.clock();
 		popOut(menu);
 	};
 	const openMenu = () => {
@@ -1052,7 +1130,10 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		placeMenu();
 		popIn(menu);
 	};
-	trove.connect(plusButton.Activated, () => (menuOpen ? closeMenu() : openMenu()));
+	trove.connect(plusButton.Activated, () => {
+		if (menuOpen) closeMenu();
+		else if (os.clock() - closedAt > 0.2) openMenu();
+	});
 	// The window can be moved or resized while the menu is open.
 	trove.connect(middle.GetPropertyChangedSignal("AbsoluteSize"), () => menuOpen && placeMenu());
 	trove.connect(plusButton.GetPropertyChangedSignal("AbsolutePosition"), () => menuOpen && placeMenu());
@@ -1067,15 +1148,55 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		const pointer = input.UserInputType === Enum.UserInputType.MouseButton1 || input.UserInputType === Enum.UserInputType.Touch;
 		if (!pointer) return;
 		// InputObject positions exclude the top bar inset; AbsolutePosition in a ScreenGui that ignores the inset (the dev
-		// menu's) includes it. Put the point in AbsolutePosition space before comparing.
-		const screenGui = host.FindFirstAncestorOfClass("ScreenGui");
-		const inset = screenGui !== undefined && screenGui.IgnoreGuiInset ? GuiService.GetGuiInset()[0] : Vector2.zero;
-		const point = new Vector2(input.Position.X, input.Position.Y).add(inset);
-		if (!inside(panel, point) && !inside(plusButton, point)) closeMenu();
+		// menu's) includes it. Both the panel and the "+" button are checked in that one space (pointerPosition); the
+		// raw point counts too, so a click on "+" is never taken for an outside click (closedAt guards the rest).
+		const point = pointerPosition(input, plusButton);
+		const raw = new Vector2(input.Position.X, input.Position.Y);
+		const onPlus = inside(plusButton, point) || inside(plusButton, raw);
+		if (!inside(panel, point) && !onPlus) closeMenu();
 	});
+
+	/** Screenshots for the next message: capturing / uploading (a chip with dots), then ready (a thumbnail chip). */
+	interface Shot {
+		key: number;
+		status: "capturing" | "uploading" | "ready";
+		taken?: TakenCapture;
+		crop?: Crop;
+		id?: string;
+	}
+	let shots = new Array<Shot>();
+	let nextShot = 0;
+	/** Dot animations of the status chips (stopped on every repaint). */
+	let chipAnimations = new Array<() => void>();
+
+	/** A small "x" button drawn from two Frames. */
+	const removeButton = (parent: Instance, order: number, onClick: () => void) => {
+		const remove = make("TextButton", { AutoButtonColor: true, Text: "", BackgroundTransparency: 1, Size: UDim2.fromOffset(20, 20), LayoutOrder: order }, parent);
+		for (const angle of [45, -45]) {
+			make("Frame", { BackgroundColor3: COLORS.dim, BorderSizePixel: 0, AnchorPoint: new Vector2(0.5, 0.5), Position: UDim2.fromScale(0.5, 0.5), Size: UDim2.fromOffset(10, 2), Rotation: angle }, remove);
+		}
+		trove.connect(remove.Activated, onClick);
+		return remove;
+	};
+	const chipFrame = (order: number, height = 24) => {
+		const chip = make("Frame", { BackgroundColor3: COLORS.button, BorderSizePixel: 0, Size: UDim2.fromOffset(0, height), AutomaticSize: Enum.AutomaticSize.X, LayoutOrder: order }, chips);
+		corner(chip, height === 24 ? 12 : 8);
+		make("UIPadding", { PaddingLeft: new UDim(0, height === 24 ? 10 : 4), PaddingRight: new UDim(0, 4) }, chip);
+		make("UIListLayout", { FillDirection: Enum.FillDirection.Horizontal, VerticalAlignment: Enum.VerticalAlignment.Center, SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 4) }, chip);
+		return chip;
+	};
+	const chipText = (chip: Frame, text: string) => {
+		const result = style(make("TextLabel", { BackgroundTransparency: 1, LayoutOrder: 1 }, chip), text, SMALL, COLORS.text, FONT);
+		result.TextWrapped = false;
+		result.Size = UDim2.fromOffset(0, 24);
+		result.AutomaticSize = Enum.AutomaticSize.X;
+		return result;
+	};
 
 	let paintToggles: () => void = () => {};
 	paintToggles = () => {
+		for (const stop of chipAnimations) stop();
+		chipAnimations = [];
 		for (const child of chips.GetChildren()) if (child.IsA("GuiObject")) child.Destroy();
 		let count = 0;
 		items.forEach((item, index) => {
@@ -1084,27 +1205,164 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 			if (check) check.Visible = on;
 			if (!on) return;
 			count += 1;
-			const chip = make("Frame", { BackgroundColor3: COLORS.button, BorderSizePixel: 0, Size: UDim2.fromOffset(0, 24), AutomaticSize: Enum.AutomaticSize.X, LayoutOrder: index }, chips);
-			corner(chip, 12);
-			make("UIPadding", { PaddingLeft: new UDim(0, 10), PaddingRight: new UDim(0, 4) }, chip);
-			make("UIListLayout", { FillDirection: Enum.FillDirection.Horizontal, VerticalAlignment: Enum.VerticalAlignment.Center, Padding: new UDim(0, 4) }, chip);
-			const text = style(make("TextLabel", { BackgroundTransparency: 1, LayoutOrder: 1 }, chip), item.name, SMALL, COLORS.text, FONT);
-			text.TextWrapped = false;
-			text.Size = UDim2.fromOffset(0, 24);
-			text.AutomaticSize = Enum.AutomaticSize.X;
-			// Remove: a small "x" drawn from two Frames.
-			const remove = make("TextButton", { AutoButtonColor: true, Text: "", BackgroundTransparency: 1, Size: UDim2.fromOffset(20, 20), LayoutOrder: 2 }, chip);
-			for (const angle of [45, -45]) {
-				make("Frame", { BackgroundColor3: COLORS.dim, BorderSizePixel: 0, AnchorPoint: new Vector2(0.5, 0.5), Position: UDim2.fromScale(0.5, 0.5), Size: UDim2.fromOffset(10, 2), Rotation: angle }, remove);
-			}
-			trove.connect(remove.Activated, () => {
+			const chip = chipFrame(index);
+			chipText(chip, item.chip?.() ?? item.name);
+			removeButton(chip, 2, () => {
 				item.set?.(false);
 				paintToggles();
 			});
 		});
+		for (const shot of shots) {
+			count += 1;
+			if (shot.status !== "ready" || !shot.taken) {
+				// "Capturing..." / "Uploading...": a chip with cycling dots.
+				const chip = chipFrame(100 + shot.key);
+				const text = chipText(chip, "");
+				text.TextColor3 = COLORS.dim;
+				chipAnimations.push(animateDots(text, shot.status === "uploading" ? "Uploading" : "Capturing"));
+				continue;
+			}
+			const chip = chipFrame(100 + shot.key, 52);
+			const thumb = captureThumb(shot.taken, shot.crop, 44);
+			thumb.LayoutOrder = 1;
+			thumb.Parent = chip;
+			removeButton(chip, 2, () => {
+				shots = shots.filter((other) => other !== shot);
+				paintToggles();
+			});
+		}
 		chips.Visible = count > 0;
 	};
 	paintToggles();
+
+	// Screenshot: capture (dev menu hidden for that frame) → crop view → claude.attach (the dev machine picks up the file
+	// Roblox wrote on its PC) → when no file appears there, the upload fallback (asset id) → a thumbnail chip.
+	const ownScreenGuis = (): ScreenGui[] => {
+		const gui = host.FindFirstAncestorOfClass("ScreenGui");
+		return gui !== undefined ? [gui] : [];
+	};
+	const attachShot = (shot: Shot, crop: Crop | undefined, drop: (code?: unknown) => void) => {
+		const taken = shot.taken!;
+		shot.crop = crop;
+		paintToggles();
+		let [ok, reply] = call("claude.attach", { captureTime: taken.captureTime, localId: taken.localId, crop });
+		let answer = (typeIs(reply, "table") ? reply : {}) as { ok?: boolean; error?: string; id?: string };
+		if (ok && answer.ok !== true && answer.error === "no_capture" && taken.capture !== undefined) {
+			// Not on the dev machine's PC (the dev plays elsewhere): upload it, the dev machine downloads it.
+			shot.status = "uploading";
+			paintToggles();
+			const uploaded = uploadCapture(taken.capture);
+			if (!uploaded.ok) return drop(uploaded.error);
+			[ok, reply] = call("claude.attach", { assetId: uploaded.value, crop });
+			answer = (typeIs(reply, "table") ? reply : {}) as { ok?: boolean; error?: string; id?: string };
+		}
+		if (!ok || answer.ok !== true || !typeIs(answer.id, "string")) return drop(ok ? answer.error : reply);
+		notify("");
+		shot.id = answer.id;
+		shot.status = "ready";
+		paintToggles();
+	};
+	screenshot = () => {
+		if (shots.size() >= MAX_ATTACHMENTS) return notify(`At most ${MAX_ATTACHMENTS} screenshots`, COLORS.warn);
+		if (shots.some((shot) => shot.status !== "ready")) return;
+		nextShot += 1;
+		const shot: Shot = { key: nextShot, status: "capturing" };
+		shots.push(shot);
+		paintToggles();
+		const drop = (code?: unknown) => {
+			shots = shots.filter((other) => other !== shot);
+			paintToggles();
+			if (code !== undefined) notify(errorText(code), COLORS.bad);
+		};
+		spawn(() => {
+			const taken = takeScreenshot(ownScreenGuis());
+			if (!taken.ok) return drop(taken.error);
+			shot.taken = taken.value;
+			// The dev picks the part to send (or all of it); only the normalized numbers travel. Overlays go in `middle`
+			// (no layout there; host's UIListLayout would stack them).
+			openCropView(middle, trove, taken.value, (crop) => spawn(() => attachShot(shot, crop, drop)), () => drop());
+		});
+	};
+
+	// Player logs...: pick another player in this server; their client logs go with the next message.
+	pickPlayer = () => {
+		const own = trove.extend();
+		const overlay = make("Frame", { Name: "PlayerPicker", Active: true, BackgroundColor3: COLORS.window, BackgroundTransparency: 0.04, BorderSizePixel: 0, Size: UDim2.fromScale(1, 1), ZIndex: 60 }, middle);
+		own.add(overlay);
+		const title = style(make("TextLabel", { BackgroundTransparency: 1, Position: UDim2.fromOffset(14, 10), Size: new UDim2(1, -60, 0, ROUND), ZIndex: 61 }, overlay), "Player logs", TEXT_SIZE, COLORS.text, Enum.Font.BuilderSansMedium);
+		title.TextWrapped = false;
+		const closeButton = make("TextButton", { AutoButtonColor: true, Text: "", BackgroundColor3: COLORS.button, BorderSizePixel: 0, AnchorPoint: new Vector2(1, 0), Position: new UDim2(1, -12, 0, 10), Size: UDim2.fromOffset(ROUND, ROUND), ZIndex: 61 }, overlay);
+		corner(closeButton, ROUND / 2);
+		for (const angle of [45, -45]) {
+			make("Frame", { BackgroundColor3: COLORS.text, BorderSizePixel: 0, AnchorPoint: new Vector2(0.5, 0.5), Position: UDim2.fromScale(0.5, 0.5), Size: UDim2.fromOffset(14, 2), Rotation: angle, ZIndex: 62 }, closeButton);
+		}
+		// Script-free list: AutomaticCanvasSize and a padded inner Frame (no UIPadding on the ScrollingFrame itself).
+		const scroll = make(
+			"ScrollingFrame",
+			{
+				BackgroundTransparency: 1,
+				BorderSizePixel: 0,
+				Position: UDim2.fromOffset(0, ROUND + 18),
+				Size: new UDim2(1, 0, 1, -(ROUND + 18)),
+				CanvasSize: new UDim2(),
+				AutomaticCanvasSize: Enum.AutomaticSize.Y,
+				ScrollingDirection: Enum.ScrollingDirection.Y,
+				ScrollBarThickness: 5,
+				ScrollBarImageColor3: COLORS.dim,
+				VerticalScrollBarInset: Enum.ScrollBarInset.ScrollBar,
+				ZIndex: 61,
+			},
+			overlay,
+		);
+		const rows = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, ZIndex: 61 }, scroll);
+		make("UIPadding", { PaddingTop: new UDim(0, 4), PaddingBottom: new UDim(0, 12), PaddingLeft: new UDim(0, 12), PaddingRight: new UDim(0, 14) }, rows);
+		make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 4) }, rows);
+		const close = () => popOut(overlay, () => own.destroy());
+		own.connect(closeButton.Activated, close);
+		const draw = (leaving?: Player) => {
+			for (const child of rows.GetChildren()) if (child.IsA("GuiObject")) child.Destroy();
+			const players = Players.GetPlayers().filter((player) => player !== Players.LocalPlayer && player !== leaving);
+			players.sort((a, b) => a.DisplayName.lower() < b.DisplayName.lower());
+			if (players.size() === 0) {
+				const none = label("No other players here", DIMMER, SMALL, false);
+				none.ZIndex = 62;
+				none.Parent = rows;
+				return;
+			}
+			players.forEach((player, index) => {
+				const selected = state.playerLogs?.userId === player.UserId;
+				const row = style(
+					make("TextButton", { AutoButtonColor: true, RichText: true, LayoutOrder: index, ZIndex: 62 }),
+					`<b>${escapeRich(player.DisplayName)}</b>  <font color="${hex(selected ? COLORS.dark : COLORS.dim)}">@${escapeRich(player.Name)}</font>`,
+					TEXT_SIZE,
+					selected ? COLORS.dark : COLORS.text,
+					FONT,
+				);
+				row.TextWrapped = false;
+				row.TextTruncate = Enum.TextTruncate.AtEnd;
+				row.BackgroundColor3 = selected ? COLORS.accent : COLORS.row;
+				row.Size = new UDim2(1, 0, 0, 40);
+				corner(row, 8);
+				pad(row, 0, 12);
+				row.Parent = rows;
+				own.connect(row.Activated, () => {
+					state.playerLogs = { userId: player.UserId, name: player.Name };
+					paintToggles();
+					close();
+				});
+			});
+		};
+		own.connect(Players.PlayerAdded, () => draw());
+		own.connect(Players.PlayerRemoving, (player) => draw(player));
+		draw();
+		popIn(overlay);
+	};
+	// The picked player left: drop the toggle.
+	trove.connect(Players.PlayerRemoving, (player) => {
+		if (state.playerLogs?.userId !== player.UserId) return;
+		state.playerLogs = undefined;
+		paintToggles();
+	});
 
 	// Messages --------------------------------------------------------------------------------------------------------
 	let messages = new Array<Message>();
@@ -1138,14 +1396,102 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		for (const bubble of bubbles) fitBubble(bubble);
 	});
 
+	/** EditableImages of the images Claude showed: cleaned with the transcript and the tab. */
+	const imageTrove = trove.extend();
+	let fetchingImage = false;
+	/**
+	 * An image Claude showed: fetched to this client (claude.image pushes chunks, the inbox joins them), drawn with an
+	 * EditableImage, tap to enlarge. When that isn't possible: one short dim line.
+	 */
+	const addImageBlock = (message: Message, meta: ClaudeImageMeta) => {
+		const frame = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: message.segments.size() + 1 }, message.reply);
+		message.segments.push({ kind: "image", frame });
+		const width = math.min(260, meta.width);
+		const button = make(
+			"ImageButton",
+			{ AutoButtonColor: false, BackgroundColor3: CODE_BG, BorderSizePixel: 0, Size: UDim2.fromOffset(width, math.max(1, math.floor((width * meta.height) / meta.width))), ScaleType: Enum.ScaleType.Stretch },
+			frame,
+		);
+		corner(button, 8);
+		const dots = style(make("TextLabel", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 1) }, button), "", SMALL, DIMMER, FONT);
+		dots.TextXAlignment = Enum.TextXAlignment.Center;
+		const stopDots = animateDots(dots, "");
+		const myView = view;
+		spawn(() => {
+			const failed = (code: unknown) => {
+				stopDots();
+				if (button.Parent === undefined) return;
+				button.Destroy();
+				const line = label(errorText(code), DIMMER, SMALL, false);
+				line.Parent = frame;
+			};
+			const inbox = deps.imageInbox;
+			if (!inbox) return failed("image_api");
+			// One transfer at a time (the server sends one per dev): wait for the previous image, retry while it finishes.
+			while (fetchingImage) task.wait(0.2);
+			fetchingImage = true;
+			const [fetchedOk, fetched] = pcall(() => {
+				for (let attempt = 1; attempt <= 10; attempt++) {
+					const [ok, reply] = call("claude.image", { id: meta.id });
+					const answer = (typeIs(reply, "table") ? reply : {}) as { ok?: boolean; error?: string };
+					if (ok && answer.ok !== true && answer.error === "busy") {
+						task.wait(0.5);
+						continue;
+					}
+					if (!ok || answer.ok !== true) return { error: ok ? answer.error : reply };
+					return { data: inbox.take(meta.id, 60) };
+				}
+				return { error: "busy" };
+			});
+			fetchingImage = false;
+			if (!fetchedOk) return failed("image_gone");
+			if (fetched.error !== undefined) return failed(fetched.error);
+			const data = fetched.data;
+			if (myView !== view) return;
+			if (!data) return failed("image_gone");
+			const made = editableFromZstd(data, meta.width, meta.height);
+			if (!made.ok) return failed(made.error);
+			const editable = made.value;
+			imageTrove.add(editable);
+			stopDots();
+			dots.Visible = false;
+			const [shown] = pcall(() => {
+				button.ImageContent = Content.fromObject(editable);
+			});
+			if (!shown) return failed("image_api");
+			trove.connect(button.Activated, () =>
+				enlargeImage(middle, trove, meta.width / meta.height, (image) => {
+					image.ImageContent = Content.fromObject(editable);
+				}),
+			);
+		});
+	};
+
 	const copyButtons = new Map<string, TextButton>();
 	/** tool_use event index → its one-line error label. */
 	const problems = new Map<number, TextLabel>();
 	const approvalCards = new Map<string, Frame>();
-	const buildMessage = (id: string, prompt: string, mode: ClaudeMode): Message => {
+	const buildMessage = (id: string, prompt: string, mode: ClaudeMode, thumbs: { taken?: TakenCapture; crop?: Crop }[] = []): Message => {
 		order += 1;
 		const frame = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: order }, list);
 		make("UIListLayout", { SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 8) }, frame);
+		if (thumbs.size() > 0) {
+			// The screenshots sent with it, right-aligned above the bubble (shown from this client's own captures; a camera
+			// mark when they aren't here any more, e.g. after a rejoin).
+			const thumbRow = make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, 64), LayoutOrder: 0 }, frame);
+			make("UIListLayout", { FillDirection: Enum.FillDirection.Horizontal, HorizontalAlignment: Enum.HorizontalAlignment.Right, SortOrder: Enum.SortOrder.LayoutOrder, Padding: new UDim(0, 6) }, thumbRow);
+			thumbs.forEach((thumb, index) => {
+				let shown: Frame;
+				if (thumb.taken) shown = captureThumb(thumb.taken, thumb.crop, 64);
+				else {
+					shown = make("Frame", { BackgroundColor3: BUBBLE_BG, BorderSizePixel: 0, Size: UDim2.fromOffset(64, 64) });
+					corner(shown, 6);
+					cameraMark(shown, DIMMER);
+				}
+				shown.LayoutOrder = index;
+				shown.Parent = thumbRow;
+			});
+		}
 		const userRow = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, LayoutOrder: 1 }, frame);
 		make(
 			"UIListLayout",
@@ -1395,6 +1741,8 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 				}
 			} else if (event.kind === "deploy_proposal") {
 				addProposalCard(message, event);
+			} else if (event.kind === "image" && event.image !== undefined) {
+				addImageBlock(message, event.image);
 			} else if (event.kind === "error") {
 				addNote(message, errorText(event.text), COLORS.bad);
 			} else if (event.kind === "status" && event.state === undefined) {
@@ -1448,8 +1796,8 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		message.outcome.Visible = text !== "";
 	};
 
-	const addMessage = (id: string, prompt: string, mode: ClaudeMode) => {
-		const message = buildMessage(id, prompt, mode);
+	const addMessage = (id: string, prompt: string, mode: ClaudeMode, thumbs?: { taken?: TakenCapture; crop?: Crop }[]) => {
+		const message = buildMessage(id, prompt, mode, thumbs);
 		messages.push(message);
 		paintOutcome(message);
 		paintEmpty();
@@ -1458,6 +1806,8 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 
 	const clearTranscript = () => {
 		view += 1;
+		// EditableImages of shown images go with the transcript (they use the device's image memory).
+		imageTrove.clean();
 		for (const message of messages) message.frame.Destroy();
 		messages = [];
 		bubbles.clear();
@@ -1470,7 +1820,11 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 	};
 
 	const fromStored = (stored: ClaudeMessage) => {
-		const message = addMessage(stored.id, stored.prompt, stored.mode ?? "live");
+		const thumbs = (stored.attachments ?? []).map((id) => {
+			const known = state.shots?.get(id);
+			return { taken: known?.taken, crop: known?.crop };
+		});
+		const message = addMessage(stored.id, stored.prompt, stored.mode ?? "live", thumbs);
 		message.state = stored.state;
 		message.proposal = stored.proposal;
 		message.finished = stored.finished;
@@ -1774,12 +2128,16 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		const prompt = trim(box.Text);
 		if (prompt === "") return notify(errorText("empty"), COLORS.warn);
 		if (prompt.size() > MAX_PROMPT) return notify(errorText("too_long"), COLORS.warn);
+		if (shots.some((shot) => shot.status !== "ready")) return notify("Wait for the screenshot", COLORS.warn);
 		sending = true;
 		closeMenu();
 		const mode = currentMode();
+		const sentShots = [...shots];
 		spawn(() => {
 			const request: ClaudePromptRequest = { prompt, mode };
 			if (state.conversationId !== undefined) request.conversationId = state.conversationId;
+			if (sentShots.size() > 0) request.attachments = sentShots.map((shot) => shot.id!);
+			if (state.playerLogs !== undefined) request.playerLogs = state.playerLogs.userId;
 			if (state.attachPath) {
 				const path = deps.dexSelection();
 				if (path !== undefined) request.path = path;
@@ -1799,11 +2157,36 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 					clearTranscript();
 				}
 				if (code === "needs_pairing") refreshSession();
+				if (code === "attachment_gone") {
+					shots = shots.filter((shot) => !sentShots.includes(shot));
+					paintToggles();
+				}
+				if (code === "player_gone") {
+					state.playerLogs = undefined;
+					paintToggles();
+				}
 				return notify(errorText(code), COLORS.bad);
 			}
 			notify("");
 			box.Text = "";
 			state.draft = "";
+			// The screenshots went with this message: off the composer, remembered for its bubble (the newest 30).
+			shots = shots.filter((shot) => !sentShots.includes(shot));
+			state.shots ??= new Map();
+			for (const shot of sentShots) state.shots.set(shot.id!, { taken: shot.taken!, crop: shot.crop, at: os.clock() });
+			while (state.shots.size() > 30) {
+				let oldest: string | undefined;
+				let oldestAt = math.huge;
+				for (const [key, value] of state.shots) {
+					if (value.at < oldestAt) {
+						oldest = key;
+						oldestAt = value.at;
+					}
+				}
+				if (oldest === undefined) break;
+				state.shots.delete(oldest);
+			}
+			paintToggles();
 			const conversationId = answer.request.conversationId;
 			if (myView !== view && conversationId !== undefined) {
 				// The dev switched chats while this was sending: show the chat the message went to.
@@ -1815,7 +2198,7 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 				modes.set(conversationId, mode);
 			}
 			chats.Visible = false;
-			active = addMessage(answer.request.id, prompt, mode);
+			active = addMessage(answer.request.id, prompt, mode, sentShots.map((shot) => ({ taken: shot.taken, crop: shot.crop })));
 			paintComposer();
 			scrollToEnd();
 		});
