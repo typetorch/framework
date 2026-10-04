@@ -10,6 +10,7 @@ import type {
 	AdminRole,
 	AdminServer,
 	AdminServersReply,
+	AdminYou,
 } from "./admin-server";
 import {
 	addButton,
@@ -79,6 +80,7 @@ const ERRORS: Record<string, string> = {
 	here: "You're already here",
 	studio: "Not in Studio",
 	no_reply: "No reply",
+	already_migrating: "Already moving",
 	"not a dev": "Not a dev",
 };
 
@@ -511,6 +513,69 @@ class PlayerMenu {
 	}
 }
 
+// Migrate -------------------------------------------------------------------------------------------------------------
+
+/** What the Migrate card says about this server. KernelStatus fits it. */
+export interface MigrateInfo {
+	players: number;
+	branch?: string;
+	serverType: string;
+}
+
+/** Mirrors admin.migrate (cosmetic; the server decides): admins on public servers, any dev elsewhere. */
+function mayMigrate(role: AdminRole | undefined, serverType: string): boolean {
+	if (serverType === "public") return role === "owner" || role === "admin";
+	return role !== undefined;
+}
+
+/** "Migrate this server?" card: the button in it arms "Confirm" (the card is the first confirm, the tap the second). */
+function openMigrate(cards: Cards, deps: AdminDeps, info: MigrateInfo) {
+	cards.open((card, close, cardTrove) => {
+		const players = `${info.players} player${info.players === 1 ? "" : "s"}`;
+		cardTitle(card, "Migrate this server?", `${players} to a new server on ${info.branch ?? "this branch"}`);
+		if (info.serverType === "public") {
+			card.text("Players land in a reserved server and leave public matchmaking.", COLORS.warn);
+		}
+		const status = cardStatus(card);
+		const buttons = card.buttons();
+		addButton(buttons, "Cancel", close);
+		if (info.serverType === "studio") {
+			status("Not in Studio", COLORS.dim);
+			return;
+		}
+		spacer(buttons);
+		let sending = false;
+		armButton(buttons, "Migrate", COLORS.accent, () => {
+			if (sending) return;
+			sending = true;
+			status("Reserving a server...", COLORS.dim);
+			spawnIn(cardTrove, () => {
+				const [ok, reply] = deps.call("admin.migrate");
+				if (succeeded(ok, reply)) {
+					status("Moving everyone...", COLORS.good);
+				} else {
+					sending = false;
+					status(`Failed: ${errorText(reply)}`, COLORS.bad);
+				}
+			});
+		});
+	});
+}
+
+/**
+ * The "Migrate" button for Server > Status (the kernel-update issue row). Create it once per tab render; the returned
+ * function adds the button to a page that is rebuilt on every refresh (the card lives outside it).
+ */
+export function migrateControl(tab: AdminTab, deps: AdminDeps): (parent: Page, info: MigrateInfo) => void {
+	const cards = new Cards(tab);
+	return (parent, info) => {
+		const [ok, devInfo] = pcall(() => deps.kernel.devStatus());
+		const role = ok && typeIs(devInfo, "table") ? devInfo.role : undefined;
+		if (!mayMigrate(role, info.serverType)) return;
+		colorButton(parent.buttons(), "Migrate", COLORS.accent, () => openMigrate(cards, deps, info));
+	};
+}
+
 // Players -------------------------------------------------------------------------------------------------------------
 
 /** userId -> headshot content id (thumbnails never change within a session). */
@@ -784,6 +849,8 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 	let loading = false;
 	let busy = false;
 	let playersHere = 0;
+	/** The reply's view of the acting dev (Migrate on this server's row). */
+	let you: AdminYou | undefined;
 
 	const act = (label: string, op: string, payload: unknown, doneText: string) => {
 		if (busy) return;
@@ -798,6 +865,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 	};
 
 	const drawServer = (server: AdminServer) => {
+		const me = you;
 		const row = list.place(
 			make("Frame", {
 				BackgroundColor3: server.here ? COLORS.button : COLORS.row,
@@ -857,16 +925,23 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 		detail.Size = UDim2.fromScale(1, 0);
 		detail.AutomaticSize = Enum.AutomaticSize.Y;
 
+		const action = (label: string, onClick: () => void) => {
+			const button = style(make("TextButton", { AutoButtonColor: true }, row), label, 15, COLORS.dark, Enum.Font.BuilderSansMedium);
+			button.TextXAlignment = Enum.TextXAlignment.Center;
+			button.TextWrapped = false;
+			button.BackgroundColor3 = COLORS.accent;
+			button.AnchorPoint = new Vector2(1, 0);
+			button.Position = UDim2.fromScale(1, 0);
+			button.Size = UDim2.fromOffset(SERVER_ACTION, BUTTON_HEIGHT);
+			corner(button, 6);
+			button.Activated.Connect(onClick);
+		};
 		if (server.joinable) {
-			const join = style(make("TextButton", { AutoButtonColor: true }, row), "Join", 15, COLORS.dark, Enum.Font.BuilderSansMedium);
-			join.TextXAlignment = Enum.TextXAlignment.Center;
-			join.TextWrapped = false;
-			join.BackgroundColor3 = COLORS.accent;
-			join.AnchorPoint = new Vector2(1, 0);
-			join.Position = UDim2.fromScale(1, 0);
-			join.Size = UDim2.fromOffset(SERVER_ACTION, BUTTON_HEIGHT);
-			corner(join, 6);
-			join.Activated.Connect(() => act(`Joining ${short}`, "admin.join", { jobId: server.jobId }, "Teleporting..."));
+			action("Join", () => act(`Joining ${short}`, "admin.join", { jobId: server.jobId }, "Teleporting..."));
+		} else if (server.here && me !== undefined && mayMigrate(me.role, me.serverType)) {
+			action("Migrate", () =>
+				openMigrate(cards, deps, { players: server.players, branch: server.branch, serverType: me.serverType }),
+			);
 		} else {
 			const state = style(
 				make("TextLabel", { BackgroundTransparency: 1 }, row),
@@ -896,6 +971,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 			}
 			const data = reply as AdminServersReply;
 			footButtons.Visible = data.you.admin;
+			you = data.you;
 			list.clear();
 			const count = data.servers.size();
 			note.Text = `${count}${data.truncated ? "+" : ""} server${count === 1 ? "" : "s"}${

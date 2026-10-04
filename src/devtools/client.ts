@@ -31,7 +31,7 @@ import {
 } from "./protocol";
 import { CLAUDE_TOOL_REQUEST, CLAUDE_TOOL_RESPONSE, findTool, inspectTool } from "./claude-tools";
 import { renderClaudeChat } from "./claude-ui";
-import { adminTabs } from "./admin-ui";
+import { adminTabs, migrateControl } from "./admin-ui";
 import { renderNetworkInspector } from "./network-inspector";
 import { describeState } from "./state";
 import { badgeLevel, checkHealth, HealthIssue, HealthLevel, ServerFacts } from "./health";
@@ -442,7 +442,10 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	};
 
 	// Server > Status
-	const renderServer = ({ page, trove: tabTrove }: TabContext) => {
+	const renderServer = (tab: TabContext) => {
+		const { page, trove: tabTrove } = tab;
+		// "Migrate" on the kernel-update issue (admin-ui.ts): moves everyone to a fresh server on the new kernel.
+		const migrateButton = migrateControl(tab, { kernel, call });
 		const body = page.group();
 		body.text("Loading...", COLORS.dim);
 		every(tabTrove, REFRESH, () => {
@@ -457,7 +460,10 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			setHealth(issues);
 			if (issues.size() > 0) {
 				body.section("Attention");
-				for (const issue of issues) body.field(issue.title, issue.detail, ISSUE_COLORS[issue.level]);
+				for (const issue of issues) {
+					body.field(issue.title, issue.detail, ISSUE_COLORS[issue.level]);
+					if (issue.action === "migrate") migrateButton(body, status);
+				}
 			}
 			body.section("Server");
 			body.field("Type", status.serverType);

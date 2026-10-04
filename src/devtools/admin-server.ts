@@ -26,6 +26,10 @@ import { RateLimiter } from "../net/limits";
  * player leaves, on shut down, and on BindToClose (bound once per server). A swap leaves it alone: the next generation
  * rewrites it within seconds. Reads happen only when a dev opens the list: one GetRangeAsync (up to 200 servers),
  * cached 15 s, single-flight. Quota use stays around 1 write per server per minute plus a few reads.
+ *
+ * Migrate (`admin.migrate`, see the Migrate section): everyone moves to one new reserved server on this branch (and
+ * pin), which starts on the newest place version, so a server on an old kernel gets the new one. Admins on public
+ * servers, any dev elsewhere; one migration per server.
  */
 
 export type AdminRole = "owner" | "admin" | "dev";
@@ -116,6 +120,14 @@ const MOD_STORE = "TypeTorch";
 const REASON_MAX = 200;
 const PERSIST_KEY = "typetorch/admin";
 const SHUTDOWN_MESSAGE = "This server is shutting down. Please rejoin.";
+const MOVED_MESSAGE = "This server moved. Please rejoin.";
+/** Seconds a player gets to leave for the new server before they are kicked. */
+const MIGRATE_DEADLINE = 30;
+/** Players per TeleportAsync call (Roblox allows 50). */
+const MIGRATE_BATCH = 25;
+/** Seconds a started teleport may take before it is tried again. */
+const MIGRATE_IN_FLIGHT = 10;
+const MIGRATE_MAX_BACKOFF = 8;
 
 const BUCKETS: Record<"mod" | "move" | "read" | "history", [number, number]> = {
 	mod: [3, 1 / 6],
@@ -130,6 +142,20 @@ interface AdminPersist {
 	modSeq: number;
 	/** BindToClose is bound once per server, not once per generation. */
 	closeBound: boolean;
+	/** Set once this server started migrating (one migration per server); the next generation finishes it. */
+	migration?: MigrationState;
+	/** A reserved server's own access code from its `private/<id>` record ("" = looked, none). Server memory only. */
+	ownCode?: string;
+}
+
+/** "Migrate this server": everyone moves to one new reserved server on the same branch (and pin). */
+interface MigrationState {
+	/** The reserved server's access code: server memory only, never sent to a client. */
+	code: string;
+	privateServerId: string;
+	/** os.time() */
+	startedAt: number;
+	by: number;
 }
 
 /** The MemoryStore value (short keys: it is read by every dev who opens the list). `k` never leaves the server. */
@@ -492,10 +518,24 @@ export function registerAdminOps(
 	/** A reserved server's own access code, when the kernel exposes it (kernel need: see plans/10, Admin). */
 	const accessCode = (): string | undefined => {
 		const api = kernel as unknown as { accessCode?: unknown };
-		if (!typeIs(api.accessCode, "function")) return undefined;
-		const [ok, code] = pcall(() => (kernel as unknown as { accessCode(): unknown }).accessCode());
-		return ok && typeIs(code, "string") && code !== "" ? code : undefined;
+		if (typeIs(api.accessCode, "function")) {
+			const [ok, code] = pcall(() => (kernel as unknown as { accessCode(): unknown }).accessCode());
+			if (ok && typeIs(code, "string") && code !== "") return code;
+		}
+		// Servers made by "Migrate" carry their code in their private/<id> record (read once below).
+		return saved.ownCode !== undefined && saved.ownCode !== "" ? saved.ownCode : undefined;
 	};
+	// A reserved server reads its own private/<id> record once per server (one DataStore read) for that code.
+	if (kernel.serverType === "reserved" && game.PrivateServerId !== "" && saved.ownCode === undefined) {
+		trove.add(
+			task.spawn(() => {
+				const [ok, value] = pcall(() => DataStoreService.GetDataStore(MOD_STORE).GetAsync(`private/${game.PrivateServerId}`)[0]);
+				if (!ok) return; // tried again by the next generation
+				const code = typeIs(value, "table") ? (value as { code?: unknown }).code : undefined;
+				saved.ownCode = typeIs(code, "string") ? code : "";
+			}),
+		);
+	}
 
 	const ownEntry = (): StoredServer => ({
 		t: kernel.serverType,
@@ -511,7 +551,7 @@ export function registerAdminOps(
 	});
 
 	const publish = () => {
-		if (!canPublish || shuttingDown || Players.GetPlayers().size() === 0) return;
+		if (!canPublish || shuttingDown || saved.migration || Players.GetPlayers().size() === 0) return;
 		lastWrite = os.clock();
 		const [ok, err] = pcall(() => map.SetAsync(game.JobId, ownEntry(), SERVER_TTL));
 		if (!ok) $warn(`[admin] server list write failed: ${err}`);
@@ -670,6 +710,157 @@ export function registerAdminOps(
 		task.delay(1, () => {
 			for (const other of Players.GetPlayers()) other.Kick(SHUTDOWN_MESSAGE);
 		});
+		return { ok: true, players: count };
+	});
+
+	// Migrate ----------------------------------------------------------------------------------------------------------
+	// Moves everyone to one fresh reserved server on this server's branch (and pin). A new server starts on the newest
+	// place version, so this is how a server on an old kernel gets the new one without waiting for it to empty. Works
+	// on kernels 0.2.0+: it reserves the server and writes the kernel's own private/<PrivateServerId> record
+	// ({branch, setBy, setAt, pin?}, plus `code` for Admin > Servers) itself. One migration per server.
+
+	/** This server's pin in the kernel's `private/<id>` pin shape, if it is pinned. */
+	const currentPin = (): Record<string, unknown> | undefined => {
+		const [ok, status] = pcall(() => kernel.status());
+		if (!ok || !typeIs(status, "table") || status.pinned !== true) return undefined;
+		const artifact = kernel.artifact;
+		if (!typeIs(artifact.assetId, "number")) return undefined;
+		return {
+			assetId: artifact.assetId,
+			artifactId: artifact.id,
+			seq: artifact.seq,
+			commit: artifact.commit,
+			channel: artifact.channel ?? kernel.channel,
+			branch: artifact.branch ?? kernel.branch,
+			// The pin holds until the branch gets a deploy newer than what this server applied.
+			headSeq: typeIs(status.appliedSeq, "number") ? status.appliedSeq : 0,
+		};
+	};
+
+	interface Attempt {
+		/** When the player was first asked to move (their deadline starts here). */
+		since: number;
+		attempts: number;
+		nextAt: number;
+		/** A teleport started at this time and hasn't failed yet. */
+		sentAt?: number;
+		kicked?: boolean;
+	}
+	const attempts = new Map<Player, Attempt>();
+	const backoff = (entry: Attempt) => {
+		entry.sentAt = undefined;
+		entry.attempts += 1;
+		entry.nextAt = os.clock() + math.min(MIGRATE_MAX_BACKOFF, 2 ** entry.attempts);
+	};
+	trove.connect(TeleportService.TeleportInitFailed, (target, result, message) => {
+		const entry = attempts.get(target);
+		if (!entry) return;
+		backoff(entry);
+		$warn(`[admin] migrate: ${target.Name} failed (${result.Name}): ${message}`);
+	});
+	trove.connect(Players.PlayerRemoving, (leaving) => attempts.delete(leaving));
+
+	let moving = false;
+	let reserving = false;
+	/** Teleports everyone (joiners too) in batches until the server is empty; kicks anyone still here after 30 s. */
+	const moveEveryone = () => {
+		const migration = saved.migration;
+		if (moving || !migration) return;
+		moving = true;
+		trove.add(
+			task.spawn(() => {
+				const options = new Instance("TeleportOptions");
+				options.ReservedServerAccessCode = migration.code;
+				while (Players.GetPlayers().size() > 0) {
+					const now = os.clock();
+					const due = new Array<Player>();
+					for (const target of Players.GetPlayers()) {
+						let entry = attempts.get(target);
+						if (!entry) {
+							entry = { since: now, attempts: 0, nextAt: now };
+							attempts.set(target, entry);
+						}
+						if (now - entry.since > MIGRATE_DEADLINE) {
+							if (!entry.kicked) target.Kick(MOVED_MESSAGE);
+							entry.kicked = true;
+						} else if ((entry.sentAt === undefined || now - entry.sentAt > MIGRATE_IN_FLIGHT) && now >= entry.nextAt) {
+							due.push(target);
+						}
+					}
+					for (let first = 0; first < due.size(); first += MIGRATE_BATCH) {
+						const batch = new Array<Player>();
+						for (let index = first; index < math.min(first + MIGRATE_BATCH, due.size()); index++) {
+							if (due[index].Parent) batch.push(due[index]);
+						}
+						if (batch.size() === 0) continue;
+						for (const target of batch) attempts.get(target)!.sentAt = os.clock();
+						const [ok, err] = pcall(() => TeleportService.TeleportAsync(game.PlaceId, batch, options));
+						if (!ok) {
+							$warn(`[admin] migrate: teleport of ${batch.size()} failed: ${err}`);
+							for (const target of batch) {
+								const entry = attempts.get(target);
+								if (entry) backoff(entry);
+							}
+						}
+					}
+					task.wait(1);
+				}
+				options.Destroy();
+				moving = false;
+			}),
+		);
+	};
+	// A swap mid-migration: this generation finishes it. Joiners move too (public matchmaking may still send some).
+	if (saved.migration) trove.add(task.delay(1, moveEveryone));
+	trove.connect(Players.PlayerAdded, () => {
+		if (saved.migration) moveEveryone();
+	});
+
+	register("admin.migrate", (player) => {
+		const actor = actorOf(player);
+		limit(actor, "mod");
+		if (kernel.serverType === "studio" || game.JobId === "") error("studio", 0);
+		// Public servers: players leave public matchmaking for a reserved server, so only owner/admin.
+		if (kernel.serverType === "public" && !actor.admin) error("admins_only", 0);
+		if (saved.migration || reserving || shuttingDown) error("already_migrating", 0);
+		reserving = true;
+		const branch = kernel.branch;
+		let code = "";
+		let privateServerId = "";
+		const [reserved, reserveError] = pcall(() => {
+			const [newCode, newId] = TeleportService.ReserveServer(game.PlaceId);
+			code = newCode;
+			privateServerId = newId;
+		});
+		if (!reserved || code === "" || privateServerId === "") {
+			reserving = false;
+			error(`reserve failed: ${reserveError}`, 0);
+		}
+		// The kernel reads this record at boot (chooseBranch): without it the new server would boot the default branch.
+		const override: Record<string, unknown> = { branch, setBy: player.UserId, setAt: DateTime.now().ToIsoDate(), code };
+		const pin = currentPin();
+		if (pin) override.pin = pin;
+		let written = false;
+		let writeError: unknown;
+		for (let attempt = 1; attempt <= 3 && !written; attempt++) {
+			const [ok, err] = pcall(() => DataStoreService.GetDataStore(MOD_STORE).SetAsync(`private/${privateServerId}`, override));
+			if (ok) written = true;
+			else {
+				writeError = err;
+				task.wait(attempt);
+			}
+		}
+		if (!written) {
+			reserving = false;
+			error(`could not save the branch: ${writeError}`, 0);
+		}
+		saved.migration = { code, privateServerId, startedAt: os.time(), by: player.UserId };
+		reserving = false;
+		const count = Players.GetPlayers().size();
+		record(actor, "migrate", undefined, undefined, "", { to: privateServerId, branch, pinned: pin !== undefined, players: count });
+		task.spawn(unpublish);
+		// A moment for the reply to reach the dev first.
+		trove.add(task.delay(1, moveEveryone));
 		return { ok: true, players: count };
 	});
 }

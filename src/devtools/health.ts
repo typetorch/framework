@@ -14,6 +14,8 @@ export interface HealthIssue {
 	level: HealthLevel;
 	title: string;
 	detail: string;
+	/** A fix the Status page offers next to the issue ("migrate": move everyone to a new server, admin-ui.ts). */
+	action?: "migrate";
 }
 
 /** Facts only the server can check (devtools "status" op); missing on older frameworks. */
@@ -49,13 +51,15 @@ export function checkHealth(status: KernelStatus, facts?: ServerFacts): HealthIs
 		issues.push({
 			level: "error",
 			title: "Kernel update required",
-			detail: `API ${status.kernelApi}, needs ${REQUIRED_KERNEL_API}. Republish the place, then restart servers.`,
+			detail: `API ${status.kernelApi}, needs ${REQUIRED_KERNEL_API}. Republish the place, then migrate.`,
+			action: "migrate",
 		});
 	} else if (versionLess(status.kernelVersion, LATEST_KERNEL)) {
 		issues.push({
 			level: "warn",
 			title: "Kernel update",
-			detail: `${status.kernelVersion} to ${LATEST_KERNEL}. Republish the place, then restart servers.`,
+			detail: `${status.kernelVersion} to ${LATEST_KERNEL}. Republish the place, then migrate.`,
+			action: "migrate",
 		});
 	}
 	if (status.generation === undefined) {
