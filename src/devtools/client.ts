@@ -34,6 +34,7 @@ import { renderClaudeChat } from "./claude-ui";
 import { adminTabs, migrateControl } from "./admin-ui";
 import { renderNetworkInspector } from "./network-inspector";
 import { describeState } from "./state";
+import type { ArtifactNotes } from "./artifact-notes";
 import { badgeLevel, checkHealth, HealthIssue, HealthLevel, ServerFacts } from "./health";
 import {
 	addButton,
@@ -43,6 +44,7 @@ import {
 	copyText,
 	corner,
 	escapeRich,
+	hex,
 	make,
 	pad,
 	Page,
@@ -761,6 +763,46 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		addButton(bar, "Reload", () => act("Reloading", "reload"));
 		addButton(bar, "Rollback", () => act("Rolling back", "rollback"));
 
+		// Tapping an artifact row anywhere but its button expands what changed (artifact.info: the asset description).
+		const notes = new Map<number, ArtifactNotes | string>();
+		const notesText = (value: ArtifactNotes | string): string => {
+			const dim = (text: string) => `<font size="14" color="${hex(COLORS.dim)}">${escapeRich(text)}</font>`;
+			if (typeIs(value, "string")) return dim(value);
+			const lines = new Array<string>();
+			for (const change of value.changes) lines.push(`<font size="14">- ${escapeRich(change)}</font>`);
+			if (lines.size() === 0) lines.push(dim("No change notes for this build"));
+			const id = value.identity;
+			const sources = new Array<string>();
+			if (id.commit !== undefined) sources.push(`template ${id.commit.sub(1, 7)}`);
+			if (id.framework !== undefined) sources.push(`framework ${id.framework}`);
+			if (id.kernel !== undefined) sources.push(`kernel ${id.kernel}`);
+			if (id.built !== undefined) sources.push(`built ${id.built}`);
+			if (sources.size() > 0) lines.push(dim(sources.join("  ")));
+			return lines.join("\n");
+		};
+		const expandable = (row: Frame, assetId: number) => {
+			const label = row.FindFirstChildWhichIsA("TextLabel");
+			if (!label) return;
+			// Under the label and the action button (ZIndex 0), so the button keeps its own clicks.
+			const hit = make("TextButton", { Name: "Expand", Text: "", AutoButtonColor: false, BackgroundTransparency: 1, Size: UDim2.fromScale(1, 1), ZIndex: 0 }, row);
+			const base = label.Text;
+			let open = false;
+			const show = (extra?: string) => (label.Text = open && extra !== undefined ? `${base}\n${extra}` : base);
+			hit.Activated.Connect(() => {
+				open = !open;
+				if (!open) return show();
+				const cached = notes.get(assetId);
+				if (cached !== undefined) return show(notesText(cached));
+				show(notesText("Loading..."));
+				spawnIn(tabTrove, () => {
+					const [ok, reply] = call("artifact.info", assetId);
+					const value = ok && typeIs(reply, "table") ? (reply as ArtifactNotes) : `Unavailable: ${str(reply)}`;
+					notes.set(assetId, value);
+					show(notesText(value));
+				});
+			});
+		};
+
 		draw = () => {
 			if (!data) return;
 			body.clear();
@@ -851,7 +893,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 					if (entry.rollback) title += tag("ROLLBACK", COLORS.warn);
 					const detail = escapeRich(`${entry.artifactId ?? `asset-${entry.assetId}`}  ${ago(entry.at)}`);
 					if (entry.running || serverType === undefined) {
-						body.row(title, detail);
+						expandable(body.row(title, detail), entry.assetId);
 						return;
 					}
 					// Mirrors the kernel's rules (it re-checks): any dev loads on private/reserved/studio servers; on a
@@ -864,7 +906,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 					const crossChannel = status?.channel === "prod" && entry.channel === "dev";
 					if (canLoad) {
 						let armed = !isPublic && !crossChannel; // public server or cross-channel: tap twice
-						body.row(title, detail, {
+						const loadRow = body.row(title, detail, {
 							label: crossChannel ? "Dev channel" : "Load",
 							color: crossChannel ? undefined : COLORS.accent,
 							onClick: (button) => {
@@ -876,14 +918,16 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 								act(`Loading ${short}`, "pin", entry.assetId);
 							},
 						});
+						expandable(loadRow, entry.assetId);
 					} else {
 						// Same button as above; here it moves only you to a reserved server pinned to this artifact.
-						body.row(title, detail, {
+						const moveRow = body.row(title, detail, {
 							label: crossChannel ? "Dev channel" : "Load",
 							color: crossChannel ? undefined : COLORS.accent,
 							onClick: () =>
 								act(`Moving you to a server on ${short}`, "newServer", { branch: entry.branch, assetId: entry.assetId }),
 						});
+						expandable(moveRow, entry.assetId);
 					}
 				});
 				if (!showAll && group.size() > ARTIFACTS_PER_BRANCH) {

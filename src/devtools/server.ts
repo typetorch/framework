@@ -1,4 +1,4 @@
-import { HttpService, Players } from "@rbxts/services";
+import { HttpService, MarketplaceService, Players } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
 import type { ServerKernel } from "../kernel";
@@ -23,6 +23,7 @@ import {
 import type { LogEntry } from "../kernel";
 import { describeState } from "./state";
 import type { ServerFacts } from "./health";
+import { ArtifactNotes, parseArtifactNotes } from "./artifact-notes";
 import { loadstringAvailable } from "./claude-tools";
 
 function isAssetId(value: unknown): value is number {
@@ -142,6 +143,20 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 	ops.set("artifacts", () => {
 		if (!kernelHasArtifacts(kernel)) return { supported: false };
 		return { supported: true, list: kernel.artifacts!() };
+	});
+	// What changed in an artifact (Branch tab, tap a row): its payload asset's description (artifact-notes.ts).
+	// Descriptions don't change, so each asset is read once per generation.
+	const notesCache = new Map<number, ArtifactNotes>();
+	ops.set("artifact.info", (_, payload) => {
+		assert(isAssetId(payload), "bad asset id");
+		const cached = notesCache.get(payload);
+		if (cached) return cached;
+		const [ok, info] = pcall(() => MarketplaceService.GetProductInfo(payload, Enum.InfoType.Asset));
+		if (!ok || !typeIs(info, "table")) error("unavailable", 0);
+		const description = (info as { Description?: unknown }).Description;
+		const notes = parseArtifactNotes(typeIs(description, "string") ? description : "");
+		if (notesCache.size() < 200) notesCache.set(payload, notes);
+		return notes;
 	});
 	// Pin this server to a known artifact. The kernel re-checks everything (dev, server type, admin, channel).
 	ops.set("pin", (player, payload) => {
