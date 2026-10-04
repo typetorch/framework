@@ -1317,7 +1317,10 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		}
 		const session = reply as ClaudeSessionView;
 		paired = session.available && session.allowed && session.paired === true;
-		if (!session.available) {
+		if (!session.available && session.searching) {
+			status.Text = "Looking for the dev server...";
+			status.TextColor3 = COLORS.dim;
+		} else if (!session.available) {
 			status.Text = "Not connected";
 			status.TextColor3 = COLORS.warn;
 		} else if (!session.allowed) {
@@ -1335,7 +1338,8 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		newButton.Visible = paired;
 		statusChevron.Visible = paired;
 		if (!paired) chats.Visible = false;
-		if (!session.available) notify(errorText("not_connected"), COLORS.warn);
+		if (!session.available && !session.searching) notify(errorText("not_connected"), COLORS.warn);
+		else if (!session.available) notify("");
 		else if (!session.allowed) notify(errorText("not_allowed"), COLORS.warn);
 		else if (notice.Text === errorText("not_connected") || notice.Text === errorText("not_allowed")) notify("");
 		// First time paired in this tab: reopen the chat that was open before the swap.

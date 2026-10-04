@@ -1,4 +1,4 @@
-import { HttpService, MessagingService, Players, RunService } from "@rbxts/services";
+import { HttpService, MemoryStoreService, MessagingService, Players, RunService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $print, $warn } from "rbxts-transform-debug";
 import type { LogEntry, ServerKernel } from "../kernel";
@@ -295,7 +295,18 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	};
 
 	// Session messages ----------------------------------------------------------------------------------------------
-	const onMessage = (raw: unknown) => {
+	// The last announcement per branch, in MemoryStore until it expires (at most ANNOUNCE TTL, 120 s). Same checks
+	// as a broadcast on read (onMessage); MemoryStore is writable by game servers like MessagingService is.
+	const discovery = () => MemoryStoreService.GetHashMap("TypeTorchClaude");
+	const shareSession = (announcement: Record<string, unknown>) => {
+		const ttl = (announcement.exp as number) - os.time();
+		if (ttl < 5) return;
+		task.spawn(() => {
+			const [ok, err] = pcall(() => discovery().SetAsync(`session/${kernel.branch}`, announcement, math.min(ttl, 300)));
+			if (!ok) $warn(`[remote-claude] could not share the session: ${err}`);
+		});
+	};
+	const onMessage = (raw: unknown, fromBroadcast = true) => {
 		let data = raw;
 		if (typeIs(raw, "string")) data = decode(raw);
 		if (!typeIs(data, "table")) return;
@@ -321,7 +332,10 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 			if (typeIs(user, "number") && user > 0 && user % 1 === 0 && users.size() < 100) users.push(user);
 		}
 		if (store.session?.sid !== sid) forgetOtherSessions(sid);
+		const fresh = store.session?.sid !== sid || store.session.exp !== exp;
 		store.session = { sid, branch, users, url, exp };
+		// Share it, so a server that starts between announcements (every 60 s) finds the session at once.
+		if (fresh && fromBroadcast) shareSession({ v: 1, s: sid, b: branch, u: users, url, exp });
 	};
 
 	if (kernel.channel === "dev") {
@@ -345,7 +359,16 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 			if (stopped) result.Disconnect();
 			else connection = result;
 		});
+		// A new server: take the last shared announcement instead of waiting up to a minute for the next one.
+		if (activeSession() === undefined) {
+			task.spawn(() => {
+				const [ok, value] = pcall(() => discovery().GetAsync(`session/${kernel.branch}`));
+				if (ok && value !== undefined && !stopped && activeSession() === undefined) onMessage(value, false);
+			});
+		}
 	}
+	// Until the first announcement could have arrived, "no session" means "still looking", not "not running".
+	const searchUntil = os.clock() + 75;
 
 	// HTTP ------------------------------------------------------------------------------------------------------------
 	const send = (
@@ -519,7 +542,9 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	ops.set("claude.session", (player): ClaudeSessionView => {
 		lastSeen.set(player.UserId, os.clock());
 		const session = activeSession();
-		if (!session) return { available: false, allowed: false, branch: kernel.branch, label: "", requests: [] };
+		if (!session) {
+			return { available: false, searching: os.clock() < searchUntil, allowed: false, branch: kernel.branch, label: "", requests: [] };
+		}
 		const allowed = session.users.includes(player.UserId);
 		const requests = new Array<ClaudeRequestView>();
 		if (allowed) {
