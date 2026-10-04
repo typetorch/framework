@@ -750,6 +750,8 @@ export function openCropView(host: GuiObject, trove: Trove, taken: TakenCapture,
 	// Marks: the strokes drawn so far and their Frames.
 	const strokes = new Array<Stroke>();
 	const arts = new Array<Frame>();
+	/** Undone strokes, newest last (Ctrl+Y / Ctrl+Shift+Z brings them back); a new stroke or Clear empties it. */
+	const redoStack = new Array<Stroke>();
 	let penColor: StrokeColor = "red";
 	let penWidth = PEN_WIDTHS[1];
 	let mode: "crop" | "draw" = "crop";
@@ -794,6 +796,7 @@ export function openCropView(host: GuiObject, trove: Trove, taken: TakenCapture,
 		}
 		const start = pressPoint(input, cell, calibration);
 		const stroke: Stroke = { color: penColor, width: penWidth, points: [] };
+		redoStack.clear();
 		strokes.push(stroke);
 		const art = strokeArt(marks, stroke, taken.aspect);
 		arts.push(art.frame);
@@ -882,20 +885,40 @@ export function openCropView(host: GuiObject, trove: Trove, taken: TakenCapture,
 		close();
 		done(undefined, picked);
 	});
-	const [undo] = iconButton(actions, "undo", 3, () => {
+	const undoStroke = () => {
 		if (pen) return;
 		const index = strokes.size() - 1;
 		if (index < 0) return;
 		arts[index].Destroy();
 		arts.remove(index);
-		strokes.remove(index);
-	});
+		redoStack.push(strokes.remove(index)!);
+	};
+	const redoStroke = () => {
+		if (pen) return;
+		const stroke = redoStack.pop();
+		if (!stroke) return;
+		strokes.push(stroke);
+		const art = strokeArt(marks, stroke, taken.aspect);
+		for (let index = 0; index + 1 < stroke.points.size(); index += 2) art.add(stroke.points[index], stroke.points[index + 1]);
+		arts.push(art.frame);
+	};
+	const [undo] = iconButton(actions, "undo", 3, undoStroke);
 	undoButton = undo;
 	const clear = button("Clear", 4, COLORS.button, COLORS.text, () => {
 		if (pen) return;
 		for (const art of arts) art.Destroy();
 		arts.clear();
 		strokes.clear();
+		redoStack.clear();
+	});
+	// Ctrl+Z undo; Ctrl+Y or Ctrl+Shift+Z redo (not while typing in a text box).
+	own.connect(UserInputService.InputBegan, (input) => {
+		if (input.UserInputType !== Enum.UserInputType.Keyboard || UserInputService.GetFocusedTextBox() !== undefined) return;
+		const ctrl = UserInputService.IsKeyDown(Enum.KeyCode.LeftControl) || UserInputService.IsKeyDown(Enum.KeyCode.RightControl);
+		if (!ctrl) return;
+		const shift = UserInputService.IsKeyDown(Enum.KeyCode.LeftShift) || UserInputService.IsKeyDown(Enum.KeyCode.RightShift);
+		if (input.KeyCode === Enum.KeyCode.Z && !shift) undoStroke();
+		else if (input.KeyCode === Enum.KeyCode.Y || (input.KeyCode === Enum.KeyCode.Z && shift)) redoStroke();
 	});
 	button("Done", 5, COLORS.accent, COLORS.dark, () => {
 		const picked = rect;
