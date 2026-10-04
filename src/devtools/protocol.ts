@@ -107,15 +107,67 @@ export interface ClaudePromptRequest {
 	attachments?: string[];
 	/** "Player logs": the UserId of a player in this server whose client logs go with the message (fetched on the server). */
 	playerLogs?: number;
+	/**
+	 * "Toolbox": the dev picked it in the "+" menu for this message, so Claude may search the Creator Store (and insert,
+	 * with approval, in Live mode). One message only: the chip clears after the send (plans/14).
+	 */
+	toolbox?: boolean;
 	/** Continue this conversation (Claude resumes its session); absent = a new chat. */
 	conversationId?: string;
+}
+
+export type ClaudeToolboxType = "Model" | "MeshPart" | "Decal" | "Audio";
+
+/** A Creator Store asset as the dev machine's search saw it (strangers' text, already cleaned and re-checked here). */
+export interface ClaudeToolboxTile {
+	id: number;
+	type: ClaudeToolboxType;
+	name: string;
+	creator: string;
+	verified: boolean;
+	/** Models: the listing's script count. */
+	scripts?: number;
+	upPercent?: number;
+	voteCount?: number;
+	triangles?: number;
+	/** Audio: length in seconds. */
+	seconds?: number;
+}
+
+/** What a toolbox_insert approval card shows: the dev machine's snapshot plus this server's own scan of the load. */
+export interface ClaudeToolboxApproval {
+	asset: ClaudeToolboxTile;
+	/** What the loaded asset holds (Models / MeshParts; absent for Decals and Audio). */
+	found?: { instances: number; parts: number; meshParts: number; scripts: number };
+	/** What the strict sanitizer removes (default). */
+	removes?: { scripts: number; remotes: number; other: number };
+	/** Server scripts that "Keep scripts" would keep (names and paths only: game code can't read Script.Source). */
+	keepable?: string[];
+	/** Where it goes, in a few words ("in front of you"). */
+	goesTo: string;
+	/** Claude's reason: context, not an instruction. */
+	reason?: string;
+	/** Short warnings: "Unverified creator", "Listing says 0 scripts, found 2", "High poly". */
+	warnings: string[];
+}
+
+/** Op "claude.approve" options for a toolbox insert (ignored for run_luau). */
+export interface ClaudeToolboxOptions {
+	anchor: boolean;
+	/** Off by default; keeps server scripts sandboxed with a fixed safe capability set (spike T4). */
+	keepScripts: boolean;
+}
+
+/** Op "claude.toolboxRemove" {insertId}: removes an insert the requesting dev made (the inserted card's Remove). */
+export interface ClaudeToolboxRemoveRequest {
+	insertId: string;
 }
 
 /**
  * Terminal states: deployed | discarded | committed | answered | failed | cancelled (plus "lost" when the dev machine
  * forgot it). "proposed" (a code change waits for Deploy / Discard) and "building" are not terminal.
  */
-export type ClaudeEventKind = "assistant_text" | "tool_use" | "tool_result" | "status" | "error" | "deploy_proposal" | "image";
+export type ClaudeEventKind = "assistant_text" | "tool_use" | "tool_result" | "status" | "error" | "deploy_proposal" | "image" | "toolbox_results";
 
 /** One changed file of a deploy proposal (-1 lines = binary). */
 export interface ClaudeFileChange {
@@ -155,16 +207,32 @@ export interface ClaudeEvent {
 	expiresAt?: number;
 	/** image: an image Claude showed (op "claude.image" fetches it to this client). */
 	image?: ClaudeImageMeta;
+	/** toolbox_results: the Creator Store results Claude got (at most 10 tiles). */
+	tiles?: ClaudeToolboxTile[];
 }
 
-/** A run_luau snippet waiting for the requesting dev's approval (shown in their chat). */
+/**
+ * A run_luau snippet (kind "luau", the default) or a toolbox insert (kind "toolbox": Insert / Deny only, no "always")
+ * waiting for the requesting dev's approval (shown in their chat).
+ */
 export interface ClaudeApproval {
 	id: string;
+	kind?: "luau" | "toolbox";
 	description: string;
+	/** run_luau: the snippet; "" for a toolbox insert. */
 	code: string;
 	conversationId?: string;
 	/** Seconds left before it is denied automatically. */
 	expiresIn: number;
+	toolbox?: ClaudeToolboxApproval;
+}
+
+/** A toolbox insert this dev made (the inserted card's Remove; op "claude.toolboxRemove"). */
+export interface ClaudeToolboxInsert {
+	insertId: string;
+	assetId: number;
+	name: string;
+	path: string;
 }
 
 /** Op "claude.events" {id, since} → the prompt's state and its events i >= since. */
@@ -187,8 +255,10 @@ export interface ClaudeEventsReply {
 	next?: number;
 	/** Another page is ready now. */
 	more?: boolean;
-	/** run_luau snippets waiting for this player's approval. */
+	/** run_luau snippets and toolbox inserts waiting for this player's approval. */
 	approvals?: ClaudeApproval[];
+	/** Toolbox inserts this player made for this prompt that are still in the server. */
+	inserts?: ClaudeToolboxInsert[];
 	mode?: ClaudeMode;
 	/** A code change waiting for (or past) Deploy / Discard. */
 	proposal?: ClaudeProposal;
