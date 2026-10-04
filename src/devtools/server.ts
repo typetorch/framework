@@ -3,10 +3,10 @@ import { $warn } from "rbxts-transform-debug";
 import type { ServerKernel } from "../kernel";
 import type { ServerDispatcher } from "../net/runtime";
 import { runningModules } from "../runtime/registry";
+import { registerRemoteClaude } from "./claude";
 import { listChildren, listProperties, resolvePath, setProperty } from "./dex";
-import { DEV_REQUEST, DEV_RESPONSE, ModuleSummary, NetStat } from "./protocol";
-
-type Handler = (player: Player, payload: unknown) => unknown;
+import { DEV_REQUEST, DEV_RESPONSE, DevOp, ModuleSummary, NetStat } from "./protocol";
+import { describeState } from "./state";
 
 function isStringArray(value: unknown): value is string[] {
 	if (!typeIs(value, "table")) return false;
@@ -24,7 +24,7 @@ function isStringArray(value: unknown): value is string[] {
  * Prod-channel servers are read-only.
  */
 export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDispatcher, trove: Trove) {
-	const ops = new Map<string, Handler>();
+	const ops = new Map<string, DevOp>();
 	const requireDevChannel = () => {
 		if (kernel.channel !== "dev") error("read-only on prod-channel servers", 0);
 	};
@@ -82,12 +82,9 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 		instance.Destroy();
 		return true;
 	});
-	// Claude prompt (plans/10, plans/11): needs `typetorch remote-claude` or the backend agent; neither exists yet.
-	ops.set("claude.prompt", (_, payload) => {
-		requireDevChannel();
-		assert(typeIs(payload, "string") && payload.size() <= 4000, "bad prompt");
-		return { ok: false, error: "not_connected" };
-	});
+	ops.set("state", () => describeState());
+	// Claude prompt (plans/11): claude.session / claude.prompt / claude.status / claude.cancel.
+	registerRemoteClaude(kernel, trove, ops);
 
 	const reply = (player: Player, id: unknown, ok: boolean, result: unknown) => kernel.send(player, DEV_RESPONSE, id, ok, result);
 

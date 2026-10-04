@@ -29,3 +29,6 @@ export interface RunningModule {
 
 /** Modules of the running generation, in start order (the dev menu reads this). */
 export const runningModules = new Array<RunningModule>();
+
+/** Persist tables the running generation opened through `ctx.persist` (the dev menu's State tab reads this). */
+export const persistKeys = new Map<string, object>();

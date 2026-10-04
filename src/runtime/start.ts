@@ -18,7 +18,7 @@ import type {
 } from "../module";
 import { ClientDispatcher, ServerDispatcher, setClientDispatcher, setServerDispatcher } from "../net/runtime";
 import { observePlayers } from "../players";
-import { RegisteredModule, registered, runningModules } from "./registry";
+import { persistKeys, RegisteredModule, registered, runningModules } from "./registry";
 
 export interface StartOptions {
 	/** Folders whose ModuleScripts are required (recursively) so their @Service / @Controller classes register. */
@@ -93,7 +93,9 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 		build: options.build ?? {},
 		kernel,
 		persist<T extends object>(key: string, init: () => T): T {
-			return kernel.persist(key, init);
+			const value = kernel.persist(key, init);
+			persistKeys.set(key, value);
+			return value;
 		},
 	};
 
@@ -122,6 +124,7 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 	const ordered = order(registered.filter((mod) => mod.realm === realm));
 	const instances = new Map<object, object>();
 	runningModules.clear();
+	persistKeys.clear();
 
 	const stopModules = () => {
 		for (let index = runningModules.size() - 1; index >= 0; index--) {

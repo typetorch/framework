@@ -6,7 +6,19 @@ import type { ClientDispatcher, LeafStats } from "../net/runtime";
 import { runningModules } from "../runtime/registry";
 import { popIn, popOut } from "../ui";
 import { listChildren, listProperties, resolvePath, setProperty } from "./dex";
-import { DEV_REQUEST, DEV_RESPONSE, DexNode, DexProperty, ModuleSummary, NetStat } from "./protocol";
+import {
+	ClaudePromptRequest,
+	ClaudeRequestView,
+	ClaudeSessionView,
+	DEV_REQUEST,
+	DEV_RESPONSE,
+	DexNode,
+	DexProperty,
+	ModuleSummary,
+	NetStat,
+	StateSummary,
+} from "./protocol";
+import { describeState } from "./state";
 
 /**
  * Client half of the dev menu (plans/10), built in code. Only devs see it: the toggle button, Ctrl+Shift+D and
@@ -16,6 +28,7 @@ import { DEV_REQUEST, DEV_RESPONSE, DexNode, DexProperty, ModuleSummary, NetStat
 
 const REQUEST_TIMEOUT = 15;
 const REFRESH = 2;
+const CLAUDE_POLL = 2.5;
 const MAX_LOG_ROWS = 300;
 const HEADER = 46;
 const TAB_WIDTH = 116;
@@ -44,7 +57,48 @@ const LOG_COLORS: Record<string, Color3> = {
 	error: COLORS.bad,
 };
 
-const TABS = ["Artifact", "Server", "Logs", "Dex", "Network", "Branch", "Claude"] as const;
+const CLAUDE_STATE_COLORS: Record<string, Color3> = {
+	queued: COLORS.dim,
+	running: COLORS.info,
+	committed: COLORS.info,
+	building: COLORS.info,
+	deployed: COLORS.good,
+	failed: COLORS.bad,
+	cancelled: COLORS.dim,
+	lost: COLORS.dim,
+};
+
+/** Short text for the remote-claude error codes of devtools/claude.ts. */
+const CLAUDE_ERRORS: Record<string, string> = {
+	not_connected: "Not connected: start `typetorch remote-claude` on this branch",
+	no_secret: "Secret typetorch_remote_claude is missing",
+	not_allowed: "not on the session's user list",
+	prod_channel: "Prompts work on dev-channel servers only.",
+	busy: "Wait for your running request",
+	rate_limited: "Limit: 10 prompts per 10 min",
+	empty: "Write a prompt first",
+	too_long: "Prompt too long (4000 max)",
+	context_too_large: "Attached context too large",
+	unreachable: "Can't reach the dev machine",
+	unauthorized: "Rejected by the dev machine",
+	forbidden: "Rejected by the dev machine",
+	remote_rate_limited: "Dev machine busy, try again",
+	not_yours: "Only the requester can cancel",
+	not_found: "Request not found",
+};
+
+function claudeError(code: unknown): string {
+	if (typeIs(code, "string")) return CLAUDE_ERRORS[code] ?? `Failed: ${code}`;
+	return "Failed";
+}
+
+interface ClaudeReply {
+	ok?: boolean;
+	error?: string;
+	request?: ClaudeRequestView;
+}
+
+const TABS = ["Artifact", "Server", "Logs", "Dex", "Network", "State", "Branch", "Claude"] as const;
 type TabName = (typeof TABS)[number];
 
 interface StatusReply {
@@ -806,43 +860,201 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		});
 	};
 
+	const renderState = ({ page, trove: tabTrove }: TabContext) => {
+		const drawSide = (target: Page, title: string, summary: StateSummary) => {
+			target.section(`${title} modules`);
+			if (summary.modules.size() === 0) target.text("None", COLORS.dim);
+			for (const mod of summary.modules) {
+				const hooks = mod.hooks.size() > 0 ? mod.hooks.join(", ") : "no hooks";
+				const deps = mod.dependencies.size() > 0 ? `; needs ${mod.dependencies.join(", ")}` : "";
+				target.field(mod.name, `${hooks}${deps}`);
+			}
+			target.section(`${title} persist`);
+			if (summary.persist.size() === 0) target.text("None", COLORS.dim);
+			for (const entry of summary.persist) {
+				target.field(entry.key, `${entry.entries} entries  ${entry.preview}`);
+			}
+		};
+		const server = page.group();
+		const client = page.group();
+		every(tabTrove, REFRESH, () => {
+			const [ok, reply] = call("state");
+			server.clear();
+			if (ok && typeIs(reply, "table")) drawSide(server, "Server", reply as StateSummary);
+			else server.text(`Server: ${str(reply)}`, COLORS.bad);
+			client.clear();
+			drawSide(client, "Client", describeState());
+		});
+	};
+
 	let claudeDraft = "";
+	let attachPath = false;
+	let attachErrors = false;
 	const renderClaude = ({ page, trove: tabTrove }: TabContext) => {
 		page.field("Branch", str(kernel.branch));
 		page.field("Channel", str(kernel.channel));
 		if (kernel.channel !== "dev") {
-			page.text("Prompts work on dev-channel servers only.", COLORS.dim);
+			page.text(claudeError("prod_channel"), COLORS.dim);
 			return;
 		}
-		const box = page.input("Describe a change", 120, true);
+		const sessionLine = page.text("Checking session...", COLORS.dim);
+		const composer = page.group(6);
+		composer.frame.Visible = false;
+		const list = page.group(8);
+
+		const box = composer.input("Describe a change", 120, true);
 		box.Text = claudeDraft;
-		box.GetPropertyChangedSignal("Text").Connect(() => (claudeDraft = box.Text));
-		const bar = page.buttons();
-		const result = page.text("", COLORS.dim);
+		tabTrove.connect(box.GetPropertyChangedSignal("Text"), () => (claudeDraft = box.Text));
+		const toggles = composer.buttons();
+		const paintToggle = (button: TextButton, on: boolean) => {
+			button.BackgroundColor3 = on ? COLORS.info : COLORS.button;
+			button.TextColor3 = on ? COLORS.dark : COLORS.text;
+		};
+		const pathToggle = addButton(toggles, "Dex path", () => {
+			attachPath = !attachPath;
+			paintToggle(pathToggle, attachPath);
+		});
+		const errorsToggle = addButton(toggles, "Errors", () => {
+			attachErrors = !attachErrors;
+			paintToggle(errorsToggle, attachErrors);
+		});
+		paintToggle(pathToggle, attachPath);
+		paintToggle(errorsToggle, attachErrors);
+		const actions = composer.buttons();
+		const result = composer.text("", COLORS.dim);
+		result.Visible = false;
+		const showResult = (text: string, color: Color3) => {
+			result.Text = text;
+			result.TextColor3 = color;
+			result.Visible = text !== "";
+		};
+
+		let requests = new Array<ClaudeRequestView>();
+		let sending = false;
+
+		const replace = (updated: ClaudeRequestView) => {
+			const index = requests.findIndex((request) => request.id === updated.id);
+			if (index === -1) requests.unshift(updated);
+			else requests[index] = updated;
+		};
+
+		let drawList: () => void;
+		const cancel = (id: string) =>
+			spawnIn(tabTrove, () => {
+				const [ok, reply] = call("claude.cancel", id);
+				const answer = (typeIs(reply, "table") ? reply : {}) as ClaudeReply;
+				if (ok && answer.ok === true && answer.request) replace(answer.request);
+				else showResult(claudeError(ok ? answer.error : reply), COLORS.bad);
+				drawList();
+			});
+
+		drawList = () => {
+			list.clear();
+			if (requests.size() === 0) return;
+			list.section("Requests");
+			for (const request of requests) {
+				const card = list.group(2);
+				const color = CLAUDE_STATE_COLORS[request.state] ?? COLORS.text;
+				const title = card.text(`${request.state.upper()}  ${request.prompt}`, color);
+				title.Font = Enum.Font.BuilderSansBold;
+				const details = new Array<string>();
+				if (!request.mine) details.push(`by ${request.by}`);
+				if (request.summary !== undefined) details.push(request.summary);
+				if (request.commit !== undefined) details.push(`commit ${request.commit}`);
+				if (request.artifactId !== undefined) details.push(request.artifactId);
+				if (request.error !== undefined) details.push(request.error);
+				if (details.size() > 0) card.text(details.join("  "), COLORS.dim);
+				const log = request.log ?? [];
+				for (let index = math.max(0, log.size() - 3); index < log.size(); index++) {
+					card.text(log[index], COLORS.dim, true);
+				}
+				if (request.mine && !request.finished) addButton(card.buttons(), "Cancel", () => cancel(request.id), COLORS.bad);
+			}
+		};
+
+		const refreshSession = () => {
+			const [ok, reply] = call("claude.session");
+			if (!ok || !typeIs(reply, "table")) {
+				sessionLine.Text = `Failed: ${str(reply)}`;
+				sessionLine.TextColor3 = COLORS.bad;
+				return;
+			}
+			const session = reply as ClaudeSessionView;
+			if (!session.available) {
+				sessionLine.Text = claudeError("not_connected");
+				sessionLine.TextColor3 = COLORS.warn;
+			} else if (!session.allowed) {
+				sessionLine.Text = `Session ${session.label}: ${claudeError("not_allowed")}`;
+				sessionLine.TextColor3 = COLORS.warn;
+			} else {
+				sessionLine.Text = `Session ${session.label} on ${str(session.branch)}`;
+				sessionLine.TextColor3 = COLORS.good;
+			}
+			composer.frame.Visible = session.available && session.allowed;
+			requests = session.requests;
+			drawList();
+		};
+
+		const pollActive = () => {
+			let polled = 0;
+			for (const request of [...requests]) {
+				if (request.finished || polled >= 3) continue;
+				polled += 1;
+				const [ok, reply] = call("claude.status", request.id);
+				const answer = (typeIs(reply, "table") ? reply : {}) as ClaudeReply;
+				if (ok && answer.ok === true && answer.request) replace(answer.request);
+			}
+			if (polled > 0) drawList();
+		};
+
+		const lastClientErrors = (): string[] => {
+			const errors = new Array<string>();
+			for (const entry of kernel.logs(undefined, 300)) {
+				if (entry.kind === "error") errors.push(entry.text.sub(1, 500));
+			}
+			return errors.filter((_, index) => index >= errors.size() - 5);
+		};
+
+		const send = () => {
+			const prompt = (box.Text.match("^%s*(.-)%s*$")[0] as string | undefined) ?? "";
+			if (prompt === "") return showResult(claudeError("empty"), COLORS.warn);
+			showResult("Sending...", COLORS.dim);
+			const request: ClaudePromptRequest = { prompt: prompt.sub(1, 4000), errors: attachErrors };
+			if (attachPath) request.path = `${dexRealm} ${["game", ...dexPath].join("/")}`;
+			if (attachErrors) request.clientErrors = lastClientErrors();
+			const [ok, reply] = call("claude.prompt", request);
+			const answer = (typeIs(reply, "table") ? reply : {}) as ClaudeReply;
+			if (ok && answer.ok === true && answer.request) {
+				showResult("Sent", COLORS.good);
+				box.Text = "";
+				replace(answer.request);
+				drawList();
+			} else {
+				showResult(claudeError(ok ? answer.error : reply), COLORS.bad);
+			}
+		};
 		addButton(
-			bar,
+			actions,
 			"Send",
-			() =>
+			() => {
+				if (sending) return;
+				sending = true;
 				spawnIn(tabTrove, () => {
-					const prompt = (box.Text.match("^%s*(.-)%s*$")[0] as string | undefined) ?? "";
-					if (prompt === "") return;
-					result.Text = "Sending...";
-					result.TextColor3 = COLORS.dim;
-					const [ok, reply] = call("claude.prompt", prompt.sub(1, 4000));
-					const answer = (typeIs(reply, "table") ? reply : {}) as { ok?: boolean; error?: string; message?: string };
-					if (ok && answer.ok === false && answer.error === "not_connected") {
-						result.Text = "Not connected: start `typetorch remote-claude` (coming soon)";
-						result.TextColor3 = COLORS.warn;
-					} else if (ok && answer.ok === true) {
-						result.Text = answer.message ?? "Sent";
-						result.TextColor3 = COLORS.good;
-					} else {
-						result.Text = `Failed: ${ok ? str(answer.error) : str(reply)}`;
-						result.TextColor3 = COLORS.bad;
-					}
-				}),
+					const [ok, err] = pcall(send);
+					sending = false;
+					if (!ok) showResult(`Failed: ${err}`, COLORS.bad);
+				});
+			},
 			COLORS.accent,
 		);
+
+		// The session every 10 s; active requests every 2.5 s in between (only while this tab is open).
+		let tick = 0;
+		every(tabTrove, CLAUDE_POLL, () => {
+			if (tick % 4 === 0) refreshSession();
+			else pollActive();
+			tick += 1;
+		});
 	};
 
 	const RENDER: Record<TabName, (tab: TabContext) => void> = {
@@ -851,6 +1063,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		Logs: renderLogs,
 		Dex: renderDex,
 		Network: renderNetwork,
+		State: renderState,
 		Branch: renderBranch,
 		Claude: renderClaude,
 	};
