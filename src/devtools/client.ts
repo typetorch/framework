@@ -720,7 +720,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				body.text("Status unavailable", COLORS.bad);
 			}
 
-			// Branch picker: switch here (private/reserved/studio) or open a reserved server (public).
+			// Branch picker. One "Switch" everywhere: private/reserved/studio servers swap in place; a public server must
+			// stay on prod (anyone can join it), so there Switch moves only you to a new reserved server on that branch.
 			body.section("Branches");
 			if (data.branchesError !== undefined) body.text(`Failed: ${data.branchesError}`, COLORS.bad);
 			else if (data.branches.size() === 0) body.text("None", COLORS.dim);
@@ -733,12 +734,13 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				parts.push(branch.commit ?? branch.artifactId ?? "-");
 				if (branch.deployedAt !== undefined) parts.push(ago(branch.deployedAt));
 				const detail = escapeRich(parts.join("  "));
-				if (serverType === undefined || (current && !isPublic)) {
+				if (serverType === undefined || current) {
 					body.row(title, detail);
 				} else if (isPublic) {
 					body.row(title, detail, {
-						label: "Open server",
-						onClick: () => act(`Opening a server on ${branch.name}`, "newServer", branch.name),
+						label: "Switch",
+						color: COLORS.accent,
+						onClick: () => act(`Moving you to a ${branch.name} server`, "newServer", branch.name),
 					});
 				} else {
 					body.row(title, detail, {
@@ -804,10 +806,12 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 							},
 						});
 					} else {
+						// Same button as above; here it moves only you to a reserved server pinned to this artifact.
 						body.row(title, detail, {
-							label: "Open server",
+							label: "Load",
+							color: COLORS.accent,
 							onClick: () =>
-								act(`Opening a server on ${short}`, "newServer", { branch: entry.branch, assetId: entry.assetId }),
+								act(`Moving you to a server on ${short}`, "newServer", { branch: entry.branch, assetId: entry.assetId }),
 						});
 					}
 				});
