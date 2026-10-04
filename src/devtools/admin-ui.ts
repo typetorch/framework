@@ -856,6 +856,18 @@ function shortArtifact(entry: ArtifactEntry): string {
 	return entry.commit ?? entry.artifactId ?? `asset ${entry.assetId}`;
 }
 
+/** Kernel 0.3: prod-effective servers (public, or on a prod-channel branch) take only pins signed by the CLI. */
+const PROD_PIN_NOTE = "Use the CLI: typetorch pin";
+
+function prodTarget(server: AdminServer): boolean {
+	return server.type === "public" || server.channel === "prod";
+}
+
+/** A branch with any prod-effective listed server: in-game A/B can't reach it (a random % would hit those). */
+function prodBranch(servers: AdminServer[], branch: string | undefined): boolean {
+	return servers.some((server) => server.branch === branch && server.type !== "studio" && prodTarget(server));
+}
+
 /** Branches of the listed servers, most servers first (A/B "Random %" and "All A/B" pick one). */
 function branchesOf(servers: AdminServer[]): string[] {
 	const counts = new Map<string, number>();
@@ -1008,12 +1020,18 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 		// A/B: a checkbox on the left (this server too). Kernels before 0.2.3 can't take a pin: a dim box.
 		const indent = abOn ? CHECK_SIZE + 8 : 0;
 		if (abOn) {
-			const enabled = server.ab !== false;
+			// Kernel 0.3: prod-effective servers take only CLI-signed pins, so their box is dim.
+			const prod = prodTarget(server);
+			const enabled = server.ab !== false && !prod;
 			rowCheckbox(
 				row,
 				enabled,
 				() => selected.has(server.jobId),
 				() => {
+					if (prod) {
+						setResult(PROD_PIN_NOTE, COLORS.dim);
+						return;
+					}
 					if (!enabled) {
 						setResult(`Needs kernel 0.2.3 (${server.kernel ?? "?"})`, COLORS.warn);
 						return;
@@ -1302,6 +1320,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 				if (!chosen) return status("Pick an artifact", COLORS.bad);
 				if (mode === "picked" && selected.size() === 0) return status("Pick servers first", COLORS.bad);
 				if (mode === "random" && branch === undefined) return status("No servers", COLORS.bad);
+				if (mode === "random" && prodBranch(servers, branch)) return status(PROD_PIN_NOTE, COLORS.dim);
 				sending = true;
 				const payload: AbRequest =
 					mode === "picked" ? { jobIds: pickedJobs(), assetId: chosen.assetId } : { pct, branch, assetId: chosen.assetId };
@@ -1312,6 +1331,13 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 				paintMode();
 				pctRow.Visible = mode === "random";
 				if (branchRow) branchRow.Visible = mode === "random";
+				warning.TextColor3 = COLORS.warn;
+				if (mode === "random" && prodBranch(servers, branch)) {
+					warning.Text = PROD_PIN_NOTE;
+					warning.TextColor3 = COLORS.dim;
+					warning.Visible = true;
+					return;
+				}
 				if (!chosen) {
 					warning.Visible = false;
 					return;
@@ -1369,6 +1395,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 				if (sending) return;
 				if (mode === "picked" && selected.size() === 0) return status("Pick servers first", COLORS.bad);
 				if (mode === "all" && branch === undefined) return status("No servers", COLORS.bad);
+				if (mode === "all" && prodBranch(servers, branch)) return status(PROD_PIN_NOTE, COLORS.dim);
 				sending = true;
 				const payload: AbRequest = mode === "picked" ? { jobIds: pickedJobs(), unpin: true } : { pct: 100, branch, unpin: true };
 				sendAb(payload, status, close, cardTrove, () => (sending = false));
@@ -1377,8 +1404,11 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 				paintMode();
 				if (branchRow) branchRow.Visible = mode === "all";
 				const count = selected.size();
-				warning.Text =
-					mode === "picked"
+				const prodAll = mode === "all" && prodBranch(servers, branch);
+				warning.TextColor3 = prodAll ? COLORS.dim : COLORS.warn;
+				warning.Text = prodAll
+					? PROD_PIN_NOTE
+					: mode === "picked"
 						? `${count} server${count === 1 ? "" : "s"} go back to the branch head`
 						: `Every A/B server on ${branch ?? "?"} goes back to the head`;
 			};

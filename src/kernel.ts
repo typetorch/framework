@@ -123,6 +123,10 @@ export interface KeyTrust {
 	changes: number;
 	/** This server takes only signed prod artifacts. */
 	signedOnly: boolean;
+	/** The BootstrapHeads kernel deploy stamped: the only unsigned heads a prod server takes (exact asset and seq). */
+	bootstrap?: Record<string, { assetId: number; seq: number; artifactId?: string }>;
+	/** See KernelStatus.noTrustedHead. */
+	noTrustedHead?: boolean;
 	rejected: Rejections;
 	/** The last 10 refusals, oldest first. */
 	refusals: Refusal[];
@@ -360,6 +364,11 @@ export interface KernelStatus {
 	signing?: SigningSummary;
 	/** Kernel 0.3+: refused messages and heads since boot. */
 	rejected?: Rejections;
+	/**
+	 * Kernel 0.3+: a signed-only server with no trusted head for its branch (no verified head, no BootstrapHeads entry).
+	 * It runs nothing new until a signed deploy arrives; it keeps polling and re-reading the keys.
+	 */
+	noTrustedHead?: boolean;
 }
 
 export interface ServerKernel {

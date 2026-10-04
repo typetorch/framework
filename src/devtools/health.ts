@@ -53,7 +53,8 @@ function clock(unix: number): string {
 /**
  * Kernel 0.3 signing (status().signing / rejected; nothing on older kernels). Shared with Artifact > Signing.
  * - a key change without a rekey hint before it: error (a rotation the user may not have done);
- * - the fallback key revoked: error; no trust root on a signed-only server: error;
+ * - no trusted prod head (nothing to boot until a signed deploy), the fallback key revoked, or no trust root on a
+ *   signed-only server: error;
  * - fallback-only mode (the key asset never loaded): warn; refusals: warn with the last reason;
  * - a key change after a rekey hint: info.
  */
@@ -61,6 +62,9 @@ export function signingIssues(status: KernelStatus): HealthIssue[] {
 	const issues = new Array<HealthIssue>();
 	const signing = status.signing;
 	if (signing === undefined) return issues;
+	if (status.noTrustedHead === true) {
+		issues.push({ level: "error", title: "No trusted prod head", detail: "Waiting for a signed deploy." });
+	}
 	if (signing.lastChangeAt !== undefined) {
 		if (signing.lastChangeHinted === true) {
 			issues.push({ level: "info", title: "Keys rotated", detail: clock(signing.lastChangeAt) });

@@ -480,6 +480,15 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		const fallback = keys.fallback;
 		if (fallback) keyRow(target, fallback, fallback.revoked ? tag("REVOKED", COLORS.bad) : "", fallback.revoked ? COLORS.bad : COLORS.text);
 		else target.text("None", keys.signedOnly ? COLORS.warn : COLORS.dim);
+		// The unsigned heads kernel deploy vouched for (BootstrapHeads), and whether this server has a trusted head at all.
+		const bootstrap = keys.bootstrap;
+		if (bootstrap !== undefined && next(bootstrap)[0] !== undefined) {
+			target.text("Bootstrap heads", COLORS.dim);
+			for (const [branch, head] of pairs(bootstrap)) {
+				target.field(branch, `#${head.seq}  ${head.artifactId ?? `asset-${head.assetId}`}`);
+			}
+		}
+		if (keys.noTrustedHead === true) target.field("Head", "No trusted prod head", COLORS.bad);
 	};
 
 	const renderArtifact = ({ page, trove: tabTrove }: TabContext) => {
@@ -967,9 +976,14 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				return;
 			}
 			if (artifacts.size() === 0) body.text("None yet", COLORS.dim);
+			// Kernel 0.3: a prod server (public, or private on a prod branch) takes only CLI-signed pins, so nothing loads
+			// in place here (non-admins on public servers still move themselves to a reserved server).
+			const signedOnly = status?.signedOnly === true;
+			const inPlaceBlocked = signedOnly && (isAdmin || !isPublic);
+			if (inPlaceBlocked) body.text("Use the CLI: typetorch pin", COLORS.dim);
 			// Owner/admin on a public server load in place as an A/B experiment (kernel 0.2.3+).
-			const abInPlace = isPublic && isAdmin && data.experiments === true;
-			if (isPublic && isAdmin && !abInPlace) body.text("A/B needs kernel 0.2.3", COLORS.dim);
+			const abInPlace = isPublic && isAdmin && data.experiments === true && !signedOnly;
+			if (isPublic && isAdmin && !abInPlace && !signedOnly) body.text("A/B needs kernel 0.2.3", COLORS.dim);
 			const order = new Array<string>();
 			const groups = new Map<string, ArtifactEntry[]>();
 			for (const entry of artifacts) {
@@ -999,7 +1013,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 					if (entry.rollout !== undefined) title += tag(`${entry.rollout}%`, COLORS.info);
 					if (entry.rollback) title += tag("ROLLBACK", COLORS.warn);
 					const detail = escapeRich(`${entry.artifactId ?? `asset-${entry.assetId}`}  ${ago(entry.at)}`);
-					if (entry.running || serverType === undefined) {
+					if (entry.running || serverType === undefined || inPlaceBlocked) {
 						expandable(body.row(title, detail), entry.assetId);
 						return;
 					}
