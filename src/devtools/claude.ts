@@ -32,7 +32,7 @@ import type {
 	ClaudeToolboxOptions,
 	DevOp,
 } from "./protocol";
-import { CLAUDE_IMAGE_CHUNK, cleanAttachmentIds, cleanCrop, cleanImageMeta, decodeImageChunk } from "./claude-images";
+import { CLAUDE_IMAGE_CHUNK, MAX_STROKES_JSON, cleanAttachmentIds, cleanCrop, cleanImageMeta, cleanStrokes, decodeImageChunk } from "./claude-images";
 import { ToolboxGate, cleanTiles, insertsFor, newToolboxStore, removeToolboxInsert, toolboxInsert, type ToolboxAsk, type ToolboxStore } from "./toolbox-server";
 import { CODE_ALPHABET, CODE_LENGTH, CODE_SECRET_LENGTH, codeFingerprint, sha256 } from "./sha256";
 
@@ -1095,16 +1095,22 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		return true;
 	};
 
-	// The screenshot the dev's client just took: {captureTime, localId?, crop?} (the dev machine picks up the file Roblox
-	// wrote on its PC: only this user's, the closest time) or {assetId, crop?} (the upload fallback, downloaded there).
+	// The screenshot the dev's client just took: {captureTime, localId?, crop?, strokes?} (the dev machine picks up the file
+	// Roblox wrote on its PC: only this user's, the closest time) or {assetId, crop?, strokes?} (the upload fallback,
+	// downloaded there). `strokes` are the dev's marks (claude-images.ts cleanStrokes: counts, finite 0..1, rounded), at
+	// most MAX_STROKES_JSON of JSON; the dev machine draws them onto the capture before the crop.
 	ops.set("claude.attach", (player, payload) => {
 		if (kernel.channel !== "dev") return fail("prod_channel");
 		const session = chatSession(player);
 		if (isFailure(session)) return session;
 		lastSeen.set(player.UserId, os.clock());
-		const request = (typeIs(payload, "table") ? payload : {}) as { captureTime?: unknown; localId?: unknown; assetId?: unknown; crop?: unknown };
+		const request = (typeIs(payload, "table") ? payload : {}) as { captureTime?: unknown; localId?: unknown; assetId?: unknown; crop?: unknown; strokes?: unknown };
 		const crop = request.crop === undefined ? undefined : cleanCrop(request.crop);
 		if (request.crop !== undefined && crop === undefined) return fail("bad_request");
+		const cleaned = cleanStrokes(request.strokes);
+		if (cleaned === undefined) return fail("bad_request");
+		if (cleaned.size() > 0 && encodedSize(cleaned) > MAX_STROKES_JSON) return fail("too_many_marks");
+		const strokes = cleaned.size() > 0 ? cleaned : undefined;
 		let path: string;
 		let body: Record<string, unknown>;
 		const assetId = request.assetId;
@@ -1112,11 +1118,11 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		if (assetId !== undefined) {
 			if (!typeIs(assetId, "number") || assetId < 1 || assetId % 1 !== 0 || assetId >= 2 ** 53) return fail("bad_request");
 			path = "/v1/attachments/asset";
-			body = { assetId, crop };
+			body = { assetId, crop, strokes };
 		} else {
 			if (!typeIs(captureTime, "number") || captureTime % 1 !== 0 || captureTime < 1e12 || captureTime >= 1e13) return fail("bad_request");
 			path = "/v1/attachments/capture";
-			body = { captureTime, placeId: game.PlaceId, crop };
+			body = { captureTime, placeId: game.PlaceId, crop, strokes };
 			const localId = request.localId;
 			if (typeIs(localId, "string") && localId.size() <= 128 && matches(localId, "^[%w%._:/{}%-]+$")) body.localId = localId;
 		}
@@ -1125,6 +1131,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		if (!result.ok) {
 			if (result.error === "not_found") return fail("no_capture");
 			if (result.error === "http_422") return fail("bad_image");
+			if (result.error === "too_large") return fail("too_many_marks");
 			if (result.error === "remote_error") return fail(assetId !== undefined ? "download_failed" : "remote_error");
 			return result;
 		}
