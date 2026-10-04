@@ -108,7 +108,7 @@ const OTHER_LOG_ERRORS: Record<string, string> = {
 	rate_limited: "Slow down",
 };
 
-const TABS = ["Artifact", "Server", "Admin", "Logs", "Dex", "Network", "State", "Claude"] as const;
+const TABS = ["Artifact", "Modules", "Server", "Admin", "Logs", "Dex", "Network", "State", "Claude"] as const;
 type TabName = (typeof TABS)[number];
 /** Tabs with sub-tabs (a segmented bar on top of the content); the first one is the default. */
 const SUBTABS: Partial<Record<TabName, readonly string[]>> = { Server: ["Status", "Branch"], Admin: ["Players", "Servers", "Bans"], Network: ["Packets", "Stats"] };
@@ -492,13 +492,9 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		else if (keys.noTrustedHead === true) target.field("Head", "No trusted prod head", COLORS.bad);
 	};
 
-	const renderArtifact = ({ page, trove: tabTrove }: TabContext) => {
-		page.section("Client");
-		page.field("Artifact", kernel.artifact.id);
-		page.field("Generation", `#${kernel.generation}`);
-		page.field("Branch", str(kernel.branch));
-		page.field("Channel", str(kernel.channel));
-		page.field("Kernel", `${kernel.kernelVersion} (API ${kernel.kernelApi})`);
+	const renderModules = ({ page, trove: tabTrove }: TabContext) => {
+		const server = page.group();
+		server.text("Loading server...", COLORS.dim);
 		page.section("Client modules");
 		if (runningModules.size() === 0) page.text("None", COLORS.dim);
 		for (const running of runningModules) {
@@ -506,6 +502,31 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			const deps = running.dependencies.size() > 0 ? `, needs ${running.dependencies.join(", ")}` : "";
 			page.field(running.name, init + deps);
 		}
+		spawnIn(tabTrove, () => {
+			const [ok, reply] = call("status");
+			server.clear();
+			server.section("Server modules");
+			if (!ok || !typeIs(reply, "table")) {
+				server.text(`Failed: ${str(reply)}`, COLORS.bad);
+				return;
+			}
+			const modules = (reply as StatusReply).modules;
+			if (modules.size() === 0) server.text("None", COLORS.dim);
+			for (const mod of modules) {
+				const init = mod.initMs !== undefined ? `init ${mod.initMs} ms` : "no onInit";
+				const deps = mod.dependencies.size() > 0 ? `, needs ${mod.dependencies.join(", ")}` : "";
+				server.field(mod.name, init + deps);
+			}
+		});
+	};
+
+	const renderArtifact = ({ page, trove: tabTrove }: TabContext) => {
+		page.section("Client");
+		page.field("Artifact", kernel.artifact.id);
+		page.field("Generation", `#${kernel.generation}`);
+		page.field("Branch", str(kernel.branch));
+		page.field("Channel", str(kernel.channel));
+		page.field("Kernel", `${kernel.kernelVersion} (API ${kernel.kernelApi})`);
 		const server = page.group();
 		server.text("Loading server...", COLORS.dim);
 		const signing = page.group();
@@ -516,7 +537,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				server.text(`Server: ${str(reply)}`, COLORS.bad);
 				return;
 			}
-			const { artifact, modules, server: status } = reply as StatusReply;
+			const { artifact, server: status } = reply as StatusReply;
 			server.section("Server artifact");
 			const idBox = server.field("Id", str(artifact.id));
 			const idBadges = verifiedBadges(status.generation?.artifact.verified);
@@ -534,13 +555,6 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			server.section("Server generation");
 			server.field("Generation", status.generation ? `${status.generation.name} (#${status.generation.number})` : "-");
 			server.field("Kernel", `${status.kernelVersion}${status.kernelBuild !== undefined ? `@${status.kernelBuild}` : ""} (API ${status.kernelApi})`);
-			server.section("Server modules");
-			if (modules.size() === 0) server.text("None", COLORS.dim);
-			for (const mod of modules) {
-				const init = mod.initMs !== undefined ? `init ${mod.initMs} ms` : "no onInit";
-				const deps = mod.dependencies.size() > 0 ? `, needs ${mod.dependencies.join(", ")}` : "";
-				server.field(mod.name, init + deps);
-			}
 		});
 		// Signing (kernel 0.3): the trust state, compact; tap a key row for its full base64.
 		spawnIn(tabTrove, () => {
@@ -1126,6 +1140,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	/** Keys: a tab name, or "Tab/Sub" for tabs with sub-tabs. */
 	const RENDER: Record<string, (tab: TabContext) => void> = {
 		Artifact: renderArtifact,
+		Modules: renderModules,
 		"Server/Status": renderServer,
 		"Server/Branch": renderBranch,
 		...adminTabs({ kernel, call }),
