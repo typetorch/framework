@@ -18,7 +18,9 @@ export type {
 export { Controller, Service } from "./decorators";
 export type { ModuleConfig } from "./decorators";
 export { startClient, startServer } from "./runtime/start";
-export type { StartOptions } from "./runtime/start";
+export type { StartOptions, StopGeneration } from "./runtime/start";
+export { TypeTorch } from "./typetorch";
+export type { BranchChange, TypeTorchApi, TypeTorchFeatures } from "./typetorch";
 export { observePlayers } from "./players";
 export { createNetwork, setNetworkLimits } from "./net";
 export type {
@@ -41,12 +43,18 @@ export type {
 	ClientKernel,
 	DevInfo,
 	GenerationHistoryEntry,
+	GenerationStart,
 	Kernel,
 	KernelStatus,
 	LogEntry,
 	NewServerReport,
+	PendingUpdate,
+	PreviousGeneration,
+	Role,
 	ServerKernel,
 	ServerType,
+	StartReason,
+	SwapOutInfo,
 	SwapReport,
 } from "./kernel";
 export { bump, isRealFrame, observeElement, popIn, popOut, PopupQueue } from "./ui";

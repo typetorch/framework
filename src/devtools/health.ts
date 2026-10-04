@@ -1,7 +1,7 @@
 import type { KernelStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
-export const LATEST_KERNEL = "0.2.1";
+export const LATEST_KERNEL = "0.2.2";
 /** The oldest kernel API this framework runs on. */
 export const REQUIRED_KERNEL_API = 1;
 /** Auto-rollbacks newer than this (seconds) are reported. */

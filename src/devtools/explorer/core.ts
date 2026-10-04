@@ -401,13 +401,56 @@ export class Registry {
 
 // Handlers ---------------------------------------------------------------------------------------------------------
 
+const KEYWORDS = new Set([
+	"and",
+	"break",
+	"do",
+	"else",
+	"elseif",
+	"end",
+	"false",
+	"for",
+	"function",
+	"if",
+	"in",
+	"local",
+	"nil",
+	"not",
+	"or",
+	"repeat",
+	"return",
+	"then",
+	"true",
+	"until",
+	"while",
+]);
+
+function quote(text: string): string {
+	return "%q".format(text).gsub("\\\n", "\\n")[0];
+}
+
+/** `.Name`, or `["Spawn point"]` when the name isn't a plain identifier. */
+function member(name: string): string {
+	const [plain] = name.match("^[%a_][%w_]*$");
+	return plain !== undefined && !KEYWORDS.has(name) ? `.${name}` : `[${quote(name)}]`;
+}
+
 /** A Luau-style path: game.Workspace.Map["Spawn point"]. */
 export function luaPath(names: string[]): string {
 	let path = "game";
-	for (const name of names) {
-		const [plain] = name.match("^[%a_][%w_]*$");
-		path += plain !== undefined ? `.${name}` : `[${"%q".format(name).gsub("\\\n", "\\n")[0]}]`;
-	}
+	for (const name of names) path += member(name);
+	return path;
+}
+
+/**
+ * A path to paste into code: `workspace.Map.Part`, `game:GetService("ReplicatedStorage").Assets["Spawn point"]`.
+ * `names` start at a child of game; `serviceClass` is that child's ClassName (services can be renamed).
+ */
+export function servicePath(names: string[], serviceClass?: string): string {
+	if (names.size() === 0) return "game";
+	const service = serviceClass ?? names[0];
+	let path = service === "Workspace" ? "workspace" : `game:GetService(${quote(service)})`;
+	for (let index = 1; index < names.size(); index++) path += member(names[index]);
 	return path;
 }
 

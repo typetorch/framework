@@ -1,5 +1,6 @@
-import { Players } from "@rbxts/services";
+import { Players, UserInputService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
+import { popIn, popOut } from "../ui";
 
 /**
  * Building blocks of the dev menu UI (plans/10), shared by its tabs: colors, instance helpers, the `Page` column,
@@ -431,6 +432,216 @@ export class Page {
 		pad(box, 6, 8);
 		return this.place(box);
 	}
+}
+
+// Copy popup --------------------------------------------------------------------------------------------------------
+
+/** Closes the open copy popup (one at a time). */
+let closeCopy: (() => void) | undefined;
+
+/**
+ * Roblox has no clipboard API, so "copy" shows `text` in a small popup: a read-only TextBox with all of it selected.
+ * The player copies it with Ctrl+C (a dim hint says so on keyboards) or, on touch, with long-press > Copy. Text with
+ * line breaks or over 80 characters shows on several lines and scrolls when long.
+ *
+ * - `anchor`: the popup opens next to it, inside its ScreenGui, and closes by itself when the anchor leaves the game
+ *   (so it goes with the tab trove that owns the anchor). Without an anchor it is centered in its own ScreenGui.
+ * - Closes on Escape, Enter, a click or tap outside, or its close button. Opening another one closes it.
+ * - Client only. Returns a function that closes it.
+ */
+export function copyText(text: string, anchor?: GuiObject): () => void {
+	closeCopy?.();
+	const touch = UserInputService.TouchEnabled && !UserInputService.MouseEnabled;
+	const keyboard = UserInputService.KeyboardEnabled && !touch;
+	const multiline = text.find("\n", 1, true)[0] !== undefined || text.size() > 80;
+	const trove = new Trove();
+
+	// Inside the anchor's ScreenGui (same coordinates, same lifetime), else a ScreenGui of its own.
+	let layer = anchor?.FindFirstAncestorWhichIsA("LayerCollector");
+	if (!layer) {
+		layer = trove.add(
+			make("ScreenGui", {
+				Name: "TypeTorchCopy",
+				DisplayOrder: 1000,
+				IgnoreGuiInset: true,
+				ResetOnSpawn: false,
+				ZIndexBehavior: Enum.ZIndexBehavior.Sibling,
+			}),
+		);
+		layer.Parent = Players.LocalPlayer.WaitForChild("PlayerGui");
+	}
+	// A transparent full-size button under the panel: a click or tap outside closes. ZIndex is set on every piece, so
+	// it also stays on top in a ScreenGui with Global ZIndexBehavior.
+	const backdrop = trove.add(
+		make("TextButton", {
+			Name: "CopyText",
+			Text: "",
+			AutoButtonColor: false,
+			BackgroundTransparency: 1,
+			Size: UDim2.fromScale(1, 1),
+			ZIndex: 1000,
+		}),
+	);
+	const layerSize = layer.IsA("GuiBase2d") ? layer.AbsoluteSize : new Vector2(800, 600);
+	const closeSize = touch ? 34 : 26;
+	const hint = keyboard ? 16 : 0;
+	const width = math.min(420, math.max(220, layerSize.X - 32));
+	const lineHeight = 18;
+	const boxHeight = multiline ? math.min(240, math.max(3, text.split("\n").size()) * lineHeight + 12) : BUTTON_HEIGHT;
+	const height = boxHeight + 16 + hint;
+
+	const panel = make(
+		"Frame",
+		{ BackgroundColor3: COLORS.header, BorderSizePixel: 0, Size: UDim2.fromOffset(width, height), ZIndex: 1001 },
+		backdrop,
+	);
+	corner(panel, 8);
+	make("UIStroke", { Color: COLORS.stroke, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, panel);
+	// Swallow clicks on the panel itself (they would reach the backdrop and close it).
+	make("TextButton", { Text: "", AutoButtonColor: false, BackgroundTransparency: 1, Size: UDim2.fromScale(1, 1), ZIndex: 1001 }, panel);
+
+	const boxFrame = make(
+		"Frame",
+		{
+			BackgroundColor3: COLORS.row,
+			BorderSizePixel: 0,
+			ClipsDescendants: true,
+			Position: UDim2.fromOffset(8, 8),
+			Size: new UDim2(1, -(closeSize + 24), 0, boxHeight),
+			ZIndex: 1002,
+		},
+		panel,
+	);
+	corner(boxFrame, 6);
+	const box = style(
+		make("TextBox", {
+			BackgroundTransparency: 1,
+			ClearTextOnFocus: false,
+			TextEditable: false,
+			MultiLine: multiline,
+			ZIndex: 1003,
+		}),
+		text,
+		14,
+		COLORS.text,
+		Enum.Font.Code,
+	);
+	if (multiline) {
+		// Script-free scrolling: the box grows with its text, the canvas follows (no UIPadding on the ScrollingFrame).
+		const scroll = scrolling(boxFrame, { Size: UDim2.fromScale(1, 1), ZIndex: 1003 });
+		verticalList(scroll, 0);
+		const inner = make(
+			"Frame",
+			{ BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y, ZIndex: 1003 },
+			scroll,
+		);
+		pad(inner, 6, 8);
+		box.TextYAlignment = Enum.TextYAlignment.Top;
+		box.Size = UDim2.fromScale(1, 0);
+		box.AutomaticSize = Enum.AutomaticSize.Y;
+		box.Parent = inner;
+	} else {
+		box.TextWrapped = false;
+		box.ClipsDescendants = true;
+		box.Size = UDim2.fromScale(1, 1);
+		pad(box, 0, 8);
+		box.Parent = boxFrame;
+	}
+
+	// Close button: an X from two bars (no glyphs).
+	const closeButton = make(
+		"TextButton",
+		{
+			Text: "",
+			AutoButtonColor: true,
+			BackgroundColor3: COLORS.button,
+			BorderSizePixel: 0,
+			AnchorPoint: new Vector2(1, 0),
+			Position: new UDim2(1, -8, 0, 8),
+			Size: UDim2.fromOffset(closeSize, closeSize),
+			ZIndex: 1002,
+		},
+		panel,
+	);
+	corner(closeButton, 6);
+	for (const angle of [45, -45]) {
+		make(
+			"Frame",
+			{
+				BackgroundColor3: COLORS.text,
+				BorderSizePixel: 0,
+				AnchorPoint: new Vector2(0.5, 0.5),
+				Position: UDim2.fromScale(0.5, 0.5),
+				Size: UDim2.fromOffset(math.floor(closeSize * 0.5), 2),
+				Rotation: angle,
+				ZIndex: 1003,
+			},
+			closeButton,
+		);
+	}
+	if (keyboard) {
+		const label = style(make("TextLabel", { BackgroundTransparency: 1, ZIndex: 1002 }, panel), "Ctrl+C", 13, COLORS.dim);
+		label.TextXAlignment = Enum.TextXAlignment.Right;
+		label.AnchorPoint = new Vector2(1, 1);
+		label.Position = new UDim2(1, -(closeSize + 16), 1, -4);
+		label.Size = UDim2.fromOffset(80, hint);
+	}
+
+	// Next to the anchor (below it, or above when there is no room), clamped to the layer; centered without one.
+	backdrop.Parent = layer;
+	if (anchor) {
+		const origin = backdrop.AbsolutePosition;
+		const at = anchor.AbsolutePosition.sub(origin);
+		const room = backdrop.AbsoluteSize;
+		const x = math.clamp(at.X, 8, math.max(8, room.X - width - 8));
+		let y = at.Y + anchor.AbsoluteSize.Y + 4;
+		if (y + height > room.Y - 8) y = at.Y - height - 4;
+		panel.Position = UDim2.fromOffset(x, math.clamp(y, 8, math.max(8, room.Y - height - 8)));
+	} else {
+		panel.AnchorPoint = new Vector2(0.5, 0.5);
+		panel.Position = UDim2.fromScale(0.5, 0.5);
+	}
+	popIn(panel);
+
+	let closed = false;
+	// Select everything (again a frame later: focusing can move the cursor).
+	const selectAll = () => {
+		if (closed || !box.Parent) return;
+		box.CaptureFocus();
+		box.SelectionStart = 1;
+		box.CursorPosition = text.size() + 1;
+	};
+	selectAll();
+	task.defer(selectAll);
+
+	// Connections end the moment it closes; the pieces go after the pop-out (or at once if that can't play).
+	const events = trove.extend();
+	let close: (animate?: boolean) => void = () => {};
+	close = (animate = true) => {
+		if (closed) return;
+		closed = true;
+		if (closeCopy === close) closeCopy = undefined;
+		trove.remove(events);
+		if (box.IsFocused()) box.ReleaseFocus();
+		if (animate && panel.IsDescendantOf(game)) {
+			popOut(panel, () => trove.destroy());
+			task.delay(0.5, () => trove.destroy());
+		} else trove.destroy();
+	};
+	closeCopy = close;
+	events.connect(backdrop.Activated, () => close());
+	events.connect(backdrop.MouseButton2Click, () => close());
+	events.connect(closeButton.Activated, () => close());
+	events.connect(box.FocusLost, (enter) => enter && close());
+	events.connect(UserInputService.InputBegan, (input) => {
+		if (input.KeyCode === Enum.KeyCode.Escape) close();
+	});
+	if (anchor) {
+		events.connect(anchor.AncestryChanged, () => {
+			if (!anchor.IsDescendantOf(game)) close(false);
+		});
+	}
+	return () => close();
 }
 
 // Player selector ---------------------------------------------------------------------------------------------------

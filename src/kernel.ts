@@ -18,11 +18,102 @@ export interface ArtifactInfo {
 	readonly seq?: number;
 }
 
+export type Role = "owner" | "admin" | "dev";
+
 export interface DevInfo {
 	dev: boolean;
+	/** Why: "studio", "owner", "member", "badge", "revoked", "none". */
 	reason: string;
-	role?: "owner" | "admin" | "dev";
+	role?: Role;
 	channel?: Channel;
+}
+
+/**
+ * Why a generation started (or the next one will):
+ * - `boot`: the first generation of this server (or, on a client, of this player's session);
+ * - `deploy`: its branch got a new deploy (a deploy message, or the poll or registry catching up);
+ * - `rollback`: its branch was rolled back (`typetorch rollback`);
+ * - `branch`: this server switched branch (dev menu, `/tt branch`);
+ * - `pin`: this server was pinned to a known artifact;
+ * - `reload`: a dev or admin reloaded the branch head;
+ * - `server_rollback`: `/tt rollback` (this server's own history);
+ * - `auto_rollback`: the next artifact failed to start, so the kernel brought this one back;
+ * - `unknown`: the kernel is older than 0.2.2 and didn't say.
+ */
+export type StartReason =
+	| "boot"
+	| "deploy"
+	| "rollback"
+	| "branch"
+	| "pin"
+	| "reload"
+	| "server_rollback"
+	| "auto_rollback"
+	| "unknown";
+
+/** The generation that ran before this one (in this server, or in this client). */
+export interface PreviousGeneration {
+	readonly artifact: ArtifactInfo;
+	/** The server's branch back then. */
+	readonly branch?: string;
+	readonly channel?: Channel;
+	/** Its generation number. */
+	readonly generation: number;
+}
+
+/** How this generation started (kernel 0.2.2+ `kernel.start`; the framework fills it in on older kernels). */
+export interface GenerationStart {
+	/** "boot": nothing ran before it; "swap": it replaced a running generation. */
+	readonly kind: "boot" | "swap";
+	readonly reason: StartReason;
+	readonly previous?: PreviousGeneration;
+	/** The server's branch differs from the previous generation's (a branch switch). */
+	readonly branchChanged: boolean;
+	/** os.time() when it started. */
+	readonly startedAt: number;
+	/** Server only: user id of the dev or admin who asked (reload, branch, pin, server rollback). */
+	readonly requestedBy?: number;
+	/** Server only (kernel 0.2.2+): seconds spent loading the payload. */
+	readonly loadSeconds?: number;
+	/** Server only (kernel 0.2.2+): seconds the previous generation took to stop. */
+	readonly stopSeconds?: number;
+	/**
+	 * Server only (kernel 0.2.2+): stop + start time of the whole swap. Set once the swap finished, so it is still
+	 * undefined during onInit and the start of onStart.
+	 */
+	readonly swapSeconds?: number;
+}
+
+/** What replaces this generation (the argument of `onSwapOut`). */
+export interface SwapOutInfo {
+	/** Why the next generation starts ("unknown" on kernels older than 0.2.2). */
+	readonly reason: StartReason;
+	/** The server's branch after the swap (differs from `TypeTorch.branch` on a branch switch). */
+	readonly branch?: string;
+	/** The next artifact, when the kernel says (0.2.2+; on a client only `id`). */
+	readonly next?: {
+		readonly id?: string;
+		readonly assetId?: number;
+		readonly branch?: string;
+		readonly commit?: string;
+		readonly channel?: Channel;
+	};
+}
+
+/** A swap is coming (kernel 0.2.2+), or was called off. */
+export interface PendingUpdate {
+	readonly reason: StartReason;
+	/** The server's branch. */
+	readonly branch?: string;
+	readonly artifactId?: string;
+	readonly commit?: string;
+	/**
+	 * Estimated seconds until this generation stops: the public-server jitter (up to 10 s) plus the usual load and
+	 * swap time. 0 when cancelled.
+	 */
+	readonly eta: number;
+	/** The swap was called off (the payload failed to load); this generation keeps running. */
+	readonly cancelled?: boolean;
 }
 
 export interface LogEntry {
@@ -165,15 +256,32 @@ export interface ServerKernel {
 	 * studio servers; on public servers only owner/admin and only prod-channel artifacts.
 	 */
 	pinArtifact?(player: Player, assetId: number): SwapReport;
+
+	// Kernel 0.2.2+ (additive, same kernelApi). Game code uses them through `TypeTorch` (src/typetorch.ts).
+	/** How this generation started. The kernel's own table: it sets `swapSeconds` once the swap finished. */
+	readonly start?: GenerationStart;
+	/** Whether this generation is pinned now. */
+	pinned?(): boolean;
+	/** One handler per generation (the framework installs it): a swap is coming, or was called off. */
+	onPending?(handler: (update: PendingUpdate) => void): void;
+	/** One handler per generation: a player's dev decision changed after the first one. */
+	onDevChanged?(handler: (player: Player, info: DevInfo) => void): void;
+	/** Reload this server to its branch head; the owner or admins only (checked by the kernel). */
+	requestReload?(player: Player): SwapReport;
 }
 
 export interface ClientKernel {
 	readonly kernelApi: number;
 	readonly kernelVersion: string;
-	readonly artifact: { readonly id: string };
+	/** Kernel 0.2.2+ fills every field from the client tree; older kernels only `id`. */
+	readonly artifact: ArtifactInfo;
 	readonly generation: number;
 	readonly branch?: string;
 	readonly channel?: Channel;
+	/** Kernel 0.2.2+. */
+	readonly serverType?: ServerType;
+	/** Kernel 0.2.2+: how this client generation started (a player's first one is kind "boot", reason "boot"). */
+	readonly start?: GenerationStart;
 
 	persist<T extends object>(key: string, init: () => T): T;
 	onMessage(handler: (channel: string, ...args: unknown[]) => void): void;
@@ -184,6 +292,13 @@ export interface ClientKernel {
 	/** Kernel events such as "dev-open" (from `/tt dev`). Returns a disconnect function. */
 	onKernelEvent(handler: (name: string) => void): () => void;
 	logs(since?: number, limit?: number): LogEntry[];
+
+	// Kernel 0.2.2+ (additive): feature-detect.
+	pinned?(): boolean;
+	/** One handler per generation: the server says a swap is coming, or called it off. */
+	onPending?(handler: (update: PendingUpdate) => void): void;
+	/** One handler per generation: the server's decision about this player changed. */
+	onDevChanged?(handler: (info: DevInfo) => void): void;
 }
 
 export type Kernel = ServerKernel | ClientKernel;

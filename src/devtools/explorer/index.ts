@@ -1,6 +1,7 @@
 import { TextService, UserInputService, Workspace } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { popIn } from "../../ui";
+import { copyText } from "../widgets";
 import {
 	ChildrenPage,
 	FindPage,
@@ -15,6 +16,7 @@ import {
 	explorerHandlers,
 	luaPath,
 	rowBefore,
+	servicePath,
 } from "./core";
 
 export type { Realm } from "./core";
@@ -55,7 +57,13 @@ const INSET = 10;
 const TREE_TOP = 4;
 const TREE_LEFT = 4;
 const AUTO_REFRESH = 3;
-const ICONS = "rbxasset://textures/ClassImages.PNG";
+/**
+ * Class icons: Studio's ClassImages.PNG (a 2352x16 strip) repacked into a 32-column grid (512x80, same order), uploaded
+ * as an image. Live clients downscale textures wider than 1024 px, so 16 px offsets into the original strip landed on
+ * the wrong, squished icons. Source: framework/assets/class-icons.png.
+ */
+const ICONS = "rbxassetid://97389585475400";
+const ICON_COLUMNS = 32;
 const STALE = "explorer: stale";
 
 const COLORS = {
@@ -314,6 +322,30 @@ export function mountExplorer(parent: GuiObject, deps: ExplorerDeps): () => void
 		status.TextColor3 = color;
 	};
 
+	// Copy popups (widgets.copyText) open next to the row they copy from but are anchored to this pin, moved over that
+	// row: rows are rebuilt by refreshes and rebound on scroll, the pin lives as long as the explorer.
+	const copyPin = make("Frame", { Name: "CopyPin", BackgroundTransparency: 1, Active: false }, root);
+	const copyFrom = (source: GuiObject, value: string) => {
+		const at = source.AbsolutePosition.sub(root.AbsolutePosition);
+		copyPin.Position = UDim2.fromOffset(at.X, at.Y);
+		copyPin.Size = UDim2.fromOffset(source.AbsoluteSize.X, source.AbsoluteSize.Y);
+		copyText(value, copyPin);
+	};
+	/** Right-click (buttons and boxes) and, except on text boxes (their long-press is the native copy menu), long-press. */
+	const onMenu = (gui: GuiObject, open: () => void) => {
+		if (gui.IsA("GuiButton")) gui.MouseButton2Click.Connect(open);
+		else {
+			gui.InputBegan.Connect((input) => {
+				if (input.UserInputType === Enum.UserInputType.MouseButton2) open();
+			});
+		}
+		if (!gui.IsA("TextBox")) {
+			gui.TouchLongPress.Connect((_, state) => {
+				if (state === Enum.UserInputState.Begin) open();
+			});
+		}
+	};
+
 	let split = math.clamp(persist.split ?? 0.5, 0.2, 0.8);
 	const vertical = () => body.AbsoluteSize.X < 520;
 	const layout = () => {
@@ -413,7 +445,8 @@ export function mountExplorer(parent: GuiObject, deps: ExplorerDeps): () => void
 			return;
 		}
 		chevron(slot.bars, isOpen(entry.id));
-		slot.icon.ImageRectOffset = new Vector2(classInfo(row.className)[0] * 16, 0);
+		const iconIndex = classInfo(row.className)[0];
+		slot.icon.ImageRectOffset = new Vector2((iconIndex % ICON_COLUMNS) * 16, math.floor(iconIndex / ICON_COLUMNS) * 16);
 		slot.label.Text = `${escape(entry.path ?? row.name)}  <font color="#${COLORS.dim.ToHex()}">${row.className}</font>`;
 		slot.label.TextColor3 = COLORS.text;
 	};
@@ -560,6 +593,20 @@ export function mountExplorer(parent: GuiObject, deps: ExplorerDeps): () => void
 		const names = new Array<string>();
 		for (let row = nodes.get(id); row; row = row.parent !== 0 ? nodes.get(row.parent) : undefined) names.unshift(row.name);
 		return luaPath(names);
+	};
+
+	/**
+	 * "Copy path": workspace.Map.Part or game:GetService("ReplicatedStorage").X, from the cached rows. The second value
+	 * is false when an ancestor isn't cached (search hits), so the path doesn't reach game yet.
+	 */
+	const servicePathOf = (id: number): [string, boolean] => {
+		const names = new Array<string>();
+		let top: Row | undefined;
+		for (let row = nodes.get(id); row; row = row.parent !== 0 ? nodes.get(row.parent) : undefined) {
+			names.unshift(row.name);
+			top = row;
+		}
+		return [servicePath(names, top?.className), top !== undefined && top.parent === 0];
 	};
 
 	/**
@@ -761,17 +808,36 @@ export function mountExplorer(parent: GuiObject, deps: ExplorerDeps): () => void
 		}
 	};
 
-	const valueEditor = (slot: Frame, row: PropRow, editable: boolean) => {
+	/** Context menu of a property, attribute or tags row: copy its value or its name. */
+	const openCopyMenu = (anchor: GuiObject, name: string, value: string) => {
+		const actions: [string, string][] = [
+			["Copy value", value],
+			["Copy name", name],
+		];
+		const height = actions.size() * ((TOUCH ? 34 : 26) + 2) + 8;
+		const list = listIn(openOverlay(anchor, 160, height), false);
+		for (const [label, copied] of actions) {
+			item(list, label, () => {
+				closeOverlay();
+				copyFrom(anchor, copied);
+			});
+		}
+	};
+
+	/** `menu` opens the row's Copy menu; every interactive value cell forwards right-click (and long-press) to it. */
+	const valueEditor = (slot: Frame, row: PropRow, editable: boolean, menu: () => void) => {
 		const dimmed = editable ? COLORS.text : COLORS.dim;
 		// Long values end in an ellipsis; hovering shows the full value in the status bar (the editor holds it too).
 		slot.MouseEnter.Connect(() => setStatus(`${row.name} = ${row.text}`, COLORS.text));
 		if (row.kind === "Instance" && row.ref !== undefined) {
 			const link = text(make("TextButton", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 1) }, slot), row.text, 14, COLORS.info);
 			link.Activated.Connect(() => reveal(row.ref!));
+			onMenu(link, menu);
 		} else if (row.kind === "boolean") {
 			// Checkbox: the whole value cell is the touch target; the box is 20 px (24 on touch).
 			const hitArea = make("TextButton", { Text: "", AutoButtonColor: false, BackgroundTransparency: 1 }, slot);
 			hitArea.Size = UDim2.fromScale(1, 1);
+			onMenu(hitArea, menu);
 			const size = TOUCH ? 24 : 20;
 			const box = make("Frame", { BorderSizePixel: 0, AnchorPoint: new Vector2(0, 0.5), Position: UDim2.fromScale(0, 0.5) }, hitArea);
 			box.Size = UDim2.fromOffset(size, size);
@@ -810,6 +876,7 @@ export function mountExplorer(parent: GuiObject, deps: ExplorerDeps): () => void
 			corner(pick, 4);
 			make("UIPadding", { PaddingLeft: new UDim(0, 6) }, pick);
 			pick.Activated.Connect(() => openEnum(pick, row));
+			onMenu(pick, menu);
 		} else {
 			let offset = 0;
 			if (row.kind === "Color3") {
@@ -820,12 +887,14 @@ export function mountExplorer(parent: GuiObject, deps: ExplorerDeps): () => void
 				make("UIStroke", { Color: COLORS.stroke, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, swatch);
 				offset = 22;
 			}
+			// Read-only values are TextBoxes too (not labels), so they can be selected and copied in place.
 			const box = text(make("TextBox", { ClearTextOnFocus: false, TextEditable: editable, ClipsDescendants: true }, slot), row.text, 14, dimmed);
 			box.Font = Enum.Font.Code;
 			box.BackgroundColor3 = COLORS.row;
 			box.BackgroundTransparency = editable ? 0 : 1;
 			box.Position = UDim2.fromOffset(offset, 0);
 			box.Size = new UDim2(1, -offset, 1, 0);
+			onMenu(box, menu);
 			if (editable) {
 				corner(box, 4);
 				make("UIPadding", { PaddingLeft: new UDim(0, 6), PaddingRight: new UDim(0, 6) }, box);
@@ -893,20 +962,27 @@ export function mountExplorer(parent: GuiObject, deps: ExplorerDeps): () => void
 				header(category);
 			}
 			if (closedCategories.has(category)) continue;
-			const frame = line();
+			// A button row, so right-click / long-press anywhere on it (the name included) opens the Copy menu.
+			const frame = place(make("TextButton", { Text: "", AutoButtonColor: false, BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, PROP) }));
+			const menu = () => openCopyMenu(frame, row.name, row.text);
+			onMenu(frame, menu);
 			const name = text(make("TextLabel", { BackgroundTransparency: 1 }, frame), row.name, 14, row.readOnly ? COLORS.dim : COLORS.text);
 			name.Size = new UDim2(0.42, -6, 1, 0);
 			const slot = make("Frame", { BackgroundTransparency: 1, Position: UDim2.fromScale(0.42, 0) }, frame);
 			slot.Size = new UDim2(0.58, 0, 1, -2);
-			valueEditor(slot, row, edit && !row.readOnly);
+			valueEditor(slot, row, edit && !row.readOnly, menu);
 		}
 		if (reply.tags.size() > 0) {
 			header("Tags");
 			if (!closedCategories.has("Tags")) {
-				const tags = place(text(make("TextLabel", { BackgroundTransparency: 1 }), reply.tags.join(", "), 14));
+				// Selectable in place (a read-only TextBox), and in the Copy menu.
+				const list = reply.tags.join(", ");
+				const tags = place(text(make("TextBox", { BackgroundTransparency: 1, ClearTextOnFocus: false, TextEditable: false }), list, 14));
 				tags.TextWrapped = true;
+				tags.TextTruncate = Enum.TextTruncate.None;
 				tags.Size = UDim2.fromScale(1, 0);
 				tags.AutomaticSize = Enum.AutomaticSize.Y;
+				onMenu(tags, () => openCopyMenu(tags, "Tags", list));
 			}
 		}
 	};
@@ -941,11 +1017,14 @@ export function mountExplorer(parent: GuiObject, deps: ExplorerDeps): () => void
 		choose(id);
 		const actions: [string, () => void, Color3?][] = [
 			["Copy path", () => {
-				const path = pathOf(id);
-				setStatus(path, COLORS.text);
-				status.CaptureFocus();
-				status.SelectionStart = 1;
-				status.CursorPosition = path.size() + 1;
+				const source = slot.frame;
+				go(() => {
+					// Search hits can have ancestors that aren't cached yet: fetch them first.
+					if (!servicePathOf(id)[1]) {
+						for (const row of call("ancestry", { id }) as Row[]) if (!nodes.has(row.id)) nodes.set(row.id, row);
+					}
+					copyFrom(source, servicePathOf(id)[0]);
+				});
 			}],
 			["Highlight", () => showInWorld(id)],
 		];

@@ -4,7 +4,7 @@ import { Trove } from "@rbxts/trove";
 import { $print, $warn } from "rbxts-transform-debug";
 import { startDevtoolsClient } from "../devtools/client";
 import { startDevtoolsServer } from "../devtools/server";
-import type { ClientKernel, ServerKernel } from "../kernel";
+import type { ClientKernel, ServerKernel, SwapOutInfo } from "../kernel";
 import type {
 	BuildInfo,
 	ModuleContext,
@@ -18,6 +18,7 @@ import type {
 } from "../module";
 import { ClientDispatcher, ServerDispatcher, setClientDispatcher, setServerDispatcher } from "../net/runtime";
 import { observePlayers } from "../players";
+import { bindTypeTorch, startedTypeTorch, swapOutTypeTorch, TypeTorch, unbindTypeTorch } from "../typetorch";
 import { persistKeys, RegisteredModule, registered, runningModules } from "./registry";
 
 export interface StartOptions {
@@ -81,9 +82,15 @@ function order(modules: RegisteredModule[]): RegisteredModule[] {
 	return result;
 }
 
-function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, options: StartOptions): () => void {
+/** The generation's stop function. The kernel (0.2.2+) passes what replaces it; older kernels pass nothing. */
+export type StopGeneration = (info?: SwapOutInfo) => void;
+
+function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, options: StartOptions): StopGeneration {
 	const startedAt = os.clock();
 	const root = new Trove();
+	persistKeys.clear();
+	// Before anything else, so module top-level code, devtools and modules can use TypeTorch.
+	bindTypeTorch(realm, kernel, options.build ?? {}, root);
 	const context: ModuleContext = {
 		realm,
 		artifact: kernel.artifact,
@@ -93,9 +100,7 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 		build: options.build ?? {},
 		kernel,
 		persist<T extends object>(key: string, init: () => T): T {
-			const value = kernel.persist(key, init);
-			persistKeys.set(key, value);
-			return value;
+			return TypeTorch.persist(key, init);
 		},
 	};
 
@@ -126,7 +131,6 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 	const ordered = order(registered.filter((mod) => mod.realm === realm));
 	const instances = new Map<object, object>();
 	runningModules.clear();
-	persistKeys.clear();
 
 	const stopModules = () => {
 		for (let index = runningModules.size() - 1; index >= 0; index--) {
@@ -167,6 +171,7 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 	if (!initialized) {
 		stopModules();
 		stopNetwork();
+		unbindTypeTorch();
 		root.destroy();
 		error(`TypeTorch ${realm} failed to start: ${initError}`, 0);
 	}
@@ -186,24 +191,28 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 	}
 
 	onStarted?.();
+	startedTypeTorch();
 
 	$print(
 		`TypeTorch ${realm} started ${runningModules.size()} modules in ${math.floor((os.clock() - startedAt) * 1000)} ms (artifact ${kernel.artifact.id}, generation ${kernel.generation})`,
 	);
 
-	return () => {
+	return (info?: SwapOutInfo) => {
+		// TypeTorch.onSwapOut first, while every module still runs (so they can save into persist).
+		swapOutTypeTorch(info);
 		stopModules();
 		stopNetwork();
+		unbindTypeTorch();
 		root.destroy();
 	};
 }
 
 /** Call from the game's `src/server/boot.ts`: `export function boot(kernel) { return startServer(kernel, {...}) }`. */
-export function startServer(kernel: ServerKernel, options: StartOptions): () => void {
+export function startServer(kernel: ServerKernel, options: StartOptions): StopGeneration {
 	return start("server", kernel, options);
 }
 
 /** Call from the game's `src/client/boot.ts`. */
-export function startClient(kernel: ClientKernel, options: StartOptions): () => void {
+export function startClient(kernel: ClientKernel, options: StartOptions): StopGeneration {
 	return start("client", kernel, options);
 }

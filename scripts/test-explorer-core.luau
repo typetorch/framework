@@ -217,6 +217,12 @@ check("decode bool strict", core.decode("boolean", "yes")[1] == false and core.d
 check("decode color clamps", core.decode("Color3", "300, -5, 128")[2] == roblox.Color3.fromRGB(255, 0, 128))
 check("enumName", core.enumName(roblox.Enum.Material.Neon) == "Material", core.enumName(roblox.Enum.Material.Neon))
 check("luaPath", core.luaPath({ "Workspace", "a b", "x_1" }) == 'game.Workspace["a b"].x_1', core.luaPath({ "Workspace", "a b", "x_1" }))
+check("luaPath keyword", core.luaPath({ "Workspace", "end" }) == 'game.Workspace["end"]', core.luaPath({ "Workspace", "end" }))
+local workspacePath = core.servicePath({ "Workspace", "Map", "Part" }, "Workspace")
+check("servicePath workspace", workspacePath == "workspace.Map.Part", workspacePath)
+local servicePathText = core.servicePath({ "Stuff", "a b" }, "ReplicatedStorage")
+check("servicePath GetService", servicePathText == 'game:GetService("ReplicatedStorage")["a b"]', servicePathText)
+check("servicePath game", core.servicePath({}) == "game")
 check("classInfo fallback", core.classInfo("Part")[1] >= 0 and core.classInfo("NoSuchClass")[2] == 999)
 
 print(`{passed} passed, {failed} failed`)
