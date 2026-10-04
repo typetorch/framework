@@ -1,5 +1,6 @@
 import { $warn } from "rbxts-transform-debug";
 import type { ClientKernel, ServerKernel } from "../kernel";
+import { PacketRecord, PacketTap } from "./inspect";
 import { DEFAULT_LIMITS, RateLimiter, withinShape } from "./limits";
 import type { LeafLimits } from "./types";
 
@@ -36,6 +37,11 @@ function newStats(): LeafStats {
 
 export class ServerDispatcher {
 	readonly stats = new Map<string, LeafStats>();
+	/**
+	 * Packet capture (dev menu Network > Packets, devtools/network-server.ts). Undefined unless a dev is inspecting, so
+	 * an uninspected message costs one nil check. Raw channels are never captured.
+	 */
+	tap: PacketTap | undefined;
 	private readonly listeners = new Map<string, Set<(player: Player, ...args: unknown[]) => void>>();
 	private readonly handlers = new Map<string, (player: Player, ...args: unknown[]) => unknown>();
 	private readonly raw = new Map<string, (player: Player, ...args: unknown[]) => void>();
@@ -82,12 +88,16 @@ export class ServerDispatcher {
 
 	send(player: Player, path: string, args: unknown[], unreliable = false) {
 		this.stat(path).outbound += 1;
+		const tap = this.tap;
+		if (tap) tap.record("out", unreliable ? "unreliable" : "fire", path, args, "ok", undefined, player);
 		if (unreliable) this.kernel.sendUnreliable(player, `e:${path}`, ...args);
 		else this.kernel.send(player, `e:${path}`, ...args);
 	}
 
 	sendAll(path: string, args: unknown[], unreliable = false) {
 		this.stat(path).outbound += 1;
+		const tap = this.tap;
+		if (tap) tap.record("out", unreliable ? "unreliable" : "fire", path, args, "ok", undefined, "all");
 		if (unreliable) this.kernel.broadcastUnreliable(`e:${path}`, ...args);
 		else this.kernel.broadcast(`e:${path}`, ...args);
 	}
@@ -105,8 +115,11 @@ export class ServerDispatcher {
 		if (updated[0] >= KICK_AFTER) player.Kick("Too many requests.");
 	}
 
-	private reply(player: Player, requestId: unknown, ok: boolean, result: unknown) {
-		if (requestId !== undefined) this.kernel.send(player, RESPONSE, requestId, ok, result);
+	private reply(player: Player, path: string, requestId: unknown, ok: boolean, result: unknown) {
+		if (requestId === undefined) return;
+		const tap = this.tap;
+		if (tap) tap.record("out", "response", path, [result], ok ? "ok" : "error", ok ? undefined : tostring(result), player, 10);
+		this.kernel.send(player, RESPONSE, requestId, ok, result);
 	}
 
 	readonly dispatch = (player: Player, channel: string, ...args: unknown[]) => {
@@ -116,9 +129,15 @@ export class ServerDispatcher {
 			else this.strike(player);
 			return;
 		}
+		// Every return below checks the tap once (one nil check per message while nobody inspects).
+		const tap = this.tap;
 		const kind = channel.sub(1, 2);
 		const path = channel.sub(3);
-		if (kind !== "e:" && kind !== "r:") return;
+		if (kind !== "e:" && kind !== "r:") {
+			if (tap) tap.record("in", "fire", channel, args, "rejected", "unknown channel", player);
+			return;
+		}
+		const packetKind = kind === "r:" ? "invoke" : "fire";
 		const stats = this.stat(path);
 
 		let requestId: unknown;
@@ -130,6 +149,7 @@ export class ServerDispatcher {
 			if (!typeIs(requestId, "number")) {
 				stats.rejected += 1;
 				this.strike(player);
+				if (tap) tap.record("in", packetKind, path, args, "rejected", "bad request id", player);
 				return;
 			}
 		}
@@ -138,43 +158,59 @@ export class ServerDispatcher {
 		if (!this.limiter.allow(player, path, limits.rate)) {
 			stats.rejected += 1;
 			this.strike(player);
-			this.reply(player, requestId, false, "Slow down!");
+			if (tap) tap.record("in", packetKind, path, callArgs, "limited", "rate limit", player, 9);
+			this.reply(player, path, requestId, false, "Slow down!");
 			return;
 		}
 		const guard = registeredGuards.get(path);
-		if (!guard || !withinShape(callArgs, limits) || !guard(callArgs)) {
+		const rejection = !guard
+			? "undeclared path"
+			: !withinShape(callArgs, limits)
+				? "shape limits"
+				: !guard(callArgs)
+					? "type guard"
+					: undefined;
+		if (rejection !== undefined) {
 			stats.rejected += 1;
 			this.strike(player);
-			this.reply(player, requestId, false, "Bad request.");
+			if (tap) tap.record("in", packetKind, path, callArgs, "rejected", rejection, player, 9);
+			this.reply(player, path, requestId, false, "Bad request.");
 			return;
 		}
 		stats.inbound += 1;
 
 		if (kind === "e:") {
 			const set = this.listeners.get(path);
+			const heard = set !== undefined && set.size() > 0;
+			const record = tap ? tap.record("in", "fire", path, callArgs, "ok", heard ? undefined : "no listener", player) : undefined;
 			if (!set) return;
 			for (const listener of set) {
 				const [ok, err] = pcall(listener, player, ...callArgs);
 				if (!ok) {
 					stats.errors += 1;
+					if (record) PacketTap.outcome(record, "error", err);
 					$warn(`[net] ${path} listener threw: ${err}`);
 				}
 			}
 			return;
 		}
 		const handler = this.handlers.get(path);
+		const record = tap
+			? tap.record("in", "invoke", path, callArgs, handler ? "ok" : "rejected", handler ? undefined : "no handler", player, 9)
+			: undefined;
 		if (!handler) {
-			this.reply(player, requestId, false, "Not available.");
+			this.reply(player, path, requestId, false, "Not available.");
 			return;
 		}
 		const [ok, result] = pcall(handler, player, ...callArgs);
 		if (!ok) {
 			stats.errors += 1;
+			if (record) PacketTap.outcome(record, "error", result);
 			$warn(`[net] ${path} handler threw: ${result}`);
-			this.reply(player, requestId, false, "Something went wrong, try again.");
+			this.reply(player, path, requestId, false, "Something went wrong, try again.");
 			return;
 		}
-		this.reply(player, requestId, true, result);
+		this.reply(player, path, requestId, true, result);
 	};
 }
 
@@ -182,10 +218,20 @@ interface Pending {
 	resolve: (value: unknown) => void;
 	reject: (reason: unknown) => void;
 	timeout: thread;
+	/** The leaf, so a captured response shows it. */
+	path: string;
 }
+
+/** What a blocked invoke rejects with (dev menu Network > Packets > Block). */
+const BLOCKED = "Blocked in the dev menu.";
 
 export class ClientDispatcher {
 	readonly stats = new Map<string, LeafStats>();
+	/**
+	 * Packet capture and dev blocks (dev menu Network > Packets, devtools/network-inspector.ts). Set only while the
+	 * inspector is open, so an uninspected message costs one nil check. Raw channels are never captured.
+	 */
+	tap: PacketTap | undefined;
 	private readonly listeners = new Map<string, Set<Listener>>();
 	private readonly raw = new Map<string, Listener>();
 	private readonly pending = new Map<number, Pending>();
@@ -222,6 +268,15 @@ export class ClientDispatcher {
 	}
 
 	fire(path: string, args: unknown[], unreliable = false) {
+		const tap = this.tap;
+		if (tap) {
+			const kind = unreliable ? "unreliable" : "fire";
+			if (tap.blocked.has(path)) {
+				tap.record("out", kind, path, args, "blocked");
+				return;
+			}
+			tap.record("out", kind, path, args);
+		}
 		this.stat(path).outbound += 1;
 		if (unreliable) this.kernel.sendUnreliable(`e:${path}`, ...args);
 		else this.kernel.send(`e:${path}`, ...args);
@@ -233,20 +288,34 @@ export class ClientDispatcher {
 				reject("This version of the game is shutting down.");
 				return;
 			}
+			const tap = this.tap;
+			if (tap) {
+				if (tap.blocked.has(path)) {
+					tap.record("out", "invoke", path, args, "blocked");
+					reject(BLOCKED);
+					return;
+				}
+				tap.record("out", "invoke", path, args, "ok", undefined, undefined, 9);
+			}
 			const id = this.nextId++;
 			const timeout = task.delay(REQUEST_TIMEOUT, () => {
 				if (this.pending.delete(id)) reject("The server didn't answer in time.");
 			});
-			this.pending.set(id, { resolve, reject, timeout });
+			this.pending.set(id, { resolve, reject, timeout, path });
 			this.stat(path).outbound += 1;
 			this.kernel.send(`r:${path}`, id, ...args);
 		});
 	}
 
 	readonly dispatch = (channel: string, ...args: unknown[]) => {
+		const tap = this.tap;
 		if (channel === RESPONSE) {
 			const [id, ok, result] = args as [number, boolean, unknown];
 			const pending = this.pending.get(id);
+			if (tap) {
+				const status = ok === true ? "ok" : "error";
+				tap.record("in", "response", pending ? pending.path : "(late response)", [result], status, ok === true ? undefined : tostring(result), undefined, 10);
+			}
 			if (!pending) return;
 			this.pending.delete(id);
 			task.cancel(pending.timeout);
@@ -263,11 +332,21 @@ export class ClientDispatcher {
 		const path = channel.sub(3);
 		this.stat(path).inbound += 1;
 		const set = this.listeners.get(path);
+		let record: PacketRecord | undefined;
+		if (tap) {
+			if (tap.blocked.has(path)) {
+				tap.record("in", "fire", path, args, "blocked");
+				return;
+			}
+			const heard = set !== undefined && set.size() > 0;
+			record = tap.record("in", "fire", path, args, "ok", heard ? undefined : "no listener");
+		}
 		if (!set) return;
 		for (const listener of set) {
 			const [ok, err] = pcall(listener, ...args);
 			if (!ok) {
 				this.stat(path).errors += 1;
+				if (record) PacketTap.outcome(record, "error", err);
 				$warn(`[net] ${path} listener threw: ${err}`);
 			}
 		}

@@ -6,6 +6,7 @@ import type { ServerDispatcher } from "../net/runtime";
 import { runningModules } from "../runtime/registry";
 import { registerRemoteClaude } from "./claude";
 import { registerExplorerOps } from "./explorer-server";
+import { registerNetworkOps } from "./network-server";
 import { registerAdminOps } from "./admin-server";
 import { listChildren, listProperties, resolvePath, setProperty } from "./dex";
 import {
@@ -230,6 +231,8 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 			ops.set(op, handler);
 		}, kernel),
 	);
+	// Network inspector ops (net.packets/packet/stop): packet capture while a dev watches.
+	registerNetworkOps(kernel, dispatcher, trove, ops);
 	// Admin ops (admin.players/tp/bring/respawn/kick/ban/unban/history/servers/join/newServer/shutdown).
 	registerAdminOps((op, handler) => {
 		ops.set(op, handler);
