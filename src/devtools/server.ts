@@ -5,6 +5,7 @@ import type { ServerKernel } from "../kernel";
 import type { ServerDispatcher } from "../net/runtime";
 import { runningModules } from "../runtime/registry";
 import { registerRemoteClaude } from "./claude";
+import { registerExplorerOps } from "./explorer-server";
 import { listChildren, listProperties, resolvePath, setProperty } from "./dex";
 import {
 	DEV_REQUEST,
@@ -206,6 +207,12 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 	});
 	// Claude prompt (plans/11): claude.session / claude.prompt / claude.status / claude.cancel.
 	registerRemoteClaude(kernel, trove, ops);
+	// Explorer ops (explorer.children/props/set/attr/rename/destroy/find/ancestry/instance).
+	trove.add(
+		registerExplorerOps((op, handler) => {
+			ops.set(op, handler);
+		}, kernel),
+	);
 
 	const reply = (player: Player, id: unknown, ok: boolean, result: unknown) => kernel.send(player, DEV_RESPONSE, id, ok, result);
 

@@ -15,7 +15,7 @@ import type {
 import type { ClientDispatcher, LeafStats } from "../net/runtime";
 import { runningModules } from "../runtime/registry";
 import { bump, popIn, popOut } from "../ui";
-import { listChildren, listProperties, resolvePath, setProperty } from "./dex";
+import { ExplorerPersist, mountExplorer } from "./explorer";
 import {
 	ClaudePromptRequest,
 	ClaudeRequestView,
@@ -629,193 +629,38 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		every(tabTrove, REFRESH, fetch);
 	};
 
-	let dexRealm: "client" | "server" = "client";
-	let dexPath = new Array<string>();
-	let dexQuery = "";
-	const renderDex = ({ page, trove: tabTrove, toolbar }: TabContext) => {
-		// Sticky toolbar: [up] [Client] [Server] [search...] [Refresh]
-		const bar = toolbar();
-		const pathLabel = page.text("", COLORS.dim, true);
-		const note = page.text("", COLORS.dim);
-		const childrenList = page.group(4);
-		const body = page.group(4);
-		let epoch = 0;
-		let children = new Array<DexNode>();
-
-		const canEdit = () => dexRealm === "client" || kernel.channel === "dev";
-		const setNote = (text: string, color = COLORS.dim) => {
-			note.Text = text;
-			note.TextColor3 = color;
-			note.Visible = text !== "";
-		};
-		setNote("");
-
-		const realmButtons = new Map<string, TextButton>();
-		const highlight = () => {
-			for (const [realm, button] of realmButtons) paintSelected(button, realm === dexRealm);
-		};
-
-		let load: () => void;
-		let search: TextBox;
-		const navigate = (path: string[]) => {
-			dexPath = path;
-			dexQuery = "";
-			search.Text = "";
-			setNote("");
-			load();
-		};
-
-		/** Children filtered by the search box (name or class, case-insensitive). */
-		const drawChildren = () => {
-			childrenList.clear();
-			const query = (dexQuery.lower().match("^%s*(.-)%s*$")[0] as string | undefined) ?? "";
-			const shown =
-				query === ""
-					? children
-					: children.filter(
-							(node) =>
-								node.name.lower().find(query, 1, true)[0] !== undefined ||
-								node.className.lower().find(query, 1, true)[0] !== undefined,
-						);
-			childrenList.section(
-				query === "" ? `Children (${children.size()})` : `Children (${shown.size()} of ${children.size()})`,
-			);
-			for (const node of shown) {
-				const count = node.children > 0 ? ` (${node.children})` : "";
-				childrenList.link(`${node.name}   ${node.className}${count}`, () => navigate([...dexPath, node.name]));
-			}
-		};
-
-		const draw = (properties: DexProperty[]) => {
-			drawChildren();
-			body.clear();
-			body.section("Properties");
-			const editable = canEdit();
-			for (const property of properties) {
-				const kind = property.kind;
-				if (editable && (kind === "string" || kind === "number" || kind === "boolean")) {
-					body.editable(property.name, property.value, (text) => spawnIn(tabTrove, () => edit(property.name, text)));
-				} else {
-					body.field(property.name, property.value);
-				}
-			}
-			if (editable && dexPath.size() >= 2) {
-				const actions = body.buttons();
-				let armed = false;
-				const destroyButton = addButton(
-					actions,
-					"Delete",
-					() => {
-						if (!armed) {
-							armed = true;
-							destroyButton.Text = "Confirm delete";
-							return;
-						}
-						spawnIn(tabTrove, destroy);
-					},
-					COLORS.bad,
-				);
-			}
-		};
-
-		const edit = (name: string, text: string) => {
-			if (dexRealm === "client") {
-				const instance = resolvePath(dexPath);
-				if (!instance) return setNote("Not found", COLORS.bad);
-				const [ok, err] = setProperty(instance, name, text);
-				setNote(ok ? `Set ${name}` : `Failed: ${err}`, ok ? COLORS.good : COLORS.bad);
-			} else {
-				const [ok, reply] = call("dex.set", { path: [...dexPath], name, value: text });
-				setNote(ok ? `Set ${name}` : `Failed: ${str(reply)}`, ok ? COLORS.good : COLORS.bad);
-			}
-			load();
-		};
-
-		const destroy = () => {
-			const path = [...dexPath];
-			let ok: boolean;
-			let reply: unknown;
-			if (dexRealm === "client") {
-				const instance = resolvePath(path);
-				[ok, reply] = instance ? pcall(() => instance.Destroy()) : [false, "not found"];
-			} else {
-				[ok, reply] = call("dex.destroy", path);
-			}
-			if (!ok) return setNote(`Failed: ${str(reply)}`, COLORS.bad);
-			path.pop();
-			navigate(path);
-			setNote("Deleted", COLORS.good);
-		};
-
-		const clearLists = () => {
-			children = [];
-			childrenList.clear();
-			body.clear();
-		};
-
-		load = () => {
-			epoch += 1;
-			const myEpoch = epoch;
-			const realm = dexRealm;
-			const path = [...dexPath];
-			pathLabel.Text = ["game", ...path].join(" / ");
-			spawnIn(tabTrove, () => {
-				let properties: DexProperty[];
-				if (realm === "client") {
-					const instance = resolvePath(path);
-					if (!instance) {
-						setNote("Not found", COLORS.bad);
-						clearLists();
-						return;
-					}
-					children = listChildren(instance);
-					properties = listProperties(instance);
-				} else {
-					const [childrenOk, childrenReply] = call("dex.children", path);
-					if (myEpoch !== epoch) return;
-					if (!childrenOk) {
-						setNote(`Failed: ${str(childrenReply)}`, COLORS.bad);
-						clearLists();
-						return;
-					}
-					const [propertiesOk, propertiesReply] = call("dex.props", path);
-					if (myEpoch !== epoch) return;
-					children = childrenReply as DexNode[];
-					properties = propertiesOk ? (propertiesReply as DexProperty[]) : [];
-				}
-				draw(properties);
-			});
-		};
-
-		const selectRealm = (realm: "client" | "server") => {
-			if (realm !== dexRealm) {
-				dexPath = [];
-				dexQuery = "";
-				search.Text = "";
-			}
-			dexRealm = realm;
-			highlight();
-			setNote("");
-			load();
-		};
-		upButton(bar, () => {
-			if (dexPath.size() === 0) return;
-			const path = [...dexPath];
-			path.pop();
-			navigate(path);
+	// Dex = the explorer (devtools/explorer). dexSelection feeds the Claude tab's "Dex path" context.
+	let dexSelection: string | undefined;
+	const explorerState = kernel.persist("typetorch/explorer", (): ExplorerPersist => ({}));
+	const renderDex = ({ trove: tabTrove, content }: TabContext) => {
+		// The explorer scrolls by itself (virtualized tree), so it takes the content's place for this tab.
+		const host = tabTrove.add(
+			make("Frame", { Name: "Explorer", BackgroundTransparency: 1, Size: UDim2.fromScale(1, 1), LayoutOrder: 3 }),
+		);
+		make("UIFlexItem", { FlexMode: Enum.UIFlexMode.Fill }, host);
+		pad(host, 8, 10);
+		host.Parent = content.Parent;
+		content.Visible = false;
+		tabTrove.add(() => {
+			content.Visible = true;
 		});
-		realmButtons.set("client", addButton(bar, "Client", () => selectRealm("client")));
-		realmButtons.set("server", addButton(bar, "Server", () => selectRealm("server")));
-		search = searchBox(bar, "Search");
-		search.Text = dexQuery;
-		tabTrove.connect(search.GetPropertyChangedSignal("Text"), () => {
-			if (search.Text === dexQuery) return;
-			dexQuery = search.Text;
-			drawChildren();
-		});
-		addButton(bar, "Refresh", () => load());
-		highlight();
-		load();
+		tabTrove.add(
+			mountExplorer(host, {
+				request: (op, payload) =>
+					new Promise((resolve, reject) => {
+						// Promise executors run in their own thread, so the yielding call() is fine here.
+						const [ok, result] = call(op, payload);
+						if (ok) resolve(result);
+						else reject(result);
+					}),
+				canEdit: (realm) => realm === "client" || kernel.channel === "dev",
+				trove: tabTrove,
+				persist: explorerState,
+				onSelect: (realm, path) => {
+					dexSelection = path !== undefined ? `${realm} ${path}` : undefined;
+				},
+			}),
+		);
 	};
 
 	const netHistory = new Map<string, [number, number, number]>();
@@ -1341,7 +1186,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			if (prompt === "") return showResult(claudeError("empty"), COLORS.warn);
 			showResult("Sending...", COLORS.dim);
 			const request: ClaudePromptRequest = { prompt: prompt.sub(1, 4000), errors: attachErrors };
-			if (attachPath) request.path = `${dexRealm} ${["game", ...dexPath].join("/")}`;
+			if (attachPath && dexSelection !== undefined) request.path = dexSelection;
 			if (attachErrors) request.clientErrors = lastClientErrors();
 			const [ok, reply] = call("claude.prompt", request);
 			const answer = (typeIs(reply, "table") ? reply : {}) as ClaudeReply;
