@@ -1635,11 +1635,16 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		let color = DIMMER;
 		const pending = message.state === "proposed" && (proposal === undefined || proposal.status === "pending");
 		if (pending) text = `Deploy within ${math.max(1, math.ceil((expiresAt - os.time()) / 60))} min, or it is discarded`;
-		else if (message.state === "building") text = "Deploying...";
+		else if (message.state === "building" && proposal?.status === "awaiting_approval") {
+			// Built and uploaded; the dev approves it on their PC (typetorch approve <id>).
+			text = `Waiting for approval on your PC${proposal.approvalId !== undefined ? `  (${proposal.approvalId})` : ""}`;
+		} else if (message.state === "building") text = "Deploying...";
 		else if (message.state === "deployed") {
 			text = `Deployed${message.artifactId !== undefined ? ` ${message.artifactId}` : ""}`;
 			color = COLORS.good;
 		} else if (message.state === "discarded") text = proposal?.status === "expired" ? "Expired after 15 min: discarded" : "Discarded";
+		else if (message.state === "failed" && proposal?.status === "rejected") text = "Rejected on your PC: not deployed";
+		else if (message.state === "failed" && proposal?.status === "approval_expired") text = "Approval expired after 24 h: not deployed";
 		else if (message.state === "failed") {
 			text = errorText(proposal?.error ?? message.error ?? "deploy failed");
 			color = COLORS.bad;
@@ -1944,8 +1949,8 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 
 	/** The end of a message: dots while it runs, one short line when it finished with something to say. */
 	const paintOutcome = (message: Message) => {
-		// A proposal waits for the dev, not for Claude: no dots then.
-		message.dots.Visible = !message.finished && message.state !== "proposed";
+		// A proposal (or an approval on the dev PC) waits for the dev, not for Claude: no dots then.
+		message.dots.Visible = !message.finished && message.state !== "proposed" && message.proposal?.status !== "awaiting_approval";
 		paintProposal(message);
 		const hasCard = proposalCard(message) !== undefined;
 		const copy = copyButtons.get(message.id);

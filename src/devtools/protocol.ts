@@ -176,9 +176,14 @@ export interface ClaudeFileChange {
 	removed: number;
 }
 
-/** A code change waiting for (or past) the requesting dev's Deploy / Discard. */
+/**
+ * A code change waiting for (or past) the requesting dev's Deploy / Discard. After Deploy, "awaiting_approval" while the
+ * deploy waits for `typetorch approve <approvalId>` on the dev's PC; then "deployed", "rejected" or "approval_expired".
+ */
 export interface ClaudeProposal {
-	status: "pending" | "deploying" | "deployed" | "discarded" | "expired" | "failed";
+	status: "pending" | "deploying" | "awaiting_approval" | "deployed" | "discarded" | "expired" | "rejected" | "approval_expired" | "failed";
+	/** The dev machine's short proposal id (8 hex) while it waits for approval. */
+	approvalId?: string;
 	commit: string;
 	/** Unix seconds. */
 	expiresAt: number;

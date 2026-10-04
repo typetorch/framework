@@ -121,7 +121,7 @@ const PAIR_MAX = 5;
 const PAIR_WINDOW = 60;
 const FINISHED_STATES = new Set(["deployed", "discarded", "answered", "failed", "cancelled", "lost"]);
 const EVENT_KINDS = new Set<string>(["assistant_text", "tool_use", "tool_result", "status", "error", "deploy_proposal", "image", "toolbox_results"]);
-const PROPOSAL_STATUSES = new Set<string>(["pending", "deploying", "deployed", "discarded", "expired", "failed"]);
+const PROPOSAL_STATUSES = new Set<string>(["pending", "deploying", "awaiting_approval", "deployed", "discarded", "expired", "rejected", "approval_expired", "failed"]);
 const MAX_PROPOSAL_FILES = 50;
 /** Session ids remembered with their URL (a sid is bound to the first URL heard for it). */
 const MAX_BOUND_SIDS = 50;
@@ -308,8 +308,10 @@ function cleanProposal(raw: unknown): ClaudeProposal | undefined {
 	if (!typeIs(status, "string") || !PROPOSAL_STATUSES.has(status) || !typeIs(commit, "string") || !matches(commit, "^%x+$") || expiresAt === undefined) {
 		return undefined;
 	}
+	const approvalId = data.approvalId;
 	return {
 		status: status as ClaudeProposal["status"],
+		approvalId: typeIs(approvalId, "string") && approvalId.size() === 8 && matches(approvalId, "^%x+$") ? approvalId : undefined,
 		commit: commit.sub(1, 40),
 		expiresAt,
 		files: cleanFiles(data.files) ?? [],
