@@ -1,5 +1,5 @@
 /**
- * Admin > Servers' server list (framework 0.2.1, user decision): a MessagingService roll call, no MemoryStore.
+ * Admin > Servers' server list (framework 0.3.0, user decision): a MessagingService roll call, no MemoryStore.
  *
  * - A dev opens the list: this server subscribes to its own reply topic `TypeTorch/rollcall/<its JobId>`, publishes one
  *   ask `{ q, j = its JobId, t }` on `TypeTorch/rollcall`, collects replies for COLLECT_SECONDS and caches the list for

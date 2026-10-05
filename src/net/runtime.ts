@@ -10,10 +10,10 @@ import type { LeafLimits } from "./types";
  *   event    client <-> server   channel "e:<path>", args...
  *   request  client  -> server   channel "r:<path>", requestId, args...
  *   response server  -> client   channel "__tt/res", requestId, ok, result
- *   hello    client  -> server   channel "__tt/hello" (0.2.1: this client's generation runs and listens)
+ *   hello    client  -> server   channel "__tt/hello" (0.3.0: this client's generation runs and listens)
  * Raw channels (devtools) are registered by exact name.
  *
- * 0.2.1 (plans/12 P-N1): a client drops server messages tagged with another generation than its own, so the server
+ * 0.3.0 (plans/12 P-N1): a client drops server messages tagged with another generation than its own, so the server
  * queues reliable sends to a player until that player's client generation says hello (at most QUEUE_MAX messages, at
  * most HELLO_TIMEOUT seconds; unreliable ones are dropped meanwhile). After a swap, or for a player who just joined,
  * nothing the new server generation sends early is lost. On the client, a resync from the kernel (0.3.2: the server

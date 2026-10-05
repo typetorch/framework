@@ -24,11 +24,11 @@ import { RollCall } from "./roll-call";
  * "TypeTorch" under `mod/<yyyy-mm-dd>/<job>/<n>` (unique keys, SetAsync, no contention; `<job>` is the JobId without
  * dashes cut to 24 characters, because DataStore keys max out at 50).
  *
- * Server list (0.2.1, user decision: no MemoryStore): a MessagingService roll call (devtools/roll-call.ts). When a dev
+ * Server list (0.3.0, user decision: no MemoryStore): a MessagingService roll call (devtools/roll-call.ts). When a dev
  * opens the list, this server asks every server on `TypeTorch/rollcall` and collects their rows for 3 s on its own reply
  * topic; the list is cached 15 s. Each server answers with the kernel's `fleetStatus()` (kernel 0.3.2+; t, b, c, a,
  * n, m, s, u, p, k?, x?, v, q, g, h, e?, sv) or the admin fields on older kernels, and stays silent while it shuts down or
- * migrates. Nothing is written anywhere: the list is live, and servers on frameworks before 0.2.1 don't show up.
+ * migrates. Nothing is written anywhere: the list is live, and servers on frameworks before 0.3.0 don't show up.
  *
  * Migrate (`admin.migrate`, see the Migrate section): everyone moves to one new reserved server on this branch (and
  * pin), which starts on the newest place version, so a server on an old kernel gets the new one. Admins on public
