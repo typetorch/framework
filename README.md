@@ -106,6 +106,9 @@ export class CoinService extends Module implements OnStart {
   behind. `TypeTorch.persist(key, init)` (or `this.ctx.persist`) keeps plain data across swaps.
 - **Network:** `createNetwork<C2S, S2C>()` with nested namespaces. The server checks rate limits, shape limits and the
   generated type guard on every client message. `setNetworkLimits({ "chat.say": { maxString: 200 } })` tunes a leaf.
+  Across a swap (0.2.1): what the server sends a player waits until that player's client runs the new generation
+  (reliable messages are queued, unreliable ones dropped), and on kernel 0.3.2 a request the server can no longer
+  answer fails at once ("The game is updating, try again.") instead of timing out.
 - **Macros:** `Modding` (from this package) declares compile-time macros that `@typetorch/transformer` fills in:
   `/** @metadata macro */ export function guardOf<T>(guard?: Modding.Generic<T, "guard">) { return guard!; }` makes
   `guardOf<Shape>()` compile to a `t` guard. `Modding.Generic<T, "id" | "text">`, `Many`, `Caller` and `TupleLabels`
