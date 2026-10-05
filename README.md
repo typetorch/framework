@@ -181,6 +181,20 @@ const shop = TypeTorch.asset("ui/shop");
 - **Edit mode** (UI Labs stories, no kernel): `running` is false, identity has defaults, `persist` keeps a local table,
   events never fire, and the server-only reads throw.
 
+## Player data
+
+Saving player data is game code: pick any library (ProfileStore, DataStore2, your own). TypeTorch only gives you the
+pieces that keep it safe across swaps:
+
+- **The library lives in the place**, outside the payload, and a small place Script requires it first. Its open
+  sessions, autosave loop and shutdown hook then survive every swap (a swap stops the generation's scripts).
+- **Session handles live in `persist`**, keyed by `UserId`. `onPlayerAdded` replays everyone after a swap, so it
+  re-attaches to the open session instead of loading again.
+- **Release only on `Players.PlayerRemoving`**, never in `onStop` or `onSwapOut`.
+- **Split store names by channel** (`TypeTorch.channel === "prod" ? "PlayerData" : "PlayerData_dev"`).
+
+Full example with ProfileStore: [Player data guide](https://github.com/typetorch/docs/blob/main/guides/player-data.md).
+
 ## Hot assets: `hotAsset`
 
 Builders mark models and UI templates in the place with the attribute `TypeTorchAsset` (a key such as `"ui/shop"`),
