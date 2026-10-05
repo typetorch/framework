@@ -99,8 +99,8 @@ export function signingIssues(status: KernelStatus): HealthIssue[] {
  * Kernel 0.3.2 (plans/12 P-F1, P-O1, P-K7): the health window, the kernel's heartbeat and deploy reports, and client
  * generation reports.
  * - a health-window rollback in the last 15 min: error; errors after the window (degraded): warn;
- * - no deploy reports: info on kernels before 0.3.2 (live servers only), warn when the place doesn't map the kernel's
- *   Reports module; heartbeat or report writes failing: warn;
+ * - no deploy reports: info on kernels before 0.3.2 (live servers only); the kernel's own fleet API sender failing
+ *   (the `TypeTorchFleet` setting), invalid, or its module not mapped in the place: warn;
  * - clients whose generation failed to start: warn.
  */
 export function deployIssues(status: KernelStatus): HealthIssue[] {
@@ -112,20 +112,18 @@ export function deployIssues(status: KernelStatus): HealthIssue[] {
 	} else if (health?.state === "degraded" && health.errors > 0) {
 		issues.push({ level: "warn", title: `Errors ${health.errors}`, detail: health.lastError ?? "-" });
 	}
-	const heartbeat = status.heartbeat;
-	if (heartbeat === undefined) {
+	if (status.reports === undefined) {
 		if (status.serverType !== "studio" && versionLess(status.kernelVersion, REPORTS_KERNEL)) {
 			issues.push({ level: "info", title: "No deploy reports", detail: `Needs kernel ${REPORTS_KERNEL}.` });
 		}
-	} else if (heartbeat.missing === true) {
-		issues.push({ level: "warn", title: "No deploy reports", detail: "Map the kernel's Reports module." });
-	} else if (heartbeat.enabled) {
-		if (heartbeat.heartbeat?.failing === true) {
-			issues.push({ level: "warn", title: "Heartbeat failing", detail: heartbeat.heartbeat.lastError ?? "-" });
-		}
-		if (heartbeat.reports?.failing === true) {
-			issues.push({ level: "warn", title: "Reports failing", detail: heartbeat.reports.lastError ?? "-" });
-		}
+	}
+	const fleet = status.fleet;
+	if (fleet?.missing === true) {
+		issues.push({ level: "warn", title: "No fleet API", detail: "Map the kernel's Fleet module." });
+	} else if (fleet?.settings === "invalid") {
+		issues.push({ level: "warn", title: "Fleet settings", detail: fleet.settingsError ?? "TypeTorchFleet is invalid." });
+	} else if (fleet?.enabled === true && fleet.lastErrorAt !== undefined && (fleet.lastOkAt === undefined || fleet.lastErrorAt > fleet.lastOkAt)) {
+		issues.push({ level: "warn", title: "Fleet API failing", detail: fleet.lastError ?? "-" });
 	}
 	const clients = status.clients;
 	if (clients !== undefined && clients.failed > 0) {

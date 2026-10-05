@@ -364,28 +364,80 @@ export interface FailedArtifact {
 	at: number;
 }
 
-/** Kernel 0.3.2+: counters of the kernel's MemoryStore writes (heartbeat or reports). */
-export interface WriteStats {
-	writes: number;
-	failures: number;
-	/** Writes given up after their retries. */
-	dropped: number;
+/**
+ * Kernel 0.3.2+ `fleetStatus()`: this server's heartbeat (plans/01 "Fleet status and deploy reports"). The kernel
+ * writes it nowhere; the analytics engine sends it, the Admin > Servers roll call answers with it, and with the
+ * `TypeTorchFleet` setting the kernel posts it to the fleet API itself (without `k`).
+ */
+export interface FleetStatus {
+	/** Server type. */
+	t: ServerType;
+	/** Branch. */
+	b?: string;
+	/** Effective channel (no generation: absent). */
+	c?: Channel;
+	/** Artifact id (no generation: absent). */
+	a?: string;
+	/** Players, max players. */
+	n: number;
+	m: number;
+	/** Server start, now (unix seconds). */
+	s: number;
+	u: number;
+	/** Place id. */
+	p: number;
+	/** A reserved server's access code: server-only, never send it to a client. */
+	k?: string;
+	/** 1 during an A/B experiment. */
+	x?: number;
+	/** Kernel version. */
+	v: string;
+	/** Applied deploy seq. */
+	q: number;
+	/** Generation number (0: none). */
+	g: number;
+	h: HealthState;
+	/** The last error (<= 200 bytes), while recent or unhealthy. */
+	e?: string;
+	sv: 2;
+}
+
+/** Kernel 0.3.2+: one deploy outcome on one server (`onDeployReport`). */
+export interface DeployReport {
+	/** Seq, branch, artifact id, JobId. */
+	s: number;
+	b: string;
+	a: string;
+	j: string;
+	r: "swapped" | "failed" | "rolled_back" | "skipped" | "booted";
+	/** Error (<= 300 bytes). */
+	e?: string;
+	/** Seconds the swap took. */
+	d?: number;
+	/** Unix seconds, generation number, kernel version, players. */
+	t: number;
+	g: number;
+	k: string;
+	p: number;
+}
+
+/** Kernel 0.3.2+ `status().fleet`: the kernel's own fleet API sender (never the token). */
+export interface FleetSenderInfo {
+	enabled: boolean;
+	/** "unknown" (not read yet), "absent", "ok", "invalid"; absent: the place doesn't map the kernel's Fleet module. */
+	settings?: "unknown" | "absent" | "ok" | "invalid";
+	settingsError?: string;
+	missing?: boolean;
+	host?: string;
+	queued?: number;
+	sent?: number;
+	failed?: number;
+	dropped?: number;
+	alerts?: number;
 	lastOkAt?: number;
 	lastError?: string;
 	lastErrorAt?: number;
-	/** The last write failed. */
-	failing: boolean;
-}
-
-/** Kernel 0.3.2+ `heartbeat()` and `status().heartbeat`: the kernel writes the server list and deploy reports. */
-export interface HeartbeatInfo {
-	/** False in Studio (no JobId), or when the place doesn't map the kernel's Reports module (`missing`). */
-	enabled: boolean;
-	missing?: boolean;
-	map?: string;
-	reportsMap?: string;
-	heartbeat?: WriteStats;
-	reports?: WriteStats;
+	lastStatus?: number;
 }
 
 /** Kernel 0.3.2+ `status().clients`: what clients reported about their generation start (P-K7). */
@@ -465,8 +517,10 @@ export interface KernelStatus {
 	health?: HealthInfo;
 	/** Kernel 0.3.2+: artifacts that failed on this server, newest first. */
 	failed?: FailedArtifact[];
-	/** Kernel 0.3.2+: the kernel's heartbeat and deploy report writes. */
-	heartbeat?: HeartbeatInfo;
+	/** Kernel 0.3.2+: deploy reports given out (`deployReports()` has the last 20). */
+	reports?: { total: number; kept: number; listeners: number };
+	/** Kernel 0.3.2+: the kernel's own fleet API sender (the `TypeTorchFleet` setting). */
+	fleet?: FleetSenderInfo;
 	/** Kernel 0.3.2+: client generation reports. */
 	clients?: ClientsSummary;
 }
@@ -550,8 +604,16 @@ export interface ServerKernel {
 	reportError?(info: ReportedError): boolean;
 	/** One handler per generation, run from the kernel's BindToClose (server shutdown), for at most 20 s. */
 	onClose?(handler: () => void): void;
-	/** The kernel writes the server list (TypeTorchServers) and deploy reports; the framework then doesn't. */
-	heartbeat?(): HeartbeatInfo;
+	/** This server's fleet status (cheap, no yield). `fleetStatus` doubles as the 0.3.2 fleet feature test. */
+	fleetStatus?(): FleetStatus;
+	/**
+	 * fn(report) once per deploy outcome on this server; the last 20 are replayed at once (the boot report comes before
+	 * any generation can listen). Each call runs on a kernel thread; the listener goes when this generation stops.
+	 * Returns a disconnect function.
+	 */
+	onDeployReport?(handler: (report: DeployReport) => void): () => void;
+	/** The last 20 deploy reports, oldest first. */
+	deployReports?(): DeployReport[];
 	/** A reserved server's own access code (server-only data: never send it to a client). */
 	accessCode?(): string | undefined;
 }

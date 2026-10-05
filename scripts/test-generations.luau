@@ -20,6 +20,7 @@
 -- Instance emulator for the payload tree, and inert stand-ins for services and datatypes Lune lacks.
 
 local fs = require("@lune/fs")
+local serde = require("@lune/serde")
 local luau = require("@lune/luau")
 local process = require("@lune/process")
 local roblox = require("@lune/roblox")
@@ -622,7 +623,7 @@ do
 	check("lifecycle: a report the kernel refuses is raised in the module's thread", ok and #errors == 1, errors[1])
 end
 
--- Health lines (kernel 0.3.2, devtools/health.ts) and the single heartbeat writer (devtools/admin-server.ts).
+-- Health lines (kernel 0.3.2, devtools/health.ts) and the fleet-status feature test (devtools/admin-server.ts).
 do
 	local model = convert(roblox.deserializeModel(bytes)[1], nil)
 	inner[model].Name = "payload#health"
@@ -650,19 +651,24 @@ do
 	check("health: a 0.3.1 server: Kernel update (warn) and No deploy reports (info)", old["Kernel update"] == "warn" and old["No deploy reports"] == "info")
 	local studio = titles(with({ kernelVersion = "0.3.1", serverType = "studio" }))
 	check("health: no report line in Studio", studio["No deploy reports"] == nil)
-	local ok = titles(with({ heartbeat = { enabled = true, heartbeat = { failing = false }, reports = { failing = false } }, health = { state = "ok", errors = 0 } }))
+	local ok = titles(with({ reports = { total = 1, kept = 1, listeners = 1 }, fleet = { enabled = true, settings = "ok", lastOkAt = 10 }, health = { state = "ok", errors = 0 } }))
 	check("health: a healthy 0.3.2 server has no deploy issue", next(ok) == nil, next(ok))
-	local missing = titles(with({ heartbeat = { enabled = false, missing = true } }))
-	check("health: Reports module not mapped: warn", missing["No deploy reports"] == "warn")
-	local failing = titles(with({ heartbeat = { enabled = true, heartbeat = { failing = true, lastError = "throttled" }, reports = { failing = true, lastError = "throttled" } } }))
-	check("health: failing heartbeat and report writes: warn", failing["Heartbeat failing"] == "warn" and failing["Reports failing"] == "warn")
-	local rolled = titles(with({ heartbeat = { enabled = true }, health = { state = "degraded", errors = 0, lastRollback = { from = "g-1", why = "3 errors", at = os.time() } } }))
+	local missing = titles(with({ reports = { total = 0, kept = 0, listeners = 0 }, fleet = { enabled = false, missing = true } }))
+	check("health: the kernel's Fleet module not mapped: warn", missing["No fleet API"] == "warn")
+	local invalid = titles(with({ reports = { total = 0, kept = 0, listeners = 0 }, fleet = { enabled = false, settings = "invalid", settingsError = "url must be https://host[/path]" } }))
+	check("health: invalid TypeTorchFleet: warn", invalid["Fleet settings"] == "warn")
+	local failing = titles(with({ reports = { total = 0, kept = 0, listeners = 0 }, fleet = { enabled = true, settings = "ok", lastOkAt = 5, lastErrorAt = 10, lastError = "HTTP 503" } }))
+	local recovered = titles(with({ reports = { total = 0, kept = 0, listeners = 0 }, fleet = { enabled = true, settings = "ok", lastOkAt = 12, lastErrorAt = 10, lastError = "HTTP 503" } }))
+	check("health: the fleet API failing (and not after it recovered): warn", failing["Fleet API failing"] == "warn" and recovered["Fleet API failing"] == nil)
+	local absent = titles(with({ reports = { total = 0, kept = 0, listeners = 0 }, fleet = { enabled = false, settings = "absent" } }))
+	check("health: no TypeTorchFleet setting: no line", next(absent) == nil, next(absent))
+	local rolled = titles(with({ reports = { total = 1, kept = 1, listeners = 1 }, health = { state = "degraded", errors = 0, lastRollback = { from = "g-1", why = "3 errors", at = os.time() } } }))
 	check("health: a recent health-window rollback: error", rolled["Failed health check"] == "error")
-	local degraded = titles(with({ heartbeat = { enabled = true }, health = { state = "degraded", errors = 4, lastError = "boom" } }))
+	local degraded = titles(with({ reports = { total = 1, kept = 1, listeners = 1 }, health = { state = "degraded", errors = 4, lastError = "boom" } }))
 	check("health: errors after the window: warn", degraded["Errors 4"] == "warn")
-	local clients = titles(with({ heartbeat = { enabled = true }, clients = { players = 3, reported = 3, ok = 2, failed = 1, behind = 1, failures = 1, lastFailure = { userId = 1, generation = "x#1", error = "boom", at = 0 } } }))
+	local clients = titles(with({ reports = { total = 1, kept = 1, listeners = 1 }, clients = { players = 3, reported = 3, ok = 2, failed = 1, behind = 1, failures = 1, lastFailure = { userId = 1, generation = "x#1", error = "boom", at = 0 } } }))
 	check("health: a client's failed generation: warn", clients["Clients failed 1"] == "warn")
-	check("admin: kernel 0.3.2 owns the heartbeat (feature-detected)", admin.kernelOwnsHeartbeat({ heartbeat = function() end }) == true and admin.kernelOwnsHeartbeat({}) == false)
+	check("admin: kernel 0.3.2 fleetStatus is feature-detected", admin.kernelHasFleetStatus({ fleetStatus = function() end }) == true and admin.kernelHasFleetStatus({}) == false)
 end
 
 -- Networking across a swap (0.2.1, plans/12 P-N1): the server queues reliable sends per player until that client's
@@ -734,6 +740,121 @@ do
 	local later = client:invoke("shop.buy", { "axe" })
 	later:catch(function() end)
 	check("net: and every new request until the swap", later:getStatus() == "Rejected" and #clientSent == 2)
+end
+
+-- Admin > Servers' roll call (0.2.1, devtools/roll-call.ts) over a fake MessagingService: three servers, an injected
+-- clock, waits 20x shorter.
+do
+	local model = convert(roblox.deserializeModel(bytes)[1], nil)
+	inner[model].Name = "payload#rollcall"
+	local TS = requireModule(model.include.RuntimeLib)
+	local frameworkOut = model.include.node_modules["@typetorch"].framework.out
+	local module = TS.import(model.Server, frameworkOut, "devtools", "roll-call")
+	local topics, published = {}, {}
+	local clock = 100
+	local function bus(jobId: string, entry)
+		return {
+			jobId = jobId,
+			subscribe = function(topic, handler)
+				topics[topic] = topics[topic] or {}
+				local holder = { handler = handler }
+				table.insert(topics[topic], holder)
+				return {
+					Disconnect = function()
+						local index = table.find(topics[topic], holder)
+						if index then
+							table.remove(topics[topic], index)
+						end
+					end,
+				}
+			end,
+			publish = function(topic, data)
+				table.insert(published, { topic = topic, data = data, from = jobId })
+				for _, holder in table.clone(topics[topic] or {}) do
+					task.defer(holder.handler, data)
+				end
+			end,
+			entry = entry,
+			encode = function(value)
+				return serde.encode("json", value)
+			end,
+			decode = function(text)
+				return serde.decode("json", text)
+			end,
+			clock = function()
+				return clock
+			end,
+			unixMs = function()
+				return 1759580000000 + clock * 1000
+			end,
+			wait = function(seconds)
+				task.wait(seconds / 20)
+			end,
+			spawn = function(callback)
+				task.spawn(callback)
+			end,
+			random = math.random,
+			warn = function() end,
+		}
+	end
+	local silent = false
+	local servers = {
+		a = module.RollCall.new(bus("job-a", function()
+			return { t = "public", b = "prod", a = "art-a", n = 1, m = 10, h = "ok", sv = 2 }
+		end)),
+		b = module.RollCall.new(bus("job-b", function()
+			return { t = "reserved", b = "dev", a = "art-b", n = 2, m = 10, h = "degraded", k = "access-code-b", sv = 2 }
+		end)),
+		c = module.RollCall.new(bus("job-c", function()
+			if silent then
+				return nil
+			end
+			return { t = "public", b = "prod", a = "art-c", n = 3, m = 10, h = "failed", e = string.rep("x", 2000), k = string.rep("k", 40), sv = 2 }
+		end)),
+	}
+	for _, server in servers do
+		server:listen()
+	end
+	task.wait(0.05)
+	local list = servers.a:ask()
+	local byKey = {}
+	for _, row in list.rows do
+		byKey[row.key] = row.value
+	end
+	check("roll call: every other server answers with its row", #list.rows == 2 and byKey["job-b"] ~= nil and byKey["job-c"] ~= nil and byKey["job-a"] == nil and list.error == nil, #list.rows)
+	check("roll call: rows carry the fleet status (h, k)", byKey["job-b"].h == "degraded" and byKey["job-b"].k == "access-code-b" and byKey["job-c"].h == "failed")
+	check("roll call: a row too big for one message drops e (and keeps what fits)", byKey["job-c"].e == nil and byKey["job-c"].k ~= nil and byKey["job-c"].a == "art-c")
+	local replyTopicsOk = true
+	for _, message in published do
+		if message.topic ~= module.ROLL_CALL_TOPIC then
+			replyTopicsOk = replyTopicsOk and message.topic == module.replyTopic("job-a") and #message.data <= module.MAX_REPLY_BYTES
+		end
+	end
+	check("roll call: replies go to the asker's own topic, each under 1 KiB", replyTopicsOk)
+	local count = #published
+	local again = servers.a:ask()
+	check("roll call: cached for 15 s (no new messages)", #published == count and #again.rows == 2)
+	clock += module.CACHE_SECONDS + 1
+	silent = true
+	local third = servers.a:ask()
+	check("roll call: a silent server (shutting down) doesn't show; a new roll after the cache", #third.rows == 1 and third.rows[1].key == "job-b" and #published > count)
+	-- Rate limits and stale asks: B answers A at most once per REPLY_GAP seconds, and never to an old ask.
+	local before = servers.b.counters.answered
+	servers.b:onAsk(serde.encode("json", { q = 1, j = "job-a", t = 1759580000000 + clock * 1000 }))
+	local limited = servers.b.counters.limited
+	servers.b:onAsk(serde.encode("json", { q = 2, j = "job-z", t = 1759580000000 + (clock - 120) * 1000 }))
+	servers.b:onAsk("not json")
+	task.wait(0.1)
+	check("roll call: one reply per asker per 5 s; stale and malformed asks are ignored", servers.b.counters.answered == before and limited >= 1 and servers.b.counters.ignored >= 2)
+	local studio = module.RollCall.new(bus("", function()
+		return {}
+	end))
+	local count2 = #published
+	local studioList = studio:ask()
+	check("roll call: Studio (no JobId) asks nobody", #studioList.rows == 0 and #published == count2)
+	for _, server in servers do
+		server:stop()
+	end
 end
 
 print(if failed == 0 then `test-generations: all {passed} checks passed` else `test-generations: {failed} of {passed + failed} checks failed`)

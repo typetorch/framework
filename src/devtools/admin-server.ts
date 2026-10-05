@@ -1,10 +1,11 @@
-import { DataStoreService, HttpService, MemoryStoreService, MessagingService, Players, TeleportService, TextService } from "@rbxts/services";
+import { DataStoreService, HttpService, MessagingService, Players, TeleportService, TextService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
 import type { Channel, NewServerReport, ServerKernel, ServerType } from "../kernel";
 import { RateLimiter } from "../net/limits";
 import { AB_KERNEL, AbReply, kernelHasExperiments, NEEDS_KERNEL_AB, PIN_JOBS_PER_MESSAGE, PIN_TOPIC, PinMessage } from "./ab";
 import { versionLess } from "./health";
+import { RollCall } from "./roll-call";
 
 /**
  * Server half of the dev menu's Admin tab (plans/10, "Admin"): players (teleport to, bring, respawn, kick, ban),
@@ -23,14 +24,11 @@ import { versionLess } from "./health";
  * "TypeTorch" under `mod/<yyyy-mm-dd>/<job>/<n>` (unique keys, SetAsync, no contention; `<job>` is the JobId without
  * dashes cut to 24 characters, because DataStore keys max out at 50).
  *
- * Server list: a MemoryStore SortedMap "TypeTorchServers" (key = JobId, a ~200-byte value, TTL 150 s). Kernel 0.3.2+
- * writes it itself (one writer per server, also while no generation runs; `kernel.heartbeat`, feature-detected) and
- * adds q (applied seq), g (generation), h (health), e (last error) and sv = 2; this file then only reads it. On older
- * kernels every server writes its own entry here about every 60 s plus up to 10 s of jitter while it has players,
- * removes it when the last player leaves, on shut down, and on BindToClose (bound once per server). A swap leaves it
- * alone: the next generation rewrites it within seconds. Reads happen only when a dev opens the list: one GetRangeAsync
- * (up to 200 servers), cached 15 s, single-flight. Quota use stays around 1 write per server per minute plus a few
- * reads.
+ * Server list (0.2.1, user decision: no MemoryStore): a MessagingService roll call (devtools/roll-call.ts). When a dev
+ * opens the list, this server asks every server on `TypeTorch/rollcall` and collects their rows for 3 s on its own reply
+ * topic; the list is cached 15 s. Each server answers with the kernel's `fleetStatus()` (kernel 0.3.2+; t, b, c, a,
+ * n, m, s, u, p, k?, x?, v, q, g, h, e?, sv) or the admin fields on older kernels, and stays silent while it shuts down or
+ * migrates. Nothing is written anywhere: the list is live, and servers on frameworks before 0.2.1 don't show up.
  *
  * Migrate (`admin.migrate`, see the Migrate section): everyone moves to one new reserved server on this branch (and
  * pin), which starts on the newest place version, so a server on an old kernel gets the new one. Admins on public
@@ -131,13 +129,6 @@ const BAN_PRESETS = new Map<string, number>([
 	["perm", -1],
 ]);
 
-const SERVER_MAP = "TypeTorchServers";
-const SERVER_TTL = 150;
-const HEARTBEAT = 60;
-const HEARTBEAT_JITTER = 10;
-const LIST_CACHE = 15;
-const LIST_ERROR_CACHE = 5;
-const LIST_MAX = 200;
 const MOD_STORE = "TypeTorch";
 const REASON_MAX = 200;
 const PERSIST_KEY = "typetorch/admin";
@@ -160,15 +151,13 @@ const BUCKETS: Record<"mod" | "move" | "read" | "history" | "ab", [number, numbe
 };
 /** Most JobIds one admin.ab request may name. */
 const AB_MAX_JOBS = 200;
-/** Seconds after an A/B request before the server list is read again (the pinned servers rewrite their entries). */
+/** Seconds after an A/B request before the roll is called again (the pinned servers swap meanwhile). */
 const AB_REFRESH = 10;
 
 /** Survives swaps (kernel persist store): plain data only. */
 interface AdminPersist {
 	/** Durable record counter for this server (unique `mod/...` keys across generations). */
 	modSeq: number;
-	/** BindToClose is bound once per server, not once per generation. */
-	closeBound: boolean;
 	/** Set once this server started migrating (one migration per server); the next generation finishes it. */
 	migration?: MigrationState;
 	/** A reserved server's own access code from its `private/<id>` record ("" = looked, none). Server memory only. */
@@ -185,7 +174,7 @@ interface MigrationState {
 	by: number;
 }
 
-/** The MemoryStore value (short keys: it is read by every dev who opens the list). `k` never leaves the server. */
+/** One server's row (short keys: one MessagingService message each). `k` never leaves the server. */
 interface StoredServer {
 	/** server type */
 	t?: unknown;
@@ -211,7 +200,7 @@ interface StoredServer {
 	x?: unknown;
 	/** kernel version */
 	v?: unknown;
-	/** Kernel 0.3.2+ (the kernel writes the entry): applied seq, generation number, health, last error, schema 2. */
+	/** Kernel 0.3.2+ (`fleetStatus()`): applied seq, generation number, health, last error, schema 2. */
 	q?: unknown;
 	g?: unknown;
 	h?: unknown;
@@ -219,9 +208,9 @@ interface StoredServer {
 	sv?: unknown;
 }
 
-/** Kernel 0.3.2+ writes the server list itself (kernel.heartbeat), so the framework doesn't. */
-export function kernelOwnsHeartbeat(kernel: ServerKernel): boolean {
-	return typeIs((kernel as unknown as Record<string, unknown>).heartbeat, "function");
+/** Kernel 0.3.2+: `fleetStatus()` is this server's row (the roll call answers with it). */
+export function kernelHasFleetStatus(kernel: ServerKernel): boolean {
+	return typeIs((kernel as unknown as Record<string, unknown>).fleetStatus, "function");
 }
 
 interface ListCache {
@@ -298,7 +287,7 @@ export function registerAdminOps(
 	kernel: ServerKernel,
 	trove: Trove,
 ) {
-	const saved = kernel.persist<AdminPersist>(PERSIST_KEY, () => ({ modSeq: 0, closeBound: false }));
+	const saved = kernel.persist<AdminPersist>(PERSIST_KEY, () => ({ modSeq: 0 }));
 	const limiter = new RateLimiter();
 	trove.connect(Players.PlayerRemoving, (player) => limiter.forget(player));
 
@@ -547,16 +536,12 @@ export function registerAdminOps(
 
 	// Servers ---------------------------------------------------------------------------------------------------------
 
-	const map = MemoryStoreService.GetSortedMap(SERVER_MAP);
-	// Kernel 0.3.2+ is the only writer of this server's entry; older kernels: this generation writes it.
-	const canPublish = game.JobId !== "" && kernel.serverType !== "studio" && !kernelOwnsHeartbeat(kernel);
 	let startedAt = os.time();
 	{
 		const [ok, status] = pcall(() => kernel.status());
 		if (ok && typeIs(status, "table") && typeIs(status.startedAt, "number")) startedAt = status.startedAt;
 	}
 	let shuttingDown = false;
-	let lastWrite = -math.huge;
 
 	/** A reserved server's own access code, when the kernel exposes it (kernel need: see plans/10, Admin). */
 	const accessCode = (): string | undefined => {
@@ -595,6 +580,11 @@ export function registerAdminOps(
 	};
 
 	const ownEntry = (): StoredServer => {
+		// Kernel 0.3.2+: the kernel's own row (it also has q, g, h, e).
+		if (kernelHasFleetStatus(kernel)) {
+			const [ok, status] = pcall(() => (kernel as unknown as { fleetStatus(): StoredServer }).fleetStatus());
+			if (ok && typeIs(status, "table")) return { ...status };
+		}
 		const health = healthNow();
 		return {
 			t: kernel.serverType,
@@ -614,74 +604,36 @@ export function registerAdminOps(
 		};
 	};
 
-	const publish = () => {
-		if (!canPublish || shuttingDown || saved.migration || Players.GetPlayers().size() === 0) return;
-		lastWrite = os.clock();
-		const [ok, err] = pcall(() => map.SetAsync(game.JobId, ownEntry(), SERVER_TTL));
-		if (!ok) $warn(`[admin] server list write failed: ${err}`);
-	};
-	const unpublish = () => {
-		if (!canPublish) return;
-		// The next player to join publishes right away.
-		lastWrite = -math.huge;
-		const [ok, err] = pcall(() => map.RemoveAsync(game.JobId));
-		if (!ok) $warn(`[admin] server list remove failed: ${err}`);
-	};
+	// The roll call: this server answers others (silent while it shuts down or migrates) and asks when a dev opens the
+	// list. Studio (no JobId) lists only itself.
+	const rollCall = new RollCall({
+		jobId: game.JobId,
+		subscribe: (topic, handler) => MessagingService.SubscribeAsync(topic, (message) => handler(message.Data)),
+		publish: (topic, data) => MessagingService.PublishAsync(topic, data),
+		entry: () => (shuttingDown || saved.migration ? undefined : (ownEntry() as Record<string, unknown>)),
+		encode: (value) => HttpService.JSONEncode(value),
+		decode: (value) => HttpService.JSONDecode(value),
+		clock: () => os.clock(),
+		unixMs: () => DateTime.now().UnixTimestampMillis,
+		wait: (seconds) => task.wait(seconds),
+		spawn: (callback) => {
+			trove.add(task.spawn(callback));
+		},
+		random: () => math.random(),
+		warn: (message) => $warn(message),
+	});
+	if (kernel.serverType !== "studio") rollCall.listen();
+	trove.add(() => rollCall.stop());
 
-	if (canPublish) {
-		trove.add(
-			task.spawn(() => {
-				task.wait(2 + math.random() * 6);
-				while (true) {
-					publish();
-					task.wait(HEARTBEAT + math.random() * HEARTBEAT_JITTER);
-				}
-			}),
-		);
-		// First player after an empty stretch: show up now, not at the next heartbeat.
-		trove.connect(Players.PlayerAdded, () => {
-			if (os.clock() - lastWrite > HEARTBEAT) trove.add(task.spawn(publish));
-		});
-		// The last player leaving: the server is about to close (an empty server writes nothing).
-		trove.connect(Players.PlayerRemoving, (leaving) => {
-			if (Players.GetPlayers().filter((other) => other !== leaving).size() === 0) task.spawn(unpublish);
-		});
-		// Real shutdown. Bound once per server (BindToClose can't be unbound, so not once per generation); the
-		// closure holds only the map name and the JobId. If it never runs, the 150 s TTL removes the entry.
-		if (!saved.closeBound) {
-			saved.closeBound = true;
-			const jobId = game.JobId;
-			game.BindToClose(() => {
-				pcall(() => MemoryStoreService.GetSortedMap(SERVER_MAP).RemoveAsync(jobId));
-			});
-		}
-	}
-
-	let cache: ListCache | undefined;
-	let waiting: thread[] | undefined;
-	/** The universe's server list: cached 15 s (errors 5 s), one MemoryStore read at a time (single-flight). */
+	/** The universe's servers (not this one): a roll call, cached 15 s (errors 5 s), one at a time. */
 	const readServers = (): ListCache => {
-		if (cache && os.clock() - cache.at < (cache.error !== undefined ? LIST_ERROR_CACHE : LIST_CACHE)) return cache;
-		if (waiting) {
-			waiting.push(coroutine.running());
-			coroutine.yield();
-			return cache ?? { at: os.clock(), rows: [], truncated: false, error: "no_reply" };
-		}
-		const mine = new Array<thread>();
-		waiting = mine;
-		const [ok, result] = pcall(() => map.GetRangeAsync(Enum.SortDirection.Ascending, LIST_MAX));
-		if (ok) {
-			const rows = new Array<{ key: string; value: StoredServer }>();
-			for (const item of result) {
-				if (typeIs(item.key, "string") && typeIs(item.value, "table")) rows.push({ key: item.key, value: item.value as StoredServer });
-			}
-			cache = { at: os.clock(), rows, truncated: result.size() >= LIST_MAX };
-		} else {
-			cache = { at: os.clock(), rows: [], truncated: false, error: tostring(result) };
-		}
-		waiting = undefined;
-		for (const thread of mine) if (coroutine.status(thread) === "suspended") task.spawn(thread);
-		return cache;
+		const list = rollCall.ask();
+		return {
+			at: list.at,
+			rows: list.rows.map((row) => ({ key: row.key, value: row.value as StoredServer })),
+			truncated: list.truncated,
+			error: list.error,
+		};
 	};
 
 	const rowOf = (jobId: string, value: StoredServer, now: number, here: boolean): AdminServer => {
@@ -833,10 +785,10 @@ export function registerAdminOps(
 			messages,
 			failed,
 		});
-		// The pinned servers rewrite their list entries within seconds of their swap: read the list again then.
+		// The pinned servers swap within seconds: call the roll again then.
 		trove.add(
 			task.delay(AB_REFRESH, () => {
-				cache = undefined;
+				rollCall.invalidate();
 			}),
 		);
 		if (failed === messages) error("publish_failed", 0);
@@ -886,7 +838,6 @@ export function registerAdminOps(
 		shuttingDown = true;
 		const count = Players.GetPlayers().size();
 		record(actor, "shutdown", undefined, undefined, "", { players: count });
-		task.spawn(unpublish);
 		// A moment for the reply to reach the dev, then everyone goes (the server closes once empty).
 		task.delay(1, () => {
 			for (const other of Players.GetPlayers()) other.Kick(SHUTDOWN_MESSAGE);
@@ -1039,7 +990,6 @@ export function registerAdminOps(
 		reserving = false;
 		const count = Players.GetPlayers().size();
 		record(actor, "migrate", undefined, undefined, "", { to: privateServerId, branch, pinned: pin !== undefined, players: count });
-		task.spawn(unpublish);
 		// A moment for the reply to reach the dev first.
 		trove.add(task.delay(1, moveEveryone));
 		return { ok: true, players: count };

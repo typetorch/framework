@@ -33,6 +33,11 @@ import {
 
 /** Seconds AssetSync may hold a generation's start. Loads still running then keep going and swap in when they finish. */
 export const ASSET_SYNC_TIMEOUT = 8;
+/**
+ * The same on a server's FIRST generation with kernel 0.3.2+ (`kernel.start.kind` = "boot"): the kernel gives a booting
+ * generation about 6 s to call ready (its 15 s boot budget), so the place's own copies serve until the loads land.
+ */
+export const ASSET_SYNC_BOOT_TIMEOUT = 3;
 /** The JSON attribute the CLI stamps (plans/13 "In the artifact"). */
 const MANIFEST_ATTRIBUTE = "Assets";
 const MAX_UNMANAGED = 50;
@@ -348,7 +353,7 @@ function run(kernel: ServerKernel, deadline: number, ownEpoch: number, threads: 
 		if (load.status.source !== "loading") continue;
 		report.timedOut = true;
 		load.fail("timed out");
-		$warn(`hot asset ${load.status.key}: still loading after ${ASSET_SYNC_TIMEOUT} s; the old copy stays until it finishes`);
+		$warn(`hot asset ${load.status.key}: still loading; the old copy stays until it finishes`);
 	}
 	report.unmanaged = unmanagedKeys();
 }
@@ -372,7 +377,9 @@ export function syncHotAssets(kernel: ServerKernel, trove: Trove) {
 	setManifest(undefined);
 	report = emptyReport();
 	report.running = true;
-	const [ok, err] = pcall(() => run(kernel, started + ASSET_SYNC_TIMEOUT, ownEpoch, threads));
+	const booting = kernel.start?.kind === "boot" && typeIs((kernel as unknown as Record<string, unknown>).fleetStatus, "function");
+	const hold = booting ? ASSET_SYNC_BOOT_TIMEOUT : ASSET_SYNC_TIMEOUT;
+	const [ok, err] = pcall(() => run(kernel, started + hold, ownEpoch, threads));
 	if (!ok) {
 		report.errors.push(`AssetSync failed: ${shortError(err)}`);
 		$warn(`AssetSync failed: ${err}`);
