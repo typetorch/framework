@@ -38,15 +38,17 @@ const MANIFEST_ATTRIBUTE = "Assets";
 const MAX_UNMANAGED = 50;
 const MAX_REPORTED = 300;
 
+// Declared before its first use: roblox-ts hoists function declarations only as a `local`, assigned where the
+// declaration stands, so a top-level call above it would call nil when the module loads.
+function emptyReport(): AssetSyncReport {
+	return { manifest: "none", errors: [], running: false, entries: [], unmanaged: [] };
+}
+
 let report: AssetSyncReport = emptyReport();
 const entryByKey = new Map<string, AssetEntry>();
 const keyById = new Map<number, string>();
 /** Bumped by every sync and when its generation stops: a load that finishes for an older one never applies. */
 let epoch = 0;
-
-function emptyReport(): AssetSyncReport {
-	return { manifest: "none", errors: [], running: false, entries: [], unmanaged: [] };
-}
 
 function shortError(err: unknown): string {
 	const text = tostring(err);
