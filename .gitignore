@@ -7,3 +7,5 @@ out/
 .env.*
 # private working notes (kept locally, never pushed)
 CHANGELOG.md
+# Roblox client textures repacked for uploads (Roblox content; kept locally, never published)
+/assets/

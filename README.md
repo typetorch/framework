@@ -10,13 +10,62 @@ code. It needs the TypeTorch kernel in the place (`@typetorch/kernel`), which ca
 ## Install
 
 ```sh
-bun add @typetorch/framework @flamework/core
-bun add -d rbxts-transformer-flamework
+npm i @typetorch/framework
+npm i -D @typetorch/transformer
 ```
 
-`tsconfig.json` needs `node_modules/@typetorch` and `node_modules/@flamework` in `typeRoots`, and the transformers in
-this order: `rbxts-transform-debug`, then `rbxts-transformer-flamework` (it generates the network guards and the
-constructor dependency ids). The starter game (`typetorch init`, or the `template` repo) has it all set up.
+(`bun add @typetorch/framework` and `bun add -d @typetorch/transformer` work the same.) The framework is a roblox-ts 3
+package; `@typetorch/transformer` is its compiler plugin: it generates the network guards, the constructor dependency
+ids of `@Service` / `@Controller` and your own macros. Nothing from Flamework is needed: `Modding`, `Reflect` and `t`
+come from this package. The starter game (`typetorch init`, or the `template` repo) has it all set up.
+
+`tsconfig.json`:
+
+```jsonc
+{
+	"compilerOptions": {
+		"experimentalDecorators": true,
+		// Every npm scope the game imports from must be a type root (roblox-ts rule).
+		"typeRoots": ["node_modules/@rbxts", "node_modules/@typetorch"],
+		"types": ["types", "compiler-types"],
+		"plugins": [
+			// Optional, first when present: $print/$warn with file and line (what every TypeTorch repo uses).
+			{ "transform": "rbxts-transform-debug", "environmentRequires": {} },
+			{ "transform": "@typetorch/transformer" }
+		]
+	}
+}
+```
+
+The payload is a Rojo `Model` project. Map only this package from the `@typetorch` scope (the transformer is Node code
+and the kernel lives in the place):
+
+```json
+"include": {
+	"$path": "include",
+	"node_modules": {
+		"$className": "Folder",
+		"@rbxts": { "$path": "node_modules/@rbxts" },
+		"@typetorch": { "$className": "Folder", "framework": { "$path": "node_modules/@typetorch/framework" } }
+	}
+}
+```
+
+Each generation requires its own copy of the payload, so the framework and its `Reflect` registry start fresh on every
+swap. It needs the TypeTorch kernel in the place (`@typetorch/kernel`).
+
+### Coming from Flamework
+
+Game code only changes imports: `@Service`, `@Controller`, constructor injection, the lifecycle interfaces and
+`createNetwork` are the same.
+
+| Flamework | TypeTorch |
+|---|---|
+| `rbxts-transformer-flamework` plugin, `node_modules/@flamework` type root | `@typetorch/transformer` plugin, `node_modules/@typetorch` type root |
+| `import { Modding, Reflect } from "@flamework/core"` | `import { Modding, Reflect } from "@typetorch/framework"` |
+| `import { t } from "@rbxts/t"` (still fine) | also `import { t } from "@typetorch/framework"` |
+| `@metadata flamework:parameters` keys, `"flamework:parameters"` metadata | `@metadata typetorch:parameters`, `"typetorch:parameters"` |
+| `flamework.build`, `include/flamework`, the `@flamework` Rojo mapping | gone; delete them |
 
 ## Usage
 
@@ -53,6 +102,10 @@ export class CoinService extends Module implements OnStart {
   behind. `TypeTorch.persist(key, init)` (or `this.ctx.persist`) keeps plain data across swaps.
 - **Network:** `createNetwork<C2S, S2C>()` with nested namespaces. The server checks rate limits, shape limits and the
   generated type guard on every client message. `setNetworkLimits({ "chat.say": { maxString: 200 } })` tunes a leaf.
+- **Macros:** `Modding` (from this package) declares compile-time macros that `@typetorch/transformer` fills in:
+  `/** @metadata macro */ export function guardOf<T>(guard?: Modding.Generic<T, "guard">) { return guard!; }` makes
+  `guardOf<Shape>()` compile to a `t` guard. `Modding.Generic<T, "id" | "text">`, `Many`, `Caller` and `TupleLabels`
+  work the same way; see the transformer's README.
 - **UI:** `observeElement(trove, tag, (instance, elementTrove) => ...)`, `isRealFrame`, `popIn` / `popOut` / `bump`
   (UIScale, never Size tweens) and `PopupQueue` (one modal at a time).
 - **Dev menu:** devs (Studio, project members, dev badge) get a DEV button, `Ctrl+Shift+D` and `/tt dev`: artifact,
@@ -183,8 +236,18 @@ bun install
 bun run build   # rbxtsc --type package -> out/
 ```
 
-- **Explorer class icons:** `assets/class-icons.png` is the client's `content/textures/ClassImages.PNG` (a 2352x16
-  strip) repacked into a 32-column grid, because live clients downscale textures wider than 1024 px:
+- **Runtime of the transformer:** `src/reflection/` (`Reflect`, `Modding`, `t`) is a copy of
+  `@typetorch/transformer`'s `runtime-kit/`; keep the two identical.
+- **Tests (Lune, offline):** `scripts/test-*.luau`; each file's header has its command (Lune is pinned in the
+  kernel's and the template's `rokit.toml`). `scripts/test-generations.luau` takes a game's built payload:
+  `cd ../template && bun run payload && lune run ../framework/scripts/test-generations.luau build/payload.rbxm` boots
+  two generations in one VM and checks fresh registries, DI and generated guards.
+- **Publishing:** `npm publish` runs `prepublishOnly` (clean + build). The package ships only `out/` (no
+  `.tsbuildinfo`), `README.md` and `LICENSE`; check with `bun pm pack --dry-run`.
+
+- **Explorer class icons:** `assets/class-icons.png` (kept locally, not in the repo: it is Roblox's own texture) is
+  the client's `content/textures/ClassImages.PNG` (a 2352x16 strip) repacked into a 32-column grid, because live
+  clients downscale textures wider than 1024 px:
   `ffmpeg -i ClassImages.PNG -vf "untile=147x1,tile=32x5:color=0x00000000" class-icons.png`. It is uploaded as image
   `rbxassetid://97389585475400`; `scripts/gen-explorer-icons.ts` generates the index table.
 
