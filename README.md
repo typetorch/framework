@@ -17,7 +17,8 @@ npm i -D @typetorch/transformer
 (`bun add @typetorch/framework` and `bun add -d @typetorch/transformer` work the same.) The framework is a roblox-ts 3
 package; `@typetorch/transformer` is its compiler plugin: it generates the network guards, the constructor dependency
 ids of `@Service` / `@Controller` and your own macros. Nothing from Flamework is needed: `Modding`, `Reflect` and `t`
-come from this package. The starter game (`typetorch init`, or the `template` repo) has it all set up.
+come from this package. The starter game ([template](https://github.com/typetorch/template)) has it all set up: clone
+it and run `bun install`.
 
 `tsconfig.json`:
 
