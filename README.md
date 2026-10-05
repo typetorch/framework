@@ -115,7 +115,7 @@ export class CoinService extends Module implements OnStart {
   Overview, State and Assets (hot assets), each with a Server | Client toolbar. In the Dex,
   right-click or long-press a property for Copy value / Copy name and a tree row for Copy path (Roblox has no
   clipboard, so copying opens a small popup with the text selected: Ctrl+C, or long-press > Copy on touch).
-- **Remote Claude** (dev-channel servers only): while `typetorch remote-claude` runs on a dev's machine, allowlisted
+- **Remote Claude** (dev-channel servers only): while `typetorch remote-claude` (`@typetorch/dev-server`) runs on a dev's machine, allowlisted
   devs prompt Claude Code from the Claude tab. Each dev pairs once by pasting the pairing code printed by
   typetorch-dev-server; the game server keeps the session URL and the tokens in memory and never sends them to clients.
   No Roblox secret is needed.
