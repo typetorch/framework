@@ -79,7 +79,7 @@ function cleanLogs(value: unknown): LogEntry[] | undefined {
 }
 
 /** Seconds between two swaps (reload, switch, rollback, pin) of one server through the dev menu. */
-const SWAP_INTERVAL = 10;
+const SWAP_INTERVAL = 2;
 /** The kernel registry DataStore (kernel Constants.DATASTORE), read for a reserved server's creator. */
 const REGISTRY_STORE = "TypeTorch";
 
@@ -128,7 +128,7 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 		if (kind === "reserved") return reservedCreator() === player.UserId;
 		return false;
 	};
-	/** At most one swap per server every 10 s, counted before the kernel call (a swap stops this generation). */
+	/** At most one swap per server every 2 s, counted before the kernel call (a swap stops this generation). */
 	const takeSwap = () => {
 		const now = os.clock();
 		const last = guard.lastSwap;
