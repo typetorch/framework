@@ -99,6 +99,9 @@ export class CoinService extends Module implements OnStart {
 - **Modules:** `@Service()` (server) and `@Controller()` (client) classes extending `Module`. Constructor parameters
   are other modules, injected by type. Lifecycle: `OnInit` (sequential, dependencies first), `OnStart` (spawned),
   `OnStop` (reverse order), `OnTick`, `OnPhysics`, `OnRender`, `OnPlayerAdded` (replays players already in the server).
+- **Bad deploys roll back (kernel 0.3.2):** a server `onStart` that throws is reported to the kernel, which rolls the
+  server back to its last known good artifact when it happens within 30 s of start (so do 3 errors from the new
+  code's scripts in that time). On a real shutdown every module's `onStop` runs too (the kernel's BindToClose).
 - **Troves:** every module gets `this.trove`; everything it creates or connects goes there, so a swap leaves nothing
   behind. `TypeTorch.persist(key, init)` (or `this.ctx.persist`) keeps plain data across swaps.
 - **Network:** `createNetwork<C2S, S2C>()` with nested namespaces. The server checks rate limits, shape limits and the
@@ -174,7 +177,7 @@ const shop = TypeTorch.asset("ui/shop");
   generation created: they keep the old generation's code alive or are destroyed by its trove. Version the key when
   the shape changes. Keys starting with `__` are reserved.
 - **`onSwapOut`** runs synchronously before every module's `onStop`, so modules can still save into `persist`. It
-  doesn't run on server shutdown (use `game.BindToClose`).
+  doesn't run on server shutdown (kernel 0.3.2 runs `onStop` then; on older kernels use `game.BindToClose`).
 - **Kernel versions:** `TypeTorch.features` says what the running kernel supports. Kernel 0.2.2 adds the start
   reason and timings, the next artifact in `onSwapOut`, `onUpdatePending`, server-side `onPlayerDevChanged` and
   `requestReload`. On older kernels `startInfo` still knows boot vs swap, the previous artifact and branch (the
@@ -256,7 +259,10 @@ bun run build   # rbxtsc --type package -> out/
 - **Tests (Lune, offline):** `scripts/test-*.luau`; each file's header has its command (Lune is pinned in the
   kernel's and the template's `rokit.toml`). `scripts/test-generations.luau` takes a game's built payload:
   `cd ../template && bun run payload && lune run ../framework/scripts/test-generations.luau build/payload.rbxm` boots
-  two generations in one VM and checks fresh registries, DI and generated guards.
+  two generations in one VM and checks fresh registries, DI and generated guards, then runs the real `startServer`
+  with stub kernels (onStart failures reported to kernel 0.3.2, raised on older ones; onClose) and the health lines.
+  To test framework changes before the template takes them, build the payload from a copy of the template whose
+  `node_modules/@typetorch/framework/out` is this repo's `out/`.
 - **Publishing:** `npm publish` runs `prepublishOnly` (clean + build). The package ships only `out/` (no
   `.tsbuildinfo`), `README.md` and `LICENSE`; check with `bun pm pack --dry-run`.
 
