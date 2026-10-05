@@ -12,20 +12,39 @@ import type {
 	AdminServersReply,
 	AdminYou,
 } from "./admin-server";
-import type { AbReply, AbRequest } from "./ab";
+import { jobBucket, type AbReply, type AbRequest } from "./ab";
+import {
+	buildBadge,
+	buildDetail,
+	buildName,
+	buildTitle,
+	loadButtonLabel,
+	loadProgress,
+	loadSummary,
+	overrideOffered,
+	requestOverride,
+	type LoadTarget,
+	type LoadWhere,
+} from "./build-actions";
+import { secondsSince } from "./health";
 import {
 	addButton,
+	armLock,
 	BUTTON_HEIGHT,
+	chip,
+	chipRow,
 	COLORS,
 	corner,
 	escapeRich,
 	hex,
 	make,
+	newArmState,
 	pad,
 	Page,
 	paintSelected,
 	scrolling,
 	searchBox,
+	shortDuration,
 	spacer,
 	style,
 	tag,
@@ -39,10 +58,11 @@ import {
  *    opens a small menu: Teleport to, Bring, Respawn, Kick, Ban. Kick and Ban open a card (reason; Ban adds a duration
  *    and "ban alts"); their button arms "Confirm" on the first tap.
  *  - Servers: the universe's live servers (short JobId, copyable by focusing it; type, branch, channel, artifact,
- *    players, uptime, an A/B tag) with Join, plus New server and, for admins, Shut down (a card, then an armed
- *    button). A summary line per artifact says how many servers (and players) run it. A/B (owner/admin, kernel
- *    0.2.3): checkboxes pick servers (this one too); "Load artifact..." pins the picked servers, or a random percent of
- *    one branch, to a known artifact as an experiment, and "Unpin" ends experiments (admin.ab, devtools/ab.ts).
+ *    players, uptime; tags are chips that wrap) with Join, plus New server and, for admins, Shut down (a card, then an
+ *    armed button). A summary line per artifact says how many servers (and players) run it. "Load a build..." (owner/
+ *    admin) runs a known build on this server (in place, kernel 0.3.3 owner override), on the ticked servers or on a
+ *    share of one branch's servers (A/B pins, kernel 0.2.3, admin.ab, devtools/ab.ts); one status line under the list
+ *    follows it. "Back to branch head" ends those.
  *  - Bans: Unban by user id and the ban history of a user id (admins).
  * Cards go through one PopupQueue (never two at once) and pop in and out through a UIScale; everything lives in the tab
  * trove, so a tab switch or a swap removes it.
@@ -65,6 +85,14 @@ const CHECK_SIZE = 34;
 const PERCENTS = [5, 10, 25, 50];
 /** Seconds after an A/B request before the list is read again (the server re-reads it after 10 s). */
 const AB_RELOAD = 12;
+/** "Load a build": the build list's row shape (width / height) and height. */
+const BUILD_ROW_RATIO = 6.5;
+const BUILD_LIST_MAX = 220;
+/** The load status line: give up after LOAD_TIMEOUT s; a finished line stays LOAD_SHOWN s. */
+const LOAD_TIMEOUT = 90;
+const LOAD_SHOWN = 60;
+/** Client persist key of the load in progress (an in-place load replaces this client generation). */
+const LOAD_PERSIST = "typetorch/admin-load";
 
 const ROLE_COLORS: Record<AdminRole, Color3> = { owner: COLORS.accent, admin: COLORS.info, dev: COLORS.good };
 const ROLE_ORDER: Record<AdminRole, number> = { owner: 3, admin: 2, dev: 1 };
@@ -150,22 +178,10 @@ function succeeded(ok: boolean, reply: unknown): boolean {
 	return ok && !(typeIs(reply, "table") && (reply as { ok?: unknown }).ok === false);
 }
 
-function duration(seconds: number | undefined): string {
-	if (seconds === undefined) return "-";
-	const total = math.max(0, math.floor(seconds));
-	const days = math.floor(total / 86400);
-	const hours = math.floor((total % 86400) / 3600);
-	const minutes = math.floor((total % 3600) / 60);
-	if (days > 0) return `${days}d ${hours}h`;
-	if (hours > 0) return "%dh %02dm".format(hours, minutes);
-	if (minutes > 0) return `${minutes}m`;
-	return `${total}s`;
-}
-
 function banLength(seconds: number | undefined): string {
 	if (seconds === undefined) return "";
 	if (seconds < 0) return "permanent";
-	return duration(seconds);
+	return shortDuration(seconds);
 }
 
 function parseUserId(text: string): number | undefined {
@@ -389,7 +405,9 @@ function checkbox(page: Page, label: string, get: () => boolean, set: (on: boole
 
 /**
  * Modal cards over the tab body: a dim overlay (tap outside or Escape = cancel) with a centered card. One PopupQueue,
- * so two cards never overlap; pops through a UIScale. Each card has its own trove inside the tab trove.
+ * so two cards never overlap; pops through a UIScale. Each card has its own trove inside the tab trove. A card grows
+ * with its content up to the tab body's height, then scrolls (script-free: AutomaticSize + AutomaticCanvasSize), so a
+ * tall card (Load a build) never runs off a phone screen.
  */
 class Cards {
 	private readonly queue = new PopupQueue();
@@ -415,7 +433,7 @@ class Cards {
 				}),
 			);
 			const card = make(
-				"Frame",
+				"ScrollingFrame",
 				{
 					Name: "Card",
 					Active: true,
@@ -425,10 +443,16 @@ class Cards {
 					AutomaticSize: Enum.AutomaticSize.Y,
 					BackgroundColor3: COLORS.header,
 					BorderSizePixel: 0,
+					CanvasSize: new UDim2(),
+					AutomaticCanvasSize: Enum.AutomaticSize.Y,
+					ScrollingDirection: Enum.ScrollingDirection.Y,
+					ScrollBarThickness: 4,
+					ScrollBarImageColor3: COLORS.dim,
+					VerticalScrollBarInset: Enum.ScrollBarInset.ScrollBar,
 				},
 				overlay,
 			);
-			make("UISizeConstraint", { MaxSize: new Vector2(380, math.huge) }, card);
+			make("UISizeConstraint", { MaxSize: new Vector2(380, math.max(160, area.AbsoluteSize.Y - 16)) }, card);
 			corner(card, 12);
 			make("UIStroke", { Color: COLORS.stroke, Thickness: 1, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, card);
 			const page = Page.mount(card, 8);
@@ -898,7 +922,86 @@ function shortArtifact(entry: ArtifactEntry): string {
 }
 
 /** Kernel 0.3: prod-effective servers (public, or on a prod-channel branch) take only pins signed by the CLI. */
-const PROD_PIN_NOTE = "Use the CLI: typetorch pin";
+const PROD_PIN_NOTE = "Other prod servers: typetorch pin";
+
+/** A build load the status line follows: the servers it went to and the build they should report. */
+interface PendingLoad {
+	name: string;
+	artifactId?: string;
+	jobIds: string[];
+	/** os.time() when sent, and when the line settled. */
+	at: number;
+	doneAt?: number;
+	/** The settled line: [text, failed]. */
+	result?: [string, boolean];
+}
+
+interface LoadState {
+	pending?: PendingLoad;
+}
+
+/** "Public" from "public": a server type as a chip word. */
+function typeWord(kind: string): string {
+	return kind.sub(1, 1).upper() + kind.sub(2);
+}
+
+/** A small selectable chip (the share card's 5/10/25/50 and branch picks). */
+function chipButton(row: Instance, text: string, onClick: () => void): TextButton {
+	const button = style(make("TextButton", { AutoButtonColor: true }), text, 14, COLORS.text, Enum.Font.BuilderSansBold);
+	button.TextWrapped = false;
+	button.TextXAlignment = Enum.TextXAlignment.Center;
+	button.Size = UDim2.fromOffset(44, 30);
+	button.AutomaticSize = Enum.AutomaticSize.X;
+	button.LayoutOrder = row.GetChildren().size();
+	corner(button, 15);
+	pad(button, 0, 10);
+	button.Activated.Connect(onClick);
+	button.Parent = row;
+	return button;
+}
+
+interface OptionCard {
+	button: TextButton;
+	title: TextLabel;
+	detail: TextLabel;
+	stroke: UIStroke;
+	/** Extra rows inside the card (the share card's chips). */
+	body: Frame;
+}
+
+/** One "Where" choice: a full-width card with a bold title and a dim line; the selected one gets an accent outline. */
+function optionCard(parent: Page, onClick: () => void): OptionCard {
+	const button = make("TextButton", {
+		AutoButtonColor: false,
+		Text: "",
+		BackgroundColor3: COLORS.row,
+		BorderSizePixel: 0,
+		Size: UDim2.fromScale(1, 0),
+		AutomaticSize: Enum.AutomaticSize.Y,
+	});
+	corner(button, 8);
+	pad(button, 8, 10);
+	verticalList(button, 2);
+	const stroke = make("UIStroke", { Color: COLORS.accent, Thickness: 2, Enabled: false, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, button);
+	const title = style(make("TextLabel", { BackgroundTransparency: 1, LayoutOrder: 1 }, button), "", 15, COLORS.text, Enum.Font.BuilderSansBold);
+	title.Size = UDim2.fromScale(1, 0);
+	title.AutomaticSize = Enum.AutomaticSize.Y;
+	const detail = style(make("TextLabel", { BackgroundTransparency: 1, LayoutOrder: 2 }, button), "", 14, COLORS.dim);
+	detail.Size = UDim2.fromScale(1, 0);
+	detail.AutomaticSize = Enum.AutomaticSize.Y;
+	const body = make("Frame", { BackgroundTransparency: 1, LayoutOrder: 3, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y }, button);
+	verticalList(body, 6);
+	button.Activated.Connect(onClick);
+	parent.place(button);
+	return { button, title, detail, stroke, body };
+}
+
+/** A small bold step heading inside a card ("Build", "Where"). */
+function stepHeading(card: Page, text: string) {
+	const label = card.text(text, COLORS.dim);
+	label.Font = Enum.Font.BuilderSansBold;
+	label.TextSize = 14;
+}
 
 function prodTarget(server: AdminServer): boolean {
 	return server.type === "public" || server.channel === "prod";
@@ -993,6 +1096,13 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 	// How many servers run which artifact, one line each.
 	const summary = page.group(2);
 	const list = page.group(4);
+	// One line under the list follows the last "Load a build" ("Loading #36 on 1 server", "Done: 1 switched").
+	const loadLine = page.text("", COLORS.dim);
+	loadLine.Visible = false;
+	const loadState = deps.kernel.persist<LoadState>(LOAD_PERSIST, () => ({}));
+	/** The owner override is offered here (kernel 0.3.3, owner/admin): "This server" loads in place. */
+	let overrideOn = false;
+	let followUp = false;
 	let loading = false;
 	let busy = false;
 	let playersHere = 0;
@@ -1006,6 +1116,53 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 	const selected = new Set<string>();
 	/** Shows the A/B footer buttons and the picked count (set up with the footer, at the end). */
 	let paintAb = () => {};
+	let load = () => {};
+
+	/** The load status line from the list: a server counts once its row reports the build. */
+	const paintLoad = () => {
+		const pending = loadState.pending;
+		if (!pending) {
+			loadLine.Visible = false;
+			return;
+		}
+		const now = os.time();
+		if (pending.result === undefined) {
+			let switched = 0;
+			for (const jobId of pending.jobIds) {
+				const server = servers.find((entry) => entry.jobId === jobId);
+				if (server && pending.artifactId !== undefined && server.artifact === pending.artifactId) switched += 1;
+			}
+			const [text, done, failed] = loadProgress(pending.name, pending.jobIds.size(), switched, now - pending.at > LOAD_TIMEOUT);
+			if (done) {
+				pending.result = [text, failed];
+				pending.doneAt = now;
+			} else {
+				loadLine.Text = text;
+				loadLine.TextColor3 = COLORS.dim;
+				loadLine.Visible = true;
+				// Read the list again soon while servers are still switching (one follow-up at a time).
+				if (!followUp) {
+					followUp = true;
+					trove.add(
+						task.delay(AB_RELOAD, () => {
+							followUp = false;
+							load();
+						}),
+					);
+				}
+				return;
+			}
+		}
+		if (now - (pending.doneAt ?? now) > LOAD_SHOWN) {
+			loadState.pending = undefined;
+			loadLine.Visible = false;
+			return;
+		}
+		const [text, failed] = pending.result!;
+		loadLine.Text = text;
+		loadLine.TextColor3 = failed ? COLORS.bad : COLORS.good;
+		loadLine.Visible = true;
+	};
 
 	const act = (label: string, op: string, payload: unknown, doneText: string) => {
 		if (busy) return;
@@ -1094,11 +1251,14 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 			row,
 		);
 		verticalList(left, 2);
-		const top = make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, 20), LayoutOrder: 1 }, left);
+		// The short JobId, then short word chips that wrap to the next line instead of truncating.
+		const top = chipRow();
+		top.LayoutOrder = 1;
+		top.Parent = left;
 		// The short JobId; focusing it shows the full id selected, ready to copy.
 		const short = server.jobId.sub(1, 8);
 		const idBox = style(
-			make("TextBox", { BackgroundTransparency: 1, ClearTextOnFocus: false, TextEditable: false }, top),
+			make("TextBox", { BackgroundTransparency: 1, ClearTextOnFocus: false, TextEditable: false, LayoutOrder: 0 }, top),
 			short,
 			15,
 			COLORS.text,
@@ -1106,33 +1266,30 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 		);
 		idBox.TextWrapped = false;
 		idBox.ClipsDescendants = true;
-		idBox.Size = new UDim2(0, ID_WIDTH, 1, 0);
-		let tags = tag(server.type.upper(), COLORS.info);
-		if (server.experiment) tags += tag("A/B", COLORS.warn);
-		// Kernel 0.3.2 heartbeats carry the server's health: only the bad states get a tag.
-		if (server.health === "failed") tags += tag("DOWN", COLORS.bad);
-		else if (server.health === "unverified") tags += tag("UNVERIFIED", COLORS.bad);
-		else if (server.health === "degraded") tags += tag("DEGRADED", COLORS.warn);
-		if (server.here) tags = tag("HERE", COLORS.accent) + tags;
-		const tagLabel = style(make("TextLabel", { BackgroundTransparency: 1, RichText: true }, top), tags, 14);
-		tagLabel.TextWrapped = false;
-		tagLabel.TextTruncate = Enum.TextTruncate.AtEnd;
-		tagLabel.Position = UDim2.fromOffset(ID_WIDTH, 0);
-		tagLabel.Size = new UDim2(1, -ID_WIDTH, 1, 0);
+		idBox.Size = new UDim2(0, ID_WIDTH, 0, 20);
+		const chips = new Array<TextLabel>();
+		if (server.here) chips.push(chip(top, "Here", COLORS.accent));
+		chips.push(chip(top, typeWord(server.type), COLORS.info));
+		if (server.experiment) chips.push(chip(top, "A/B", COLORS.warn));
+		if (server.override !== undefined) chips.push(chip(top, "Override", COLORS.warn));
+		// Kernel 0.3.2 heartbeats carry the server's health: only the bad states get a chip.
+		if (server.health === "failed") chips.push(chip(top, "Down", COLORS.bad));
+		else if (server.health === "unverified") chips.push(chip(top, "Unverified", COLORS.bad));
+		else if (server.health === "degraded") chips.push(chip(top, "Degraded", COLORS.warn));
 		idBox.Focused.Connect(() => {
 			idBox.Text = server.jobId;
-			idBox.Size = UDim2.fromScale(1, 1);
-			tagLabel.Visible = false;
+			idBox.Size = new UDim2(1, 0, 0, 20);
+			for (const label of chips) label.Visible = false;
 			idBox.SelectionStart = 1;
 			idBox.CursorPosition = server.jobId.size() + 1;
 		});
 		idBox.FocusLost.Connect(() => {
 			idBox.Text = short;
-			idBox.Size = new UDim2(0, ID_WIDTH, 1, 0);
-			tagLabel.Visible = true;
+			idBox.Size = new UDim2(0, ID_WIDTH, 0, 20);
+			for (const label of chips) label.Visible = true;
 		});
-		let lineTwo = `${server.players}/${server.maxPlayers}  up ${duration(server.uptime)}`;
-		if (!server.here && server.age > 90) lineTwo += `  seen ${duration(server.age)} ago`;
+		let lineTwo = `${server.players}/${server.maxPlayers}  up ${shortDuration(server.uptime)}`;
+		if (!server.here && server.age > 90) lineTwo += `  seen ${shortDuration(server.age)} ago`;
 		if (abOn && server.ab === false) lineTwo += `  kernel ${server.kernel ?? "?"}`;
 		const detail = style(
 			make("TextLabel", { BackgroundTransparency: 1, LayoutOrder: 2 }, left),
@@ -1176,7 +1333,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 		}
 	};
 
-	const load = () => {
+	load = () => {
 		if (loading) return;
 		loading = true;
 		spawnIn(trove, () => {
@@ -1191,6 +1348,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 			footButtons.Visible = data.you.admin;
 			you = data.you;
 			abOn = data.you.admin && data.ab === true;
+			overrideOn = data.you.admin && overrideOffered(deps.kernel)[1];
 			abNote.Visible = data.you.admin && data.ab !== true;
 			servers = data.servers;
 			// Servers that left drop out of the selection.
@@ -1211,6 +1369,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 				if (server.here) playersHere = server.players;
 				drawServer(server);
 			}
+			paintLoad();
 		});
 	};
 
@@ -1221,6 +1380,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 		close: () => void,
 		cardTrove: Trove,
 		onFail: () => void,
+		pending?: PendingLoad,
 	) => {
 		status("Sending...", COLORS.dim);
 		spawnIn(cardTrove, () => {
@@ -1233,7 +1393,13 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 			const result = reply as AbReply;
 			const target = result.servers !== undefined ? `${result.servers} server${result.servers === 1 ? "" : "s"}` : `${payload.pct}%`;
 			const missed = result.failed > 0 || result.skipped > 0 ? `, ${result.failed + result.skipped} missed` : "";
-			setResult(`${payload.unpin === true ? "Unpinning" : "Loading on"} ${target}${missed}`, missed !== "" ? COLORS.warn : COLORS.good);
+			if (pending) {
+				loadState.pending = pending;
+				paintLoad();
+				if (missed !== "") setResult(`${result.failed + result.skipped} missed`, COLORS.warn);
+			} else {
+				setResult(`Back to the head on ${target}${missed}`, missed !== "" ? COLORS.warn : COLORS.good);
+			}
 			close();
 			// The servers swap within seconds (random picks wait up to 10 s more), then rewrite their list entries.
 			trove.add(task.delay(AB_RELOAD, load));
@@ -1253,165 +1419,292 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 		return jobIds;
 	};
 
-	// "Load artifact...": the picked servers, or a random percent of one branch's servers, run a known artifact as an
-	// experiment. The card is the first confirm and the armed Load button the second; a one-line warning says who.
+	/** JobIds of the listed servers on `branch` (Studio sessions never take pins). */
+	const jobsOn = (branch: string | undefined): string[] =>
+		servers.filter((server) => server.branch === branch && server.type !== "studio").map((server) => server.jobId);
+
+	// "Load a build...": step 1 picks a known build (newest first), step 2 where it runs: this server (in place, the kernel
+	// 0.3.3 owner override), the ticked servers, or a share of one branch's servers (A/B pins). One summary line; the
+	// primary button says the action and takes two taps (green Confirm, then a locked dark "Loading...").
 	const openLoad = () =>
 		cards.open((card, close, cardTrove) => {
-			cardTitle(card, "Load artifact");
+			cardTitle(card, "Load a build");
+			const here = servers.find((server) => server.here);
+			const hereProd = here !== undefined && prodTarget(here);
+			// In place through the override, or (older kernels) an A/B pin of this server when it isn't prod.
+			const hereVia: "override" | "pin" | undefined = overrideOn ? "override" : abOn && here !== undefined && !hereProd ? "pin" : undefined;
 			const branches = branchesOf(servers);
-			let mode: "picked" | "random" = selected.size() > 0 ? "picked" : "random";
+			let where: LoadWhere = selected.size() > 0 && abOn ? "selected" : hereVia !== undefined ? "here" : "share";
 			let pct = 10;
-			let branch = defaultBranch(branches);
 			let chosen: ArtifactEntry | undefined;
+			let shareBranch = defaultBranch(branches);
+			let branchPicked = false;
 			let refresh = () => {};
-			const [, paintMode] = choiceRow<"picked" | "random">(
-				card,
-				[
-					["picked", `Picked (${selected.size()})`],
-					["random", "Random %"],
-				],
-				() => mode,
-				(value) => {
-					mode = value;
-					refresh();
-				},
-			);
-			const [pctRow] = choiceRow(
-				card,
-				PERCENTS.map((value): [number, string] => [value, `${value}%`]),
-				() => pct,
-				(value) => {
-					pct = value;
-					refresh();
-				},
-			);
-			let branchRow: Frame | undefined;
-			if (branches.size() > 1) {
-				[branchRow] = choiceRow(
-					card,
-					branches.map((name): [string | undefined, string] => [name, name]),
-					() => branch,
-					(value) => {
-						branch = value;
-						refresh();
-					},
-				);
-			}
 
-			// Known artifacts in a script-free scrolling list (layout + AutomaticCanvasSize), sized to fit the tab body.
+			// Step 1: the build. A script-free scrolling list (layout + AutomaticCanvasSize, rows keep their shape).
+			stepHeading(card, "Build");
 			const [, area] = hostOf(tab);
-			const listHeight = math.clamp(area.AbsoluteSize.Y - 260, 80, 220);
+			// The build list takes what the rest of the card leaves (about 420 px); the card scrolls on short screens.
+			const listHeight = math.clamp(area.AbsoluteSize.Y - 420, 96, BUILD_LIST_MAX);
 			const scroller = card.place(scrolling(card.frame, { Size: new UDim2(1, 0, 0, listHeight) }));
 			const rows = Page.mount(scroller, 4);
 			rows.text("Loading...", COLORS.dim);
-			const rowButtons = new Array<[ArtifactEntry, TextButton, UIStroke]>();
+			const rowButtons = new Array<[ArtifactEntry, UIStroke]>();
 			const paintRows = () => {
-				for (const [entry, button, stroke] of rowButtons) {
-					button.BackgroundColor3 = entry === chosen ? COLORS.button : COLORS.row;
-					stroke.Enabled = entry === chosen;
-				}
+				for (const [entry, stroke] of rowButtons) stroke.Enabled = entry === chosen;
 			};
 			spawnIn(cardTrove, () => {
 				const [ok, reply] = deps.call("artifacts");
 				rows.clear();
 				const answer = (typeIs(reply, "table") ? reply : {}) as { supported?: boolean; list?: ArtifactEntry[] };
 				if (!ok || answer.supported !== true) {
-					rows.text(ok ? "Kernel 0.2 needed for artifacts" : `Failed: ${errorText(reply)}`, COLORS.bad);
+					rows.text(ok ? "Needs kernel 0.2" : `Failed: ${errorText(reply)}`, COLORS.bad);
 					return;
 				}
-				const entries = answer.list ?? [];
+				// Newest first: by deploy seq, then the list's own order.
+				const entries = [...(answer.list ?? [])];
+				const index = new Map<ArtifactEntry, number>();
+				entries.forEach((entry, i) => index.set(entry, i));
+				entries.sort((a, b) => {
+					if (a.seq !== b.seq) return (a.seq ?? -1) > (b.seq ?? -1);
+					return index.get(a)! < index.get(b)!;
+				});
 				if (entries.size() === 0) rows.text("None yet", COLORS.dim);
 				for (const entry of entries) {
 					const button = make("TextButton", {
-						AutoButtonColor: false,
+						AutoButtonColor: true,
 						Text: "",
 						BackgroundColor3: COLORS.row,
 						BorderSizePixel: 0,
-						Size: UDim2.fromScale(1, 0),
-						AutomaticSize: Enum.AutomaticSize.Y,
+						Size: new UDim2(1, 0, 0, 200),
 					});
+					make("UIAspectRatioConstraint", { AspectRatio: BUILD_ROW_RATIO, DominantAxis: Enum.DominantAxis.Width }, button);
 					corner(button, 6);
-					pad(button, 6, 8);
-					const stroke = make("UIStroke", { Color: COLORS.accent, Thickness: 1, Enabled: false, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, button);
-					let title = `<b>${entry.seq !== undefined ? `#${entry.seq}  ` : ""}${escapeRich(shortArtifact(entry))}</b>  ${escapeRich(entry.branch)}`;
-					if (entry.channel === "dev") title += tag("DEV", COLORS.warn);
-					if (entry.live) title += tag("LIVE", COLORS.info);
-					if (entry.running) title += tag("HERE", COLORS.good);
-					const label = style(
+					pad(button, 6, 10);
+					const stroke = make("UIStroke", { Color: COLORS.accent, Thickness: 2, Enabled: false, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, button);
+					const badge = buildBadge(entry);
+					const title = style(
 						make("TextLabel", { BackgroundTransparency: 1, RichText: true }, button),
-						`${title}\n<font size="14" color="${hex(COLORS.dim)}">${escapeRich(entry.artifactId ?? `asset-${entry.assetId}`)}</font>`,
+						`<b>${escapeRich(buildTitle(entry))}</b>`,
 						15,
 					);
-					label.Size = UDim2.fromScale(1, 0);
-					label.AutomaticSize = Enum.AutomaticSize.Y;
+					title.TextWrapped = false;
+					title.TextTruncate = Enum.TextTruncate.AtEnd;
+					title.Size = new UDim2(1, badge !== undefined ? -100 : 0, 0.5, 0);
+					const at = entry.at !== undefined ? secondsSince(entry.at) : undefined;
+					const detail = style(make("TextLabel", { BackgroundTransparency: 1 }, button), buildDetail(entry, at), 14, COLORS.dim);
+					detail.TextWrapped = false;
+					detail.TextTruncate = Enum.TextTruncate.AtEnd;
+					detail.Position = UDim2.fromScale(0, 0.5);
+					detail.Size = new UDim2(1, badge !== undefined ? -100 : 0, 0.5, 0);
+					if (badge !== undefined) {
+						const label = chip(button, badge, badge === "Live" ? COLORS.info : COLORS.good);
+						label.AnchorPoint = new Vector2(1, 0.5);
+						label.Position = UDim2.fromScale(1, 0.5);
+					}
 					button.Activated.Connect(() => {
 						chosen = entry;
+						if (!branchPicked && branches.includes(entry.branch)) shareBranch = entry.branch;
 						paintRows();
 						refresh();
 					});
 					rows.place(button);
-					rowButtons.push([entry, button, stroke]);
+					rowButtons.push([entry, stroke]);
 				}
 			});
 
-			const warning = card.text("", COLORS.warn);
+			// Step 2: where.
+			stepHeading(card, "Where");
+			const hereCard = optionCard(card, () => {
+				if (hereVia === undefined) return;
+				where = "here";
+				refresh();
+			});
+			const selectedCard = optionCard(card, () => {
+				if (!abOn || selected.size() === 0) return;
+				where = "selected";
+				refresh();
+			});
+			const shareCard = optionCard(card, () => {
+				if (!abOn || shareBranch === undefined || prodBranch(servers, shareBranch)) return;
+				where = "share";
+				refresh();
+			});
+			// The share card's chips (only while it is active): the percent, and the branch when there are several.
+			const pctRow = chipRow();
+			pctRow.Parent = shareCard.body;
+			const pctButtons = PERCENTS.map((value): [number, TextButton] => [
+				value,
+				chipButton(pctRow, `${value}%`, () => {
+					pct = value;
+					refresh();
+				}),
+			]);
+			const branchRow = chipRow();
+			branchRow.Parent = shareCard.body;
+			const branchButtons = branches.map((name): [string, TextButton] => [
+				name,
+				chipButton(branchRow, name, () => {
+					shareBranch = name;
+					branchPicked = true;
+					refresh();
+				}),
+			]);
+			// Prod servers take only CLI-signed pins: one dim line; "This server" still works (the owner override).
+			const anyProd = servers.some((server) => server.type !== "studio" && prodTarget(server) && !(server.here && hereVia === "override"));
+			const prodLine = card.text(PROD_PIN_NOTE, COLORS.dim);
+			prodLine.Visible = anyProd;
+			const summaryLine = card.text("", COLORS.text);
 			const status = cardStatus(card);
 			const buttons = card.buttons();
 			addButton(buttons, "Cancel", close);
 			spacer(buttons);
-			let sending = false;
-			armButton(buttons, "Load", COLORS.accent, () => {
-				if (sending) return;
-				if (!chosen) return status("Pick an artifact", COLORS.bad);
-				if (mode === "picked" && selected.size() === 0) return status("Pick servers first", COLORS.bad);
-				if (mode === "random" && branch === undefined) return status("No servers", COLORS.bad);
-				if (mode === "random" && prodBranch(servers, branch)) return status(PROD_PIN_NOTE, COLORS.dim);
-				sending = true;
-				const payload: AbRequest =
-					mode === "picked" ? { jobIds: pickedJobs(), assetId: chosen.assetId } : { pct, branch, assetId: chosen.assetId };
-				sendAb(payload, status, close, cardTrove, () => (sending = false));
-			});
+
+			const targetOf = (): LoadTarget => {
+				if (where === "here") return { where, players: playersHere };
+				if (where === "selected") return { where, selected: selected.size() };
+				return { where, pct, branch: shareBranch, branchJobs: jobsOn(shareBranch) };
+			};
+			/** Why the primary button can't run now (undefined: it can). */
+			const blocked = (): string | undefined => {
+				if (!chosen) return "Pick a build";
+				if (where === "here" && chosen.running) return `${buildName(chosen)} already runs here`;
+				if (where === "here" && hereVia === undefined) return "Needs kernel 0.3.3";
+				if (where === "selected" && selected.size() === 0) return "Tick servers in the list";
+				if (where === "share" && (shareBranch === undefined || prodBranch(servers, shareBranch))) return PROD_PIN_NOTE;
+				return undefined;
+			};
+			const idle: { label: string; color?: Color3 } = { label: "Load here", color: COLORS.accent };
+			const primary = addButton(buttons, "Load here", () => {}, COLORS.accent);
+			const arm = newArmState();
+			let paintPrimary = () => {};
+			paintPrimary = armLock(
+				primary,
+				arm,
+				idle,
+				"Loading...",
+				() => {
+					const reason = blocked();
+					if (reason === undefined) return status("", COLORS.dim);
+					arm.armedAt = -math.huge;
+					paintPrimary();
+					status(reason, COLORS.bad);
+				},
+				(unlock) => {
+					const build = chosen;
+					const reason = blocked();
+					if (build === undefined || reason !== undefined) {
+						unlock();
+						return status(reason ?? "Pick a build", COLORS.bad);
+					}
+					const target = targetOf();
+					const pending: PendingLoad = { name: buildName(build), artifactId: build.artifactId, jobIds: [], at: os.time() };
+					if (where === "here") {
+						pending.jobIds = here !== undefined ? [here.jobId] : [];
+						if (hereVia === "pin") {
+							sendAb({ jobIds: pending.jobIds, assetId: build.assetId }, status, close, cardTrove, unlock, pending);
+							return;
+						}
+						// In place: this client generation is replaced when it works, so the line is kept in the persist store.
+						loadState.pending = pending;
+						status("Switching this server...", COLORS.dim);
+						spawnIn(cardTrove, () => {
+							const reply = requestOverride(deps.kernel, { assetId: build.assetId });
+							if (reply.ok) {
+								paintLoad();
+								close();
+								return;
+							}
+							loadState.pending = undefined;
+							unlock();
+							status(`Failed: ${reply.error ?? "unknown error"}`, COLORS.bad);
+						});
+						return;
+					}
+					if (where === "selected") {
+						pending.jobIds = pickedJobs();
+						sendAb({ jobIds: pending.jobIds, assetId: build.assetId }, status, close, cardTrove, unlock, pending);
+						return;
+					}
+					pending.jobIds = (target.branchJobs ?? []).filter((jobId) => jobBucket(jobId) < pct);
+					sendAb({ pct, branch: shareBranch, assetId: build.assetId }, status, close, cardTrove, unlock, pending);
+				},
+			);
 
 			refresh = () => {
-				paintMode();
-				pctRow.Visible = mode === "random";
-				if (branchRow) branchRow.Visible = mode === "random";
-				warning.TextColor3 = COLORS.warn;
-				if (mode === "random" && prodBranch(servers, branch)) {
-					warning.Text = PROD_PIN_NOTE;
-					warning.TextColor3 = COLORS.dim;
-					warning.Visible = true;
-					return;
-				}
-				if (!chosen) {
-					warning.Visible = false;
-					return;
-				}
-				const name = shortArtifact(chosen);
 				const count = selected.size();
-				warning.Text =
-					mode === "picked"
-						? `Everyone on ${count} server${count === 1 ? "" : "s"} runs ${name}`
-						: `About ${pct}% of ${branch ?? "?"} servers run ${name}`;
-				warning.Visible = true;
+				// This server.
+				hereCard.title.Text = "This server";
+				hereCard.detail.Text =
+					hereVia === undefined ? "Needs kernel 0.3.3" : `${playersHere} player${playersHere === 1 ? "" : "s"} stay`;
+				// Selected servers.
+				selectedCard.title.Text = `Selected servers (${count})`;
+				selectedCard.detail.Text = !abOn ? "Needs kernel 0.2.3" : count === 0 ? "Tick servers in the list" : "Ticked in the list";
+				// Share of a branch.
+				const shareProd = shareBranch !== undefined && prodBranch(servers, shareBranch);
+				shareCard.title.Text = `Share of ${shareBranch ?? "?"} servers`;
+				shareCard.detail.Text = !abOn ? "Needs kernel 0.2.3" : shareBranch === undefined ? "No servers" : shareProd ? "Prod servers" : "Random, by server";
+				const enabled: Record<LoadWhere, boolean> = {
+					here: hereVia !== undefined,
+					selected: abOn && count > 0,
+					share: abOn && shareBranch !== undefined && !shareProd,
+				};
+				if (!enabled[where]) where = enabled.here ? "here" : enabled.selected ? "selected" : "share";
+				for (const [kind, option] of [
+					["here", hereCard],
+					["selected", selectedCard],
+					["share", shareCard],
+				] as Array<[LoadWhere, OptionCard]>) {
+					const on = enabled[kind];
+					option.stroke.Enabled = on && where === kind;
+					option.button.BackgroundColor3 = on && where === kind ? COLORS.button : COLORS.row;
+					option.title.TextColor3 = on ? COLORS.text : COLORS.dim;
+				}
+				shareCard.body.Visible = where === "share" && enabled.share;
+				branchRow.Visible = branches.size() > 1;
+				for (const [value, button] of pctButtons) paintSelected(button, value === pct);
+				for (const [name, button] of branchButtons) paintSelected(button, name === shareBranch);
+				// The summary and the primary button say the action.
+				const target = targetOf();
+				idle.label = loadButtonLabel(target);
+				const reason = blocked();
+				idle.color = reason === undefined ? COLORS.accent : undefined;
+				paintPrimary();
+				if (chosen === undefined) {
+					summaryLine.Text = "Pick a build";
+					summaryLine.TextColor3 = COLORS.dim;
+				} else if (reason !== undefined) {
+					summaryLine.Text = reason;
+					summaryLine.TextColor3 = COLORS.dim;
+				} else {
+					summaryLine.Text = loadSummary(chosen, target);
+					summaryLine.TextColor3 = COLORS.text;
+				}
 			};
 			refresh();
 		});
 
-	// "Unpin": the picked servers, or every A/B server of one branch, go back to their branch head.
+	// "Back to branch head": this server (when an owner override holds it), the ticked servers, or every A/B server of
+	// one branch go back to their branch head.
 	const openUnpin = () =>
 		cards.open((card, close, cardTrove) => {
-			cardTitle(card, "Unpin");
+			cardTitle(card, "Back to branch head");
+			const here = servers.find((server) => server.here);
+			const hereBack = overrideOn && here?.override !== undefined;
 			const branches = branchesOf(servers);
-			let mode: "picked" | "all" = selected.size() > 0 ? "picked" : "all";
+			type BackMode = "here" | "picked" | "all";
+			let mode: BackMode = hereBack ? "here" : selected.size() > 0 ? "picked" : "all";
 			let branch = defaultBranch(branches);
 			let refresh = () => {};
-			const [, paintMode] = choiceRow<"picked" | "all">(
+			const choices = new Array<[BackMode, string]>();
+			if (hereBack) choices.push(["here", "This server"]);
+			if (abOn) {
+				choices.push(["picked", `Selected (${selected.size()})`]);
+				choices.push(["all", "All A/B"]);
+			}
+			const [, paintMode] = choiceRow<BackMode>(
 				card,
-				[
-					["picked", `Picked (${selected.size()})`],
-					["all", "All A/B"],
-				],
+				choices,
 				() => mode,
 				(value) => {
 					mode = value;
@@ -1419,7 +1712,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 				},
 			);
 			let branchRow: Frame | undefined;
-			if (branches.size() > 1) {
+			if (abOn && branches.size() > 1) {
 				[branchRow] = choiceRow(
 					card,
 					branches.map((name): [string | undefined, string] => [name, name]),
@@ -1435,27 +1728,53 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 			const buttons = card.buttons();
 			addButton(buttons, "Cancel", close);
 			spacer(buttons);
-			let sending = false;
-			armButton(buttons, "Unpin", COLORS.accent, () => {
-				if (sending) return;
-				if (mode === "picked" && selected.size() === 0) return status("Pick servers first", COLORS.bad);
-				if (mode === "all" && branch === undefined) return status("No servers", COLORS.bad);
-				if (mode === "all" && prodBranch(servers, branch)) return status(PROD_PIN_NOTE, COLORS.dim);
-				sending = true;
-				const payload: AbRequest = mode === "picked" ? { jobIds: pickedJobs(), unpin: true } : { pct: 100, branch, unpin: true };
-				sendAb(payload, status, close, cardTrove, () => (sending = false));
-			});
+			const idle: { label: string; color?: Color3 } = { label: "Go back", color: COLORS.accent };
+			const primary = addButton(buttons, "Go back", () => {}, COLORS.accent);
+			const paintPrimary = armLock(
+				primary,
+				newArmState(),
+				idle,
+				"Switching...",
+				() => status("", COLORS.dim),
+				(unlock) => {
+					if (mode === "here") {
+						status("Switching this server...", COLORS.dim);
+						spawnIn(cardTrove, () => {
+							const reply = requestOverride(deps.kernel, { back: true });
+							if (reply.ok) return close();
+							unlock();
+							status(`Failed: ${reply.error ?? "unknown error"}`, COLORS.bad);
+						});
+						return;
+					}
+					if (mode === "picked" && selected.size() === 0) {
+						unlock();
+						return status("Tick servers in the list", COLORS.bad);
+					}
+					if (mode === "all" && (branch === undefined || prodBranch(servers, branch))) {
+						unlock();
+						return status(branch === undefined ? "No servers" : PROD_PIN_NOTE, COLORS.dim);
+					}
+					const payload: AbRequest = mode === "picked" ? { jobIds: pickedJobs(), unpin: true } : { pct: 100, branch, unpin: true };
+					sendAb(payload, status, close, cardTrove, unlock);
+				},
+			);
 			refresh = () => {
 				paintMode();
 				if (branchRow) branchRow.Visible = mode === "all";
 				const count = selected.size();
 				const prodAll = mode === "all" && prodBranch(servers, branch);
+				idle.label = mode === "here" ? "Switch back" : mode === "picked" ? `Back on ${count} server${count === 1 ? "" : "s"}` : "Back on all A/B";
+				paintPrimary();
 				warning.TextColor3 = prodAll ? COLORS.dim : COLORS.warn;
-				warning.Text = prodAll
-					? PROD_PIN_NOTE
-					: mode === "picked"
-						? `${count} server${count === 1 ? "" : "s"} go back to the branch head`
-						: `Every A/B server on ${branch ?? "?"} goes back to the head`;
+				warning.Text =
+					mode === "here"
+						? `This server goes back to ${here?.override?.branch !== undefined ? "its branch" : "the branch head"}`
+						: prodAll
+							? PROD_PIN_NOTE
+							: mode === "picked"
+								? `${count} server${count === 1 ? "" : "s"} go back to the branch head`
+								: `Every A/B server on ${branch ?? "?"} goes back to the head`;
 			};
 			refresh();
 		});
@@ -1487,9 +1806,10 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 
 	addButton(bar, "Refresh", load);
 	addButton(bar, "New server", () => act("Opening a server", "admin.newServer", undefined, "Teleporting..."));
-	// Footer: A/B on the picked servers (owner/admin, kernel 0.2.3), then Shut down for this server.
-	const loadButton = colorButton(footButtons, "Load artifact...", COLORS.accent, openLoad);
-	const unpinButton = addButton(footButtons, "Unpin", openUnpin);
+	// Footer (owner/admin): Load a build (in place on kernel 0.3.3, A/B pins on 0.2.3), Back to branch head, then Shut
+	// down for this server (red, with its own confirm).
+	const loadButton = colorButton(footButtons, "Load a build...", COLORS.accent, openLoad);
+	const unpinButton = addButton(footButtons, "Back to branch head", openUnpin);
 	const countLabel = style(
 		make("TextLabel", { BackgroundTransparency: 1, Size: UDim2.fromOffset(0, BUTTON_HEIGHT), AutomaticSize: Enum.AutomaticSize.X }),
 		"",
@@ -1501,10 +1821,11 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 	countLabel.LayoutOrder = footButtons.GetChildren().size();
 	countLabel.Parent = footButtons;
 	paintAb = () => {
-		loadButton.Visible = abOn;
-		unpinButton.Visible = abOn;
+		const hereOverridden = servers.some((server) => server.here && server.override !== undefined);
+		loadButton.Visible = abOn || overrideOn;
+		unpinButton.Visible = abOn || (overrideOn && hereOverridden);
 		countLabel.Visible = abOn && selected.size() > 0;
-		countLabel.Text = `${selected.size()} picked`;
+		countLabel.Text = `${selected.size()} selected`;
 	};
 	spacer(footButtons);
 	colorButton(footButtons, "Shut down", COLORS.bad, openShutdown);

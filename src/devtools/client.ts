@@ -12,9 +12,21 @@ import type {
 	KeyTrust,
 	LogEntry,
 	NewServerReport,
+	OverrideRequest,
 	SwapReport,
 	Verified,
 } from "../kernel";
+import {
+	branchAction,
+	branchLabel,
+	buildAction,
+	buildLabel,
+	buildName,
+	overrideOffered,
+	PickerContext,
+	requestOverride,
+	showCliNote,
+} from "./build-actions";
 import type { ClientDispatcher, LeafStats } from "../net/runtime";
 import { runningModules } from "../runtime/registry";
 import { bump, popIn, popOut } from "../ui";
@@ -44,6 +56,9 @@ import { badgeLevel, checkHealth, HealthIssue, HealthLevel, ServerFacts } from "
 import { NEEDS_KERNEL_AB } from "./ab";
 import {
 	addButton,
+	ArmState,
+	armLock,
+	newArmState,
 	chevron,
 	buttonRow,
 	COLORS,
@@ -58,6 +73,7 @@ import {
 	playerSelector,
 	scrolling,
 	searchBox,
+	shortDuration,
 	style,
 	tag,
 	upButton,
@@ -84,6 +100,8 @@ const TAB_WIDTH = 116;
 const BODY_MARGIN = 8;
 /** Artifact rows shown per branch before "Show all". */
 const ARTIFACTS_PER_BRANCH = 6;
+/** Artifact tab: seconds between updates of its "Running", "Server up" and "Built ... ago" texts. */
+const TIMES_REFRESH = 5;
 const PERSIST_KEY = "typetorch/devtools";
 /** Played after a hot swap on dev-channel servers (ships with the client: no upload, no moderation). */
 const RELOAD_SOUND = "rbxasset://sounds/electronicpingshort.wav";
@@ -549,9 +567,33 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		page.section("Client");
 		page.field("Artifact", kernel.artifact.id);
 		page.field("Generation", `#${kernel.generation}`);
+		// How long this client generation has run (kernel 0.2.2+ `start`), in Admin > Servers' words ("12m", "3h 04m").
+		const clientStarted = kernel.start?.startedAt;
+		const clientRunning = page.field("Running", "-");
 		page.field("Branch", str(kernel.branch));
 		page.field("Channel", str(kernel.channel));
 		page.field("Kernel", `${kernel.kernelVersion} (API ${kernel.kernelApi})`);
+		/** The server's times as of the status reply (os.clock() then); the loop below adds the time since. */
+		let serverTimes: { at: number; generation?: number; server?: number; builtAt?: number; running: TextBox; up: TextBox; built: TextBox } | undefined;
+		/** "2026-10-05 17:51:37 UTC (8m ago)". */
+		const builtText = (builtAt: number) => `${utc(builtAt)} (${shortDuration(DateTime.now().UnixTimestamp - builtAt)} ago)`;
+		/** Text only, no re-layout: called every TIMES_REFRESH s while the tab is open. */
+		const paintTimes = () => {
+			clientRunning.Text = clientStarted !== undefined ? shortDuration(os.time() - clientStarted) : "-";
+			const times = serverTimes;
+			if (!times) return;
+			const since = os.clock() - times.at;
+			times.running.Text = times.generation !== undefined ? shortDuration(times.generation + since) : "-";
+			times.up.Text = times.server !== undefined ? shortDuration(times.server + since) : "-";
+			if (times.builtAt !== undefined) times.built.Text = builtText(times.builtAt);
+		};
+		paintTimes();
+		spawnIn(tabTrove, () => {
+			while (true) {
+				task.wait(TIMES_REFRESH);
+				paintTimes();
+			}
+		});
 		const server = page.group();
 		server.text("Loading server...", COLORS.dim);
 		const signing = page.group();
@@ -576,9 +618,22 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			server.field("Commit hash", str(artifact.commitHash));
 			server.field("Asset id", str(artifact.assetId));
 			server.field("Seq", str(artifact.seq));
-			server.field("Built", utc(artifact.builtAt));
+			const builtAt = typeIs(artifact.builtAt, "number") ? artifact.builtAt : undefined;
+			const built = server.field("Built", builtAt !== undefined ? builtText(builtAt) : utc(artifact.builtAt));
 			server.section("Server generation");
 			server.field("Generation", status.generation ? `${status.generation.name} (#${status.generation.number})` : "-");
+			const running = server.field("Running", "-");
+			const up = server.field("Server up", "-");
+			serverTimes = {
+				at: os.clock(),
+				generation: typeIs(status.generation?.uptime, "number") ? status.generation.uptime : undefined,
+				server: typeIs(status.uptime, "number") ? status.uptime : undefined,
+				builtAt,
+				running,
+				up,
+				built,
+			};
+			paintTimes();
 			server.field("Kernel", `${status.kernelVersion}${status.kernelBuild !== undefined ? `@${status.kernelBuild}` : ""} (API ${status.kernelApi})`);
 		});
 		// Signing (kernel 0.3): the trust state, compact; tap a key row for its full base64.
@@ -598,6 +653,27 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		const { page, trove: tabTrove } = tab;
 		// "Migrate" on the kernel-update issue (admin-ui.ts): moves everyone to a fresh server on the new kernel.
 		const migrateButton = migrateControl(tab, { kernel, call });
+		// Kernel 0.3.3: an owner override holds this server; "Back to <branch>" (two taps) for the owner and admins.
+		const backArm = newArmState();
+		const backButton = (parent: typeof body, status: KernelStatus) => {
+			const ov = status.ov;
+			const [, mayUse] = overrideOffered(kernel);
+			if (ov === undefined || !mayUse) return;
+			const back = ov.back ?? "the branch head";
+			const button = addButton(parent.buttons(), `Back to ` + back, () => {});
+			armLock(
+				button,
+				backArm,
+				{ label: `Back to ` + back, color: COLORS.accent },
+				"Switching...",
+				() => {},
+				(unlock) =>
+					spawnIn(tabTrove, () => {
+						const reply = requestOverride(kernel, { back: true });
+						if (!reply.ok) unlock();
+					}),
+			);
+		};
 		const body = page.group();
 		body.text("Loading...", COLORS.dim);
 		every(tabTrove, REFRESH, () => {
@@ -615,6 +691,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				for (const issue of issues) {
 					body.field(issue.title, issue.detail, ISSUE_COLORS[issue.level]);
 					if (issue.action === "migrate") migrateButton(body, status);
+					if (issue.action === "back") backButton(body, status);
 				}
 			}
 			body.section("Server");
@@ -884,6 +961,16 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		}
 		let data: Picker | undefined;
 		const expanded = new Set<string>();
+		/** Two-tap state per row (kept across redraws). */
+		const arms = new Map<string, ArmState>();
+		const armOf = (key: string) => {
+			let state = arms.get(key);
+			if (!state) {
+				state = newArmState();
+				arms.set(key, state);
+			}
+			return state;
+		};
 		let busy = false;
 		let epoch = 0;
 		let load: () => void;
@@ -900,6 +987,19 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				const [text, color] = op === "newServer" ? serverText(ok, reply) : swapText(ok, reply);
 				setResult(text, color);
 				if (op !== "newServer") load();
+			});
+		};
+		/** Kernel 0.3.3: switches THIS server in place through the owner override; a switch restarts this menu. */
+		const override = (label: string, request: OverrideRequest, unlock: () => void) => {
+			setResult(`${label}...`, COLORS.dim);
+			spawnIn(tabTrove, () => {
+				const reply = requestOverride(kernel, request);
+				if (reply.ok) setResult(reply.generation !== undefined ? `Running ${reply.generation}` : "Done", COLORS.good);
+				else {
+					setResult(`Failed: ${reply.error ?? "unknown error"}`, COLORS.bad);
+					unlock();
+				}
+				load();
 			});
 		};
 		addButton(bar, "Reload", () => act("Reloading", "reload"));
@@ -953,6 +1053,17 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			const isPublic = serverType === "public";
 			const isAdmin = data.you?.role === "owner" || data.you?.role === "admin";
 			const running = status?.generation?.artifact;
+			const [overrideKernel, canOverride] = overrideOffered(kernel);
+			const ctx: PickerContext = {
+				serverType,
+				signedOnly: status?.signedOnly === true,
+				isAdmin,
+				overrideKernel,
+				canOverride,
+				experiments: data.experiments === true,
+			};
+			const players = status?.players ?? 0;
+			const playersText = `${players} player${players === 1 ? "" : "s"}`;
 
 			// This server.
 			body.section("This server");
@@ -973,12 +1084,18 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				const pinned = status.pinned === true;
 				const pinText = status.experiment !== undefined ? "A/B experiment, until the next deploy" : pinned ? "yes, until the next deploy" : "no";
 				body.field("Pinned", pinText, pinned ? COLORS.warn : COLORS.text);
+				const ov = status.ov;
+				if (ov !== undefined) {
+					const what = ov.branch ?? ov.artifact ?? "-";
+					body.field("Override", `by ${ov.name ?? ov.by}: ${what}${ov.seq !== undefined ? ` #${ov.seq}` : ""}`, COLORS.warn);
+				}
 			} else {
 				body.text("Status unavailable", COLORS.bad);
 			}
 
-			// Branch picker. One "Switch" everywhere: private/reserved/studio servers swap in place; a public server must
-			// stay on prod (anyone can join it), so there Switch moves only you to a new reserved server on that branch.
+			// Branch picker (framework 0.3.1, build-actions.ts): "Switch" moves THIS server (in place: the owner override on
+			// public servers, kernel 0.3.3; the stored switch on private/reserved/Studio servers); "Join" moves only you to a
+			// reserved server on that branch (everyone else on public servers).
 			body.section("Branches");
 			if (data.branchesError !== undefined) body.text(`Failed: ${data.branchesError}`, COLORS.bad);
 			else if (data.branches.size() === 0) body.text("None", COLORS.dim);
@@ -991,39 +1108,51 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				parts.push(branch.commit ?? branch.artifactId ?? "-");
 				if (branch.deployedAt !== undefined) parts.push(ago(branch.deployedAt));
 				const detail = escapeRich(parts.join("  "));
-				if (serverType === undefined || current) {
+				const action = branchAction(ctx, current);
+				if (action === undefined) {
 					body.row(title, detail);
-				} else if (isPublic) {
+				} else if (action === "join") {
 					body.row(title, detail, {
-						label: "Switch",
+						label: branchLabel(action),
 						color: COLORS.accent,
 						onClick: () => act(`Moving you to a ${branch.name} server`, "newServer", branch.name),
 					});
-				} else {
+				} else if (action === "stored") {
 					body.row(title, detail, {
-						label: "Switch",
+						label: branchLabel(action),
 						color: COLORS.accent,
 						onClick: () => act(`Switching to ${branch.name}`, "switch", branch.name),
 					});
+				} else {
+					const row = body.row(title, detail, { label: branchLabel(action), color: COLORS.accent, onClick: () => {} });
+					const button = row.FindFirstChildWhichIsA("TextButton");
+					if (button) {
+						armLock(
+							button,
+							armOf(`branch:${branch.name}`),
+							{ label: branchLabel(action), color: COLORS.accent },
+							"Switching...",
+							() => setResult(`Switch this server (${playersText}) to ${branch.name}?`, COLORS.warn),
+							(unlock) => override(`Switching to ${branch.name}`, { branch: branch.name }, unlock),
+						);
+					}
 				}
 			}
 
-			// Artifact picker: newest first, grouped by branch.
-			body.section("Artifacts");
+			// Build picker: newest first, grouped by branch.
+			body.section("Builds");
 			const artifacts = data.artifacts;
 			if (artifacts === undefined) {
 				body.text(data.artifactsNote ?? "Unavailable", COLORS.dim);
 				return;
 			}
 			if (artifacts.size() === 0) body.text("None yet", COLORS.dim);
-			// Kernel 0.3: a prod server (public, or private on a prod branch) takes only CLI-signed pins, so nothing loads
-			// in place here (non-admins on public servers still move themselves to a reserved server).
-			const signedOnly = status?.signedOnly === true;
-			const inPlaceBlocked = signedOnly && (isAdmin || !isPublic);
-			if (inPlaceBlocked) body.text("Use the CLI: typetorch pin", COLORS.dim);
-			// Owner/admin on a public server load in place as an A/B experiment (kernel 0.2.3+).
-			const abInPlace = isPublic && isAdmin && data.experiments === true && !signedOnly;
-			if (isPublic && isAdmin && !abInPlace && !signedOnly) body.text("A/B needs kernel 0.2.3", COLORS.dim);
+			// Kernels before 0.3.3: a prod server takes only CLI-signed pins, so nothing loads in place there.
+			if (showCliNote(ctx)) body.text("Use the CLI: typetorch pin", COLORS.dim);
+			const abInPlace = ctx.serverType === "public" && isAdmin && ctx.experiments && !ctx.signedOnly;
+			if (ctx.serverType === "public" && isAdmin && !ctx.experiments && !ctx.signedOnly && !canOverride) {
+				body.text("A/B needs kernel 0.2.3", COLORS.dim);
+			}
 			const order = new Array<string>();
 			const groups = new Map<string, ArtifactEntry[]>();
 			for (const entry of artifacts) {
@@ -1053,45 +1182,57 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 					if (entry.rollout !== undefined) title += tag(`${entry.rollout}%`, COLORS.info);
 					if (entry.rollback) title += tag("ROLLBACK", COLORS.warn);
 					const detail = escapeRich(`${entry.artifactId ?? `asset-${entry.assetId}`}  ${ago(entry.at)}`);
-					if (entry.running || serverType === undefined || inPlaceBlocked) {
+					const action = buildAction(ctx, entry);
+					if (action === undefined) {
 						expandable(body.row(title, detail), entry.assetId);
 						return;
 					}
-					// Mirrors the kernel's rules (it re-checks): any dev loads on private/reserved/studio servers; on a
-					// public server only owner/admin: any artifact as an A/B experiment (kernel 0.2.3+), else only
-					// prod-channel ones. Everyone else opens a reserved server pinned to it (only they move).
-					const canLoad = !isPublic || (isAdmin && (abInPlace || entry.channel === "prod"));
-					// A dev-channel artifact on a prod-channel server: a dark "Dev channel" button instead of the orange
-					// Load, so it isn't loaded by mistake. Still works (tap twice); switching the branch first is the
-					// usual way.
-					const crossChannel = status?.channel === "prod" && entry.channel === "dev";
-					if (canLoad) {
-						let armed = !isPublic && !crossChannel; // public server or cross-channel: tap twice
-						const loadRow = body.row(title, detail, {
-							label: crossChannel ? "Dev channel" : "Load",
-							color: crossChannel ? undefined : COLORS.accent,
-							onClick: (button) => {
-								if (!armed) {
-									armed = true;
-									button.Text = "Confirm";
-									// Public: the whole server moves, so say so before the second tap.
-									if (isPublic) setResult(`Everyone on this server runs ${short}`, COLORS.warn);
-									return;
-								}
-								act(`Loading ${short}`, "pin", abInPlace ? { assetId: entry.assetId, experiment: true } : entry.assetId);
-							},
-						});
-						expandable(loadRow, entry.assetId);
-					} else {
-						// Same button as above; here it moves only you to a reserved server pinned to this artifact.
+					if (action === "here") {
+						// Kernel 0.3.3: the owner/admins load it on THIS server in place (two taps; everyone stays).
+						const row = body.row(title, detail, { label: buildLabel(action), color: COLORS.accent, onClick: () => {} });
+						const button = row.FindFirstChildWhichIsA("TextButton");
+						if (button) {
+							armLock(
+								button,
+								armOf(`build:${entry.assetId}`),
+								{ label: buildLabel(action), color: COLORS.accent },
+								"Loading...",
+								() => setResult(`Load ${buildName(entry)} on this server (${playersText})?`, COLORS.warn),
+								(unlock) => override(`Loading ${short}`, { assetId: entry.assetId }, unlock),
+							);
+						}
+						expandable(row, entry.assetId);
+						return;
+					}
+					if (action === "join") {
+						// Moves only you to a reserved server pinned to this build.
 						const moveRow = body.row(title, detail, {
-							label: crossChannel ? "Dev channel" : "Load",
-							color: crossChannel ? undefined : COLORS.accent,
+							label: buildLabel(action),
+							color: COLORS.accent,
 							onClick: () =>
 								act(`Moving you to a server on ${short}`, "newServer", { branch: entry.branch, assetId: entry.assetId }),
 						});
 						expandable(moveRow, entry.assetId);
+						return;
 					}
+					// "pin": private/reserved/Studio servers, or an A/B experiment on a public server before kernel 0.3.3.
+					// A dev-channel build on a prod-channel server: a dark "Dev channel" button, so it isn't loaded by mistake.
+					const crossChannel = status?.channel === "prod" && entry.channel === "dev";
+					let armed = !isPublic && !crossChannel; // public server or cross-channel: tap twice
+					const loadRow = body.row(title, detail, {
+						label: crossChannel ? "Dev channel" : buildLabel(action),
+						color: crossChannel ? undefined : COLORS.accent,
+						onClick: (button) => {
+							if (!armed) {
+								armed = true;
+								button.Text = "Confirm";
+								if (isPublic) setResult(`Everyone on this server runs ${short}`, COLORS.warn);
+								return;
+							}
+							act(`Loading ${short}`, "pin", abInPlace ? { assetId: entry.assetId, experiment: true } : entry.assetId);
+						},
+					});
+					expandable(loadRow, entry.assetId);
 				});
 				if (!showAll && group.size() > ARTIFACTS_PER_BRANCH) {
 					body.link(`Show all ${group.size()}`, () => {

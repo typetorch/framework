@@ -2,7 +2,7 @@ import type { AssetFacts } from "../assets/manifest";
 import type { KernelStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
-export const LATEST_KERNEL = "0.3.2";
+export const LATEST_KERNEL = "0.3.3";
 /** The oldest kernel API this framework runs on. */
 export const REQUIRED_KERNEL_API = 1;
 /** The first kernel that writes the heartbeat and deploy reports itself. */
@@ -17,8 +17,11 @@ export interface HealthIssue {
 	level: HealthLevel;
 	title: string;
 	detail: string;
-	/** A fix the Status page offers next to the issue ("migrate": move everyone to a new server, admin-ui.ts). */
-	action?: "migrate";
+	/**
+	 * A fix the Status page offers next to the issue ("migrate": move everyone to a new server, admin-ui.ts; "back": end
+	 * the owner override, kernel 0.3.3).
+	 */
+	action?: "migrate" | "back";
 }
 
 /** Facts only the server can check (devtools "status" op); missing on older frameworks. */
@@ -45,7 +48,8 @@ export function versionLess(a: string, b: string): boolean {
 	return false;
 }
 
-function secondsSince(iso: string): number | undefined {
+/** Seconds since an ISO time (undefined: unparsable). */
+export function secondsSince(iso: string): number | undefined {
 	const [ok, time] = pcall(() => DateTime.fromIsoDate(iso));
 	if (!ok || time === undefined) return undefined;
 	return DateTime.now().UnixTimestamp - time.UnixTimestamp;
@@ -155,6 +159,19 @@ export function assetIssues(assets: AssetFacts | undefined): HealthIssue[] {
 	return issues;
 }
 
+/** Kernel 0.3.3: "Overridden by Owner" / "dev #37" while an owner override holds this server (Back: "back"). */
+export function overrideIssue(status: KernelStatus): HealthIssue | undefined {
+	const ov = status.ov;
+	if (ov === undefined) return undefined;
+	const what = ov.branch ?? ov.artifact ?? "a build";
+	return {
+		level: "warn",
+		title: `Overridden by ${ov.name ?? `user ${ov.by}`}`,
+		detail: ov.seq !== undefined ? `${what} #${ov.seq}` : what,
+		action: "back",
+	};
+}
+
 /** Everything about this server a dev should notice, worst first. */
 export function checkHealth(status: KernelStatus, facts?: ServerFacts): HealthIssue[] {
 	const issues = new Array<HealthIssue>();
@@ -173,6 +190,8 @@ export function checkHealth(status: KernelStatus, facts?: ServerFacts): HealthIs
 			action: "migrate",
 		});
 	}
+	const overridden = overrideIssue(status);
+	if (overridden) issues.push(overridden);
 	if (status.generation === undefined) {
 		issues.push({ level: "error", title: "No game running", detail: "No artifact is mounted on this server." });
 	}

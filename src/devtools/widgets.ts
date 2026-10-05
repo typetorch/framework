@@ -1,6 +1,6 @@
 import { Players, UserInputService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
-import { popIn, popOut } from "../ui";
+import { bump, popIn, popOut } from "../ui";
 
 /**
  * Building blocks of the dev menu UI (plans/10), shared by its tabs: colors, instance helpers, the `Page` column,
@@ -152,6 +152,125 @@ export function buttonRow(): Frame {
 		row,
 	);
 	return row;
+}
+
+/**
+ * "45s", "12m", "3h 04m", "2d 3h": the short uptime and age text of Admin > Servers rows ("up 12m", "seen 2m ago") and
+ * the Artifact tab ("Running", "Server up", "Built ... (8m ago)").
+ */
+export function shortDuration(seconds: number | undefined): string {
+	if (seconds === undefined) return "-";
+	const total = math.max(0, math.floor(seconds));
+	const days = math.floor(total / 86400);
+	const hours = math.floor((total % 86400) / 3600);
+	const minutes = math.floor((total % 3600) / 60);
+	if (days > 0) return `${days}d ${hours}h`;
+	if (hours > 0) return "%dh %02dm".format(hours, minutes);
+	if (minutes > 0) return `${minutes}m`;
+	return `${total}s`;
+}
+
+/** How long a two-tap button stays armed ("Confirm"). */
+export const ARM_SECONDS = 4;
+
+/** A two-tap button's state. Keep it outside redraws, so a refresh neither drops the arm nor the lock. */
+export interface ArmState {
+	armedAt: number;
+	locked: boolean;
+}
+
+export function newArmState(): ArmState {
+	return { armedAt: -math.huge, locked: false };
+}
+
+/**
+ * The confirm pattern for actions that move a whole server (Migrate, Switch, Load here): the first tap turns the button
+ * green "Confirm" for ARM_SECONDS and calls `onArm` (say what will happen); the second runs `run` once and locks the
+ * button dark with `busyLabel`. `run` gets `unlock` for when it failed. `idle` may change (call the returned paint).
+ */
+export function armLock(
+	button: TextButton,
+	state: ArmState,
+	idle: { label: string; color?: Color3 },
+	busyLabel: string,
+	onArm: () => void,
+	run: (unlock: () => void) => void,
+): () => void {
+	const paint = () => {
+		if (state.locked) {
+			button.AutoButtonColor = false;
+			button.BackgroundColor3 = COLORS.button;
+			button.TextColor3 = COLORS.dim;
+			button.Text = busyLabel;
+			return;
+		}
+		button.AutoButtonColor = true;
+		if (os.clock() - state.armedAt < ARM_SECONDS) {
+			button.BackgroundColor3 = COLORS.good;
+			button.TextColor3 = COLORS.dark;
+			button.Text = "Confirm";
+			return;
+		}
+		button.BackgroundColor3 = idle.color ?? COLORS.button;
+		button.TextColor3 = idle.color !== undefined ? COLORS.dark : COLORS.text;
+		button.Text = idle.label;
+	};
+	const unlock = () => {
+		state.locked = false;
+		state.armedAt = -math.huge;
+		if (button.Parent) paint();
+	};
+	paint();
+	button.Activated.Connect(() => {
+		if (state.locked) return;
+		if (os.clock() - state.armedAt < ARM_SECONDS) {
+			state.armedAt = -math.huge;
+			state.locked = true;
+			paint();
+			run(unlock);
+			return;
+		}
+		state.armedAt = os.clock();
+		paint();
+		bump(button);
+		onArm();
+		task.delay(ARM_SECONDS, () => {
+			if (button.Parent) paint();
+		});
+	});
+	return paint;
+}
+
+/** A row of small word chips ("Here", "Reserved", "A/B") that wraps instead of truncating. */
+export function chipRow(): Frame {
+	const row = make("Frame", { BackgroundTransparency: 1, Size: UDim2.fromScale(1, 0), AutomaticSize: Enum.AutomaticSize.Y });
+	make(
+		"UIListLayout",
+		{
+			FillDirection: Enum.FillDirection.Horizontal,
+			SortOrder: Enum.SortOrder.LayoutOrder,
+			VerticalAlignment: Enum.VerticalAlignment.Center,
+			Padding: new UDim(0, 4),
+			Wraps: true,
+		},
+		row,
+	);
+	return row;
+}
+
+/** One chip: a short word on a dark pill with a colored outline; it sizes to its text and never truncates. */
+export function chip(row: Instance, text: string, color: Color3): TextLabel {
+	const label = style(make("TextLabel", { BackgroundColor3: COLORS.window, BackgroundTransparency: 0 }), text, 13, color, Enum.Font.BuilderSansBold);
+	label.TextWrapped = false;
+	label.TextXAlignment = Enum.TextXAlignment.Center;
+	label.Size = UDim2.fromOffset(0, 20);
+	label.AutomaticSize = Enum.AutomaticSize.X;
+	label.LayoutOrder = nextOrder(row);
+	corner(label, 10);
+	pad(label, 0, 7);
+	make("UIStroke", { Color: color, Thickness: 1, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, label);
+	label.Parent = row;
+	return label;
 }
 
 /** An empty item that takes the rest of a buttonRow's line, pushing the next items to the right. */

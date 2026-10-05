@@ -100,6 +100,8 @@ export interface AdminServer {
 	health?: string;
 	/** Kernel 0.3.2+: its applied deploy seq. */
 	seq?: number;
+	/** Kernel 0.3.3+: an owner override holds it (who, and the branch or build it was switched to). */
+	override?: { by?: number; branch?: string; artifact?: string };
 }
 
 export interface AdminServersReply {
@@ -206,6 +208,8 @@ interface StoredServer {
 	h?: unknown;
 	e?: unknown;
 	sv?: unknown;
+	/** Kernel 0.3.3+: the owner override ({by, at, branch | artifact}). */
+	ov?: unknown;
 }
 
 /** Kernel 0.3.2+: `fleetStatus()` is this server's row (the roll call answers with it). */
@@ -665,6 +669,13 @@ export function registerAdminOps(
 			ab: version !== undefined ? !versionLess(version, AB_KERNEL) : undefined,
 			health: text(value.h),
 			seq: num(value.q),
+			override: typeIs(value.ov, "table")
+				? {
+						by: num((value.ov as Record<string, unknown>).by),
+						branch: text((value.ov as Record<string, unknown>).branch),
+						artifact: text((value.ov as Record<string, unknown>).artifact),
+					}
+				: undefined,
 		};
 	};
 

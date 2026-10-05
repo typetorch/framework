@@ -638,7 +638,7 @@ do
 		end
 		return list
 	end
-	local base = { kernelApi = 1, kernelVersion = "0.3.2", serverType = "public", generation = { name = "x#1" }, history = {}, memoryMb = 1 }
+	local base = { kernelApi = 1, kernelVersion = "0.3.3", serverType = "public", generation = { name = "x#1" }, history = {}, memoryMb = 1 }
 	local function with(fields)
 		local status = table.clone(base)
 		for key, value in fields do
@@ -646,7 +646,7 @@ do
 		end
 		return status
 	end
-	check("health: LATEST_KERNEL is 0.3.2", health.LATEST_KERNEL == "0.3.2")
+	check("health: LATEST_KERNEL is 0.3.3", health.LATEST_KERNEL == "0.3.3")
 	local old = titles(with({ kernelVersion = "0.3.1" }))
 	check("health: a 0.3.1 server: Kernel update (warn) and No deploy reports (info)", old["Kernel update"] == "warn" and old["No deploy reports"] == "info")
 	local studio = titles(with({ kernelVersion = "0.3.1", serverType = "studio" }))
@@ -669,6 +669,94 @@ do
 	local clients = titles(with({ reports = { total = 1, kept = 1, listeners = 1 }, clients = { players = 3, reported = 3, ok = 2, failed = 1, behind = 1, failures = 1, lastFailure = { userId = 1, generation = "x#1", error = "boom", at = 0 } } }))
 	check("health: a client's failed generation: warn", clients["Clients failed 1"] == "warn")
 	check("admin: kernel 0.3.2 fleetStatus is feature-detected", admin.kernelHasFleetStatus({ fleetStatus = function() end }) == true and admin.kernelHasFleetStatus({}) == false)
+	-- Kernel 0.3.3: the owner override line on Server > Status, with its "Back to <branch>" action.
+	local overridden = health.checkHealth(with({ reports = { total = 1, kept = 1, listeners = 1 }, ov = { by = 1, at = 10, branch = "dev", name = "Owner", back = "prod", seq = 37 } }))
+	local line = overridden[1]
+	check("health: an owner override: 'Overridden by Owner' / 'dev #37' (warn, action back)", #overridden == 1 and line.title == "Overridden by Owner" and line.detail == "dev #37" and line.level == "warn" and line.action == "back", line)
+	local pinnedLine = health.overrideIssue(with({ ov = { by = 2, at = 10, artifact = "aaaaaaa-111111" } }))
+	check("health: an override to a build without a name: by user id", pinnedLine ~= nil and pinnedLine.title == "Overridden by user 2" and pinnedLine.detail == "aaaaaaa-111111")
+	check("health: no override, no line", health.overrideIssue(base) == nil)
+end
+
+-- Branch tab and "Load a build" (framework 0.3.1, devtools/build-actions.ts): the words and the rules both UIs use.
+do
+	local model = convert(roblox.deserializeModel(bytes)[1], nil)
+	inner[model].Name = "payload#build-actions"
+	local TS = requireModule(model.include.RuntimeLib)
+	local frameworkOut = model.include.node_modules["@typetorch"].framework.out
+	local actions = TS.import(model.Server, frameworkOut, "devtools", "build-actions")
+	local ab = TS.import(model.Server, frameworkOut, "devtools", "ab")
+	local function ctx(fields)
+		local value = { serverType = "public", signedOnly = true, isAdmin = true, overrideKernel = true, canOverride = true, experiments = true }
+		for key, field in fields do
+			value[key] = field
+		end
+		return value
+	end
+	-- Branches: the owner/admins switch a public (prod) server in place; everyone else joins; private servers keep their
+	-- stored switch; the current branch has no button.
+	check("build-actions: owner/admin on a public prod server: Switch in place", actions.branchAction(ctx({}), false) == "here" and actions.branchLabel("here") == "Switch")
+	check("build-actions: the current branch: no button", actions.branchAction(ctx({}), true) == nil)
+	check("build-actions: a non-admin on a public server: Join", actions.branchAction(ctx({ isAdmin = false, canOverride = false }), false) == "join" and actions.branchLabel("join") == "Join")
+	check("build-actions: an older kernel on a public server: Join (moves only you)", actions.branchAction(ctx({ overrideKernel = false, canOverride = false }), false) == "join")
+	check("build-actions: a reserved server keeps its stored switch", actions.branchAction(ctx({ serverType = "reserved", signedOnly = false }), false) == "stored")
+	-- Builds: Load here in place on public and prod servers (0.3.3); the CLI note only on older kernels.
+	local build = { running = false, channel = "dev" }
+	check("build-actions: owner/admin on a prod server: Load here", actions.buildAction(ctx({}), build) == "here" and actions.buildLabel("here") == "Load here")
+	check("build-actions: a signed-only private server: Load here too", actions.buildAction(ctx({ serverType = "private" }), build) == "here")
+	check("build-actions: the running build: no button", actions.buildAction(ctx({}), { running = true, channel = "prod" }) == nil)
+	check("build-actions: a non-admin on a public server: Join", actions.buildAction(ctx({ isAdmin = false, canOverride = false }), build) == "join" and actions.buildLabel("join") == "Join")
+	check("build-actions: no 'Use the CLI' note on kernel 0.3.3", actions.showCliNote(ctx({})) == false and actions.showCliNote(ctx({ isAdmin = false, canOverride = false, serverType = "private" })) == false)
+	check("build-actions: an older kernel on a prod server: no button, the CLI note", actions.buildAction(ctx({ overrideKernel = false, canOverride = false }), build) == nil and actions.showCliNote(ctx({ overrideKernel = false, canOverride = false })) == true)
+	check("build-actions: an older kernel on a dev private server: the kernel pin", actions.buildAction(ctx({ serverType = "private", signedOnly = false, overrideKernel = false, canOverride = false }), build) == "pin")
+	-- Names and lines.
+	local entry = { seq = 36, commit = "4363e8c", assetId = 1, branch = "dev", live = true, running = false }
+	check("build-actions: '#36  4363e8c' and 'dev · 3h ago'", actions.buildTitle(entry) == "#36  4363e8c" and actions.buildDetail(entry, 3 * 3600 + 5) == "dev · 3h ago" and actions.buildName(entry) == "#36")
+	check("build-actions: one badge, Running here over Live", actions.buildBadge(entry) == "Live" and actions.buildBadge({ assetId = 1, branch = "dev", live = true, running = true }) == "Running here" and actions.buildBadge({ assetId = 1, branch = "dev" }) == nil)
+	check("build-actions: the button says the action", actions.loadButtonLabel({ where = "here" }) == "Load here" and actions.loadButtonLabel({ where = "selected", selected = 2 }) == "Load on 2 servers" and actions.loadButtonLabel({ where = "selected", selected = 1 }) == "Load on 1 server" and actions.loadButtonLabel({ where = "share", pct = 10 }) == "Load on 10%")
+	local jobs = {}
+	for i = 1, 40 do
+		table.insert(jobs, `job-{i}`)
+	end
+	local reached = 0
+	for _, jobId in jobs do
+		if ab.jobBucket(jobId) < 25 then
+			reached += 1
+		end
+	end
+	local summary = actions.loadSummary(entry, { where = "share", pct = 25, branch = "dev", branchJobs = jobs })
+	check("build-actions: the share summary counts the servers the percent reaches (jobBucket)", summary == `Load #36 on 25% of dev servers (about {reached} of 40)` and actions.shareCount(25, jobs) == reached, summary)
+	check("build-actions: the here summary", actions.loadSummary(entry, { where = "here", players = 1 }) == "Load #36 here (1 player)")
+	-- (roblox-ts returns a tuple type as one array.)
+	local loading = actions.loadProgress("#36", 1, 0, false)
+	local finished = actions.loadProgress("#36", 1, 1, false)
+	local partial = actions.loadProgress("#36", 2, 1, true)
+	check("build-actions: the status line: Loading, Done, and failures", loading[1] == "Loading #36 on 1 server" and not loading[2] and not loading[3] and finished[1] == "Done: 1 switched" and finished[2] and not finished[3] and partial[1] == "1 of 2 switched" and partial[2] and partial[3])
+	-- The override is feature-detected (kernel 0.3.3) and offered only when the kernel says this player may.
+	local offered = actions.overrideOffered({
+		requestOverride = function() end,
+		devStatus = function()
+			return { dev = true, canOverride = true }
+		end,
+	})
+	local offeredOld = actions.overrideOffered({
+		devStatus = function()
+			return { dev = true }
+		end,
+	})
+	local offeredNo = actions.overrideOffered({
+		requestOverride = function() end,
+		devStatus = function()
+			return { dev = true }
+		end,
+	})
+	check("build-actions: the override is feature-detected and needs canOverride", offered[1] and offered[2] and not offeredOld[1] and not offeredOld[2] and offeredNo[1] and not offeredNo[2])
+	local reply = actions.requestOverride({
+		requestOverride = function()
+			error("boom")
+		end,
+	}, { branch = "dev" })
+	check("build-actions: a failing requestOverride is an error reply", reply.ok == false and string.find(reply.error, "boom", 1, true) ~= nil)
 end
 
 -- Networking across a swap (0.2.1, plans/12 P-N1): the server queues reliable sends per player until that client's

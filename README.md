@@ -115,10 +115,17 @@ export class CoinService extends Module implements OnStart {
   work the same way; see the transformer's README.
 - **UI:** `observeElement(trove, tag, (instance, elementTrove) => ...)`, `isRealFrame`, `popIn` / `popOut` / `bump`
   (UIScale, never Size tweens) and `PopupQueue` (one modal at a time).
-- **Dev menu:** devs (Studio, project members, dev badge) get a DEV button, `Ctrl+Shift+D` and `/tt dev`: artifact,
-  server status, logs (server, own client, other players' clients), client and server dex, network stats, module
-  state, a branch and artifact picker (Server > Branch) and a Claude prompt. Prod-channel servers are read-only. The
-  window can be dragged by its header and resized from its corner (double-tap the header to reset). Modules has
+- **Dev menu:** devs (Studio, project members, dev badge) get a DEV button, `Ctrl+Shift+D` and `/tt dev`: artifact
+  (with how long the server and client generations have run, the server's uptime and the build's age), server status,
+  logs (server, own client, other players' clients), client and server dex, network stats, module state, a branch and
+  build picker (Server > Branch) and a Claude prompt. Prod-channel servers are read-only. The window can be dragged by
+  its header and resized from its corner (double-tap the header to reset).
+- **Switch a live server (kernel 0.3.3):** the owner (and admins, unless the place is owner-only) switch THIS server in
+  place, public and prod ones too: Server > Branch, "Switch" on a branch or "Load here" on a build, then the green
+  Confirm. Everyone stays; the server follows that branch (dev rules) or holds that build until "Back to prod" on
+  Server > Status (or the server closes). Nothing is stored: new servers still boot the signed prod head. Others see
+  "Join", which moves only them to a reserved server. Admin > Servers "Load a build..." does the same for this server,
+  the ticked servers or a share of one branch (A/B pins), with one status line under the list. Modules has
   Overview, State and Assets (hot assets), each with a Server | Client toolbar. In the Dex,
   right-click or long-press a property for Copy value / Copy name and a tree row for Copy path (Roblox has no
   clipboard, so copying opens a small popup with the text selected: Ctrl+C, or long-press > Copy on touch).
@@ -335,7 +342,8 @@ bun run build   # rbxtsc --type package -> out/
   kernel's and the template's `rokit.toml`). `scripts/test-generations.luau` takes a game's built payload:
   `cd ../template && bun run payload && lune run ../framework/scripts/test-generations.luau build/payload.rbxm` boots
   two generations in one VM and checks fresh registries, DI and generated guards, then runs the real `startServer`
-  with stub kernels (onStart failures reported to kernel 0.3.2, raised on older ones; onClose) and the health lines.
+  with stub kernels (onStart failures reported to kernel 0.3.2, raised on older ones; onClose), the health lines and
+  the Branch tab / "Load a build" rules (`devtools/build-actions.ts`).
   To test framework changes before the template takes them, build the payload from a copy of the template whose
   `node_modules/@typetorch/framework/out` is this repo's `out/`.
   `scripts/test-analytics.luau` checks the analytics engine's pure parts (experiment assignment, settings, the queue

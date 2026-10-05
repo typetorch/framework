@@ -147,6 +147,33 @@ export interface DevInfo {
 	reason: string;
 	role?: Role;
 	channel?: Channel;
+	/** Kernel 0.3.3+: this player may switch this server in place (the owner, admins unless the place is owner-only). */
+	canOverride?: boolean;
+}
+
+/** Kernel 0.3.3+: an owner override holds this server (`status().ov`, `fleetStatus().ov`). */
+export interface OverrideInfo {
+	/** User id of the owner or admin who switched it, and when (unix seconds). */
+	by: number;
+	at: number;
+	/** The branch it follows now, or the build it holds. */
+	branch?: string;
+	artifact?: string;
+	/** status() only: their name, the branch switching back returns to, the running build's seq. */
+	name?: string;
+	back?: string;
+	seq?: number;
+}
+
+/** Kernel 0.3.3+: what to switch this server to (`requestOverride`). */
+export type OverrideRequest = { branch: string } | { assetId: number } | { back: true };
+
+export interface OverrideReply {
+	ok: boolean;
+	error?: string;
+	/** The generation now running (the switch replaces this client generation too, so it may never be seen). */
+	generation?: string;
+	queued?: boolean;
 }
 
 /**
@@ -399,6 +426,8 @@ export interface FleetStatus {
 	h: HealthState;
 	/** The last error (<= 200 bytes), while recent or unhealthy. */
 	e?: string;
+	/** Kernel 0.3.3+: an owner override holds this server. */
+	ov?: OverrideInfo;
 	sv: 2;
 }
 
@@ -521,6 +550,8 @@ export interface KernelStatus {
 	reports?: { total: number; kept: number; listeners: number };
 	/** Kernel 0.3.2+: the kernel's own fleet API sender (the `TypeTorchFleet` setting). */
 	fleet?: FleetSenderInfo;
+	/** Kernel 0.3.3+: an owner override holds this server (who, when, the branch or build, and where back goes). */
+	ov?: OverrideInfo;
 	/** Kernel 0.3.2+: client generation reports. */
 	clients?: ClientsSummary;
 }
@@ -651,6 +682,15 @@ export interface ClientKernel {
 	// Kernel 0.3.2+ (additive).
 	/** One handler per generation: the server dropped one of this generation's messages (it runs a newer protocol). */
 	onResync?(handler: () => void): void;
+
+	// Kernel 0.3.3+ (additive).
+	/**
+	 * Asks the server to switch ITSELF in place, for this player (the owner, or an admin unless the place is
+	 * owner-only; `devStatus().canOverride`): to a branch, a known build, or back. Yields until it answers (up to
+	 * 30 s). A switch replaces this client generation too, so the caller may not see the answer. The server has no API
+	 * for this: payload code can't do it on another player's behalf.
+	 */
+	requestOverride?(request: OverrideRequest): OverrideReply;
 }
 
 export type Kernel = ServerKernel | ClientKernel;
