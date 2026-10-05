@@ -1,0 +1,45 @@
+# @typetorch/framework: the package build (rbxtsc --type package, which is also the typecheck) and the Lune specs that
+# run on the compiled out/. scripts/test-generations.luau needs a game's payload (the template's), so it isn't here.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build and Lune specs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - name: Install
+        run: bun install --frozen-lockfile
+      - name: Build (rbxtsc --type package)
+        run: bun run build
+      # The repo pins no tools; Lune comes from a manifest written here (same version as the kernel's rokit.toml).
+      - name: Pin Lune
+        run: printf '[tools]\nlune = "lune-org/lune@0.10.5"\n' > rokit.toml
+      - name: Rokit tools (lune)
+        uses: CompeyDev/setup-rokit@v0.2.1
+        with:
+          cache: "true"
+      - name: Lune specs on out/
+        run: |
+          set -euo pipefail
+          lune run scripts/test-explorer-core.luau out/devtools/explorer/
+          lune run scripts/test-hot-assets.luau out/
+          lune run scripts/test-net-inspect.luau out/net/
+          lune run scripts/test-sha256.luau out/devtools/sha256.luau
+          lune run scripts/test-toolbox-sanitize.luau out/devtools/
