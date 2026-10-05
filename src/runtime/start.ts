@@ -20,7 +20,7 @@ import type {
 import { ClientDispatcher, ServerDispatcher, setClientDispatcher, setServerDispatcher } from "../net/runtime";
 import { observePlayers } from "../players";
 import { Reflect } from "../reflection/reflect";
-import { bindTypeTorch, startedTypeTorch, swapOutTypeTorch, TypeTorch, unbindTypeTorch } from "../typetorch";
+import { bindTypeTorch, closeTypeTorch, startedTypeTorch, swapOutTypeTorch, TypeTorch, unbindTypeTorch } from "../typetorch";
 import { persistKeys, RegisteredModule, registered, runningModules } from "./registry";
 
 export interface StartOptions {
@@ -229,10 +229,14 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 		}
 	}
 
-	// Kernel 0.3.2: a real shutdown runs every module's onStop too (reverse order; the kernel gives it up to 20 s).
-	// onSwapOut doesn't run: nothing replaces this generation.
+	// Kernel 0.3.2: a real shutdown runs every module's onStop too (reverse order; the kernel gives it up to 20 s),
+	// then the built-ins' close hooks (the analytics engine's last flush). onSwapOut doesn't run: nothing replaces this
+	// generation.
 	if (realm === "server" && typeIs((kernel as unknown as Record<string, unknown>).onClose, "function")) {
-		(kernel as ServerKernel).onClose!(() => stopModules());
+		(kernel as ServerKernel).onClose!(() => {
+			stopModules();
+			closeTypeTorch();
+		});
 	}
 
 	onStarted?.();
