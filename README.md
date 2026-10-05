@@ -312,8 +312,9 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   flush on shutdown (kernel 0.3.2). Delivery is at least once (a swap mid-request sends that batch again).
   `analytics.stats()` (server) has the counters; `flush()` sends soon.
 
-**Settings** (server only, never sent to clients): the ConfigService key `TypeTorchAnalytics`, written by the CLI or in
-Creator Hub (Configs), re-read live every few minutes:
+**Settings** (server only, never sent to clients): the ConfigService key `TypeTorchAnalytics`, written with
+`writeSettings()` from `@typetorch/analytics` (Open Cloud, universe:write) or in Creator Hub (Configs); no CLI command
+writes it. Re-read live every few minutes:
 
 ```json
 { "backend": "basin", "events": "https://<stream-id>.ingest.cloudflare.com",
