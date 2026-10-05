@@ -189,6 +189,8 @@ let logQueued = false;
 const localPersist = new Map<string, object>();
 
 const swapOutListeners = new Set<(info: SwapOutInfo) => void>();
+/** Framework-internal: run on server shutdown after every module's onStop (kernel 0.3.2+ onClose). */
+const closeListeners = new Set<() => void>();
 const pendingListeners = new Set<(update: PendingUpdate) => void>();
 const branchListeners = new Set<(change: BranchChange) => void>();
 const devListeners = new Set<(player: Player, info: DevInfo) => void>();
@@ -515,9 +517,54 @@ export function swapOutTypeTorch(info: unknown) {
 	}
 }
 
+// Framework-internal (not exported from the package root): built-ins that live with the generation, such as the
+// analytics engine, use these instead of a module's trove.
+
+/** The running generation: its root trove and kernel. Undefined outside a running generation (edit mode). */
+export interface GenerationScope {
+	readonly trove: Trove;
+	readonly server?: ServerKernel;
+	readonly client?: ClientKernel;
+}
+
+export function generationScope(): GenerationScope | undefined {
+	if (!generationTrove) return undefined;
+	return { trove: generationTrove, server, client };
+}
+
+/**
+ * Server shutdown hook for built-ins: runs after every module's onStop, inside the kernel's onClose (kernel 0.3.2+, up
+ * to 20 s; may yield). Returns a disconnect function. `closeHooksSupported()` says whether it will ever run.
+ */
+export function onGenerationClose(callback: () => void): () => void {
+	return listen(closeListeners, callback);
+}
+
+/** Whether the running server kernel has onClose (0.3.2+), so `onGenerationClose` hooks run on shutdown. */
+export function closeHooksSupported(): boolean {
+	return server !== undefined && hasMethod(server, "onClose");
+}
+
+/** Called by runtime/start.ts from the kernel's onClose, after the modules stopped. Hooks run in parallel. */
+export function closeTypeTorch() {
+	const running = new Array<thread>();
+	for (const listener of [...closeListeners]) {
+		running.push(
+			task.spawn(() => {
+				const [ok, err] = pcall(listener);
+				if (!ok) $warn(`TypeTorch close hook threw: ${err}`);
+			}),
+		);
+	}
+	// The kernel gives onClose up to 20 s; wait for the hooks a bit less than that.
+	const deadline = os.clock() + 18;
+	while (os.clock() < deadline && running.some((thread) => coroutine.status(thread) !== "dead")) task.wait(0.1);
+}
+
 /** The generation stopped (or failed to start): drop every listener and the kernel. */
 export function unbindTypeTorch() {
 	swapOutListeners.clear();
+	closeListeners.clear();
 	pendingListeners.clear();
 	branchListeners.clear();
 	devListeners.clear();

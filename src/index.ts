@@ -63,5 +63,22 @@ export type {
 } from "./kernel";
 export { bump, isRealFrame, observeElement, popIn, popOut, PopupQueue } from "./ui";
 export { hotAsset } from "./assets/hot-asset";
+// Analytics (plans/16): optional, nothing runs until `new AnalyticsEngine()`.
+export { AnalyticsEngine } from "./analytics/engine";
+export type {
+	AnalyticsOptions,
+	AnalyticsProps,
+	AnalyticsPurchase,
+	AnalyticsSettings,
+	AnalyticsStats,
+	AnalyticsValue,
+	DeployReport,
+	DeviceKind,
+	EventKind,
+	EventRow,
+	ExperimentOverride,
+	FleetStatus,
+	RecordingRow,
+} from "./analytics/schema";
 export type { HotAsset } from "./assets/hot-asset";
 export type { AssetEntry, AssetSource, AssetStatus, AssetSyncReport } from "./assets/manifest";
