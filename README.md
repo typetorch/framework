@@ -338,8 +338,10 @@ bun run build   # rbxtsc --type package -> out/
   with stub kernels (onStart failures reported to kernel 0.3.2, raised on older ones; onClose) and the health lines.
   To test framework changes before the template takes them, build the payload from a copy of the template whose
   `node_modules/@typetorch/framework/out` is this repo's `out/`.
-  `scripts/test-analytics.luau` checks the analytics engine's pure parts: experiment assignment, settings, the queue
-  and HTTP budget, tt-rec-1 and the sink request bodies.
+  `scripts/test-analytics.luau` checks the analytics engine's pure parts (experiment assignment, settings, the queue
+  and HTTP budget, tt-rec-1, the sink request bodies); `test-analytics-server.luau` and `test-analytics-client.luau`
+  run the compiled server and client cores against mocked services (sessions, intake, retries, a swap with a request
+  in flight, shutdown; the recorder, screens, batching).
 - **Publishing:** `npm publish` runs `prepublishOnly` (clean + build). The package ships only `out/` (no
   `.tsbuildinfo`), `README.md` and `LICENSE`; check with `bun pm pack --dry-run`.
 
