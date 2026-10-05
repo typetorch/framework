@@ -5,6 +5,8 @@ import type { KernelStatus } from "../kernel";
 export const LATEST_KERNEL = "0.3.2";
 /** The oldest kernel API this framework runs on. */
 export const REQUIRED_KERNEL_API = 1;
+/** The first kernel that writes the heartbeat and deploy reports itself. */
+export const REPORTS_KERNEL = "0.3.2";
 /** Auto-rollbacks newer than this (seconds) are reported. */
 const RECENT_ROLLBACK = 15 * 60;
 const HIGH_MEMORY_MB = 3000;
@@ -112,8 +114,8 @@ export function deployIssues(status: KernelStatus): HealthIssue[] {
 	}
 	const heartbeat = status.heartbeat;
 	if (heartbeat === undefined) {
-		if (status.serverType !== "studio") {
-			issues.push({ level: "info", title: "No deploy reports", detail: "Needs kernel 0.3.2." });
+		if (status.serverType !== "studio" && versionLess(status.kernelVersion, REPORTS_KERNEL)) {
+			issues.push({ level: "info", title: "No deploy reports", detail: `Needs kernel ${REPORTS_KERNEL}.` });
 		}
 	} else if (heartbeat.missing === true) {
 		issues.push({ level: "warn", title: "No deploy reports", detail: "Map the kernel's Reports module." });
