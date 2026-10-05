@@ -622,5 +622,48 @@ do
 	check("lifecycle: a report the kernel refuses is raised in the module's thread", ok and #errors == 1, errors[1])
 end
 
+-- Health lines (kernel 0.3.2, devtools/health.ts) and the single heartbeat writer (devtools/admin-server.ts).
+do
+	local model = convert(roblox.deserializeModel(bytes)[1], nil)
+	inner[model].Name = "payload#health"
+	local TS = requireModule(model.include.RuntimeLib)
+	local frameworkOut = model.include.node_modules["@typetorch"].framework.out
+	local health = TS.import(model.Server, frameworkOut, "devtools", "health")
+	local admin = TS.import(model.Server, frameworkOut, "devtools", "admin-server")
+	local function titles(status)
+		local list = {}
+		for _, issue in health.checkHealth(status) do
+			list[issue.title] = issue.level
+		end
+		return list
+	end
+	local base = { kernelApi = 1, kernelVersion = "0.3.2", serverType = "public", generation = { name = "x#1" }, history = {}, memoryMb = 1 }
+	local function with(fields)
+		local status = table.clone(base)
+		for key, value in fields do
+			status[key] = value
+		end
+		return status
+	end
+	check("health: LATEST_KERNEL is 0.3.2", health.LATEST_KERNEL == "0.3.2")
+	local old = titles(with({ kernelVersion = "0.3.1" }))
+	check("health: a 0.3.1 server: Kernel update (warn) and No deploy reports (info)", old["Kernel update"] == "warn" and old["No deploy reports"] == "info")
+	local studio = titles(with({ kernelVersion = "0.3.1", serverType = "studio" }))
+	check("health: no report line in Studio", studio["No deploy reports"] == nil)
+	local ok = titles(with({ heartbeat = { enabled = true, heartbeat = { failing = false }, reports = { failing = false } }, health = { state = "ok", errors = 0 } }))
+	check("health: a healthy 0.3.2 server has no deploy issue", next(ok) == nil, next(ok))
+	local missing = titles(with({ heartbeat = { enabled = false, missing = true } }))
+	check("health: Reports module not mapped: warn", missing["No deploy reports"] == "warn")
+	local failing = titles(with({ heartbeat = { enabled = true, heartbeat = { failing = true, lastError = "throttled" }, reports = { failing = true, lastError = "throttled" } } }))
+	check("health: failing heartbeat and report writes: warn", failing["Heartbeat failing"] == "warn" and failing["Reports failing"] == "warn")
+	local rolled = titles(with({ heartbeat = { enabled = true }, health = { state = "degraded", errors = 0, lastRollback = { from = "g-1", why = "3 errors", at = os.time() } } }))
+	check("health: a recent health-window rollback: error", rolled["Failed health check"] == "error")
+	local degraded = titles(with({ heartbeat = { enabled = true }, health = { state = "degraded", errors = 4, lastError = "boom" } }))
+	check("health: errors after the window: warn", degraded["Errors 4"] == "warn")
+	local clients = titles(with({ heartbeat = { enabled = true }, clients = { players = 3, reported = 3, ok = 2, failed = 1, behind = 1, failures = 1, lastFailure = { userId = 1, generation = "x#1", error = "boom", at = 0 } } }))
+	check("health: a client's failed generation: warn", clients["Clients failed 1"] == "warn")
+	check("admin: kernel 0.3.2 owns the heartbeat (feature-detected)", admin.kernelOwnsHeartbeat({ heartbeat = function() end }) == true and admin.kernelOwnsHeartbeat({}) == false)
+end
+
 print(if failed == 0 then `test-generations: all {passed} checks passed` else `test-generations: {failed} of {passed + failed} checks failed`)
 process.exit(if failed == 0 then 0 else 1)

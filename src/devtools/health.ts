@@ -2,7 +2,7 @@ import type { AssetFacts } from "../assets/manifest";
 import type { KernelStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
-export const LATEST_KERNEL = "0.3.0";
+export const LATEST_KERNEL = "0.3.2";
 /** The oldest kernel API this framework runs on. */
 export const REQUIRED_KERNEL_API = 1;
 /** Auto-rollbacks newer than this (seconds) are reported. */
@@ -94,6 +94,49 @@ export function signingIssues(status: KernelStatus): HealthIssue[] {
 }
 
 /**
+ * Kernel 0.3.2 (plans/12 P-F1, P-O1, P-K7): the health window, the kernel's heartbeat and deploy reports, and client
+ * generation reports.
+ * - a health-window rollback in the last 15 min: error; errors after the window (degraded): warn;
+ * - no deploy reports: info on kernels before 0.3.2 (live servers only), warn when the place doesn't map the kernel's
+ *   Reports module; heartbeat or report writes failing: warn;
+ * - clients whose generation failed to start: warn.
+ */
+export function deployIssues(status: KernelStatus): HealthIssue[] {
+	const issues = new Array<HealthIssue>();
+	const health = status.health;
+	const rollback = health?.lastRollback;
+	if (rollback !== undefined && os.time() - rollback.at <= RECENT_ROLLBACK) {
+		issues.push({ level: "error", title: "Failed health check", detail: `${rollback.from}: ${rollback.why}` });
+	} else if (health?.state === "degraded" && health.errors > 0) {
+		issues.push({ level: "warn", title: `Errors ${health.errors}`, detail: health.lastError ?? "-" });
+	}
+	const heartbeat = status.heartbeat;
+	if (heartbeat === undefined) {
+		if (status.serverType !== "studio") {
+			issues.push({ level: "info", title: "No deploy reports", detail: "Needs kernel 0.3.2." });
+		}
+	} else if (heartbeat.missing === true) {
+		issues.push({ level: "warn", title: "No deploy reports", detail: "Map the kernel's Reports module." });
+	} else if (heartbeat.enabled) {
+		if (heartbeat.heartbeat?.failing === true) {
+			issues.push({ level: "warn", title: "Heartbeat failing", detail: heartbeat.heartbeat.lastError ?? "-" });
+		}
+		if (heartbeat.reports?.failing === true) {
+			issues.push({ level: "warn", title: "Reports failing", detail: heartbeat.reports.lastError ?? "-" });
+		}
+	}
+	const clients = status.clients;
+	if (clients !== undefined && clients.failed > 0) {
+		issues.push({
+			level: "warn",
+			title: `Clients failed ${clients.failed}`,
+			detail: clients.lastFailure?.error ?? "-",
+		});
+	}
+	return issues;
+}
+
+/**
  * Hot assets (plans/13): a failed load keeps the old copy (warn); a failure with nothing live for the key is an
  * error; an unusable manifest is a warning.
  */
@@ -154,6 +197,7 @@ export function checkHealth(status: KernelStatus, facts?: ServerFacts): HealthIs
 	}
 	for (const issue of assetIssues(facts?.assets)) issues.push(issue);
 	for (const issue of signingIssues(status)) issues.push(issue);
+	for (const issue of deployIssues(status)) issues.push(issue);
 	if (status.localPayload === true) {
 		issues.push({ level: "info", title: "Studio: local payload", detail: "Edits need Stop + Play. Reload remounts it." });
 	}

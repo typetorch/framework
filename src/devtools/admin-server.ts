@@ -23,11 +23,14 @@ import { versionLess } from "./health";
  * "TypeTorch" under `mod/<yyyy-mm-dd>/<job>/<n>` (unique keys, SetAsync, no contention; `<job>` is the JobId without
  * dashes cut to 24 characters, because DataStore keys max out at 50).
  *
- * Server list: a MemoryStore SortedMap "TypeTorchServers" (key = JobId, a ~200-byte value, TTL 150 s). Every server
- * writes its own entry about every 60 s plus up to 10 s of jitter while it has players, removes it when the last
- * player leaves, on shut down, and on BindToClose (bound once per server). A swap leaves it alone: the next generation
- * rewrites it within seconds. Reads happen only when a dev opens the list: one GetRangeAsync (up to 200 servers),
- * cached 15 s, single-flight. Quota use stays around 1 write per server per minute plus a few reads.
+ * Server list: a MemoryStore SortedMap "TypeTorchServers" (key = JobId, a ~200-byte value, TTL 150 s). Kernel 0.3.2+
+ * writes it itself (one writer per server, also while no generation runs; `kernel.heartbeat`, feature-detected) and
+ * adds q (applied seq), g (generation), h (health), e (last error) and sv = 2; this file then only reads it. On older
+ * kernels every server writes its own entry here about every 60 s plus up to 10 s of jitter while it has players,
+ * removes it when the last player leaves, on shut down, and on BindToClose (bound once per server). A swap leaves it
+ * alone: the next generation rewrites it within seconds. Reads happen only when a dev opens the list: one GetRangeAsync
+ * (up to 200 servers), cached 15 s, single-flight. Quota use stays around 1 write per server per minute plus a few
+ * reads.
  *
  * Migrate (`admin.migrate`, see the Migrate section): everyone moves to one new reserved server on this branch (and
  * pin), which starts on the newest place version, so a server on an old kernel gets the new one. Admins on public
@@ -95,6 +98,10 @@ export interface AdminServer {
 	kernel?: string;
 	/** Its kernel takes pin messages (0.2.3+); undefined when unknown. */
 	ab?: boolean;
+	/** Kernel 0.3.2+: "ok" | "failed" (nothing runs) | "unverified" | "degraded" (a deploy failed or rolled back there). */
+	health?: string;
+	/** Kernel 0.3.2+: its applied deploy seq. */
+	seq?: number;
 }
 
 export interface AdminServersReply {
@@ -204,6 +211,17 @@ interface StoredServer {
 	x?: unknown;
 	/** kernel version */
 	v?: unknown;
+	/** Kernel 0.3.2+ (the kernel writes the entry): applied seq, generation number, health, last error, schema 2. */
+	q?: unknown;
+	g?: unknown;
+	h?: unknown;
+	e?: unknown;
+	sv?: unknown;
+}
+
+/** Kernel 0.3.2+ writes the server list itself (kernel.heartbeat), so the framework doesn't. */
+export function kernelOwnsHeartbeat(kernel: ServerKernel): boolean {
+	return typeIs((kernel as unknown as Record<string, unknown>).heartbeat, "function");
 }
 
 interface ListCache {
@@ -530,7 +548,8 @@ export function registerAdminOps(
 	// Servers ---------------------------------------------------------------------------------------------------------
 
 	const map = MemoryStoreService.GetSortedMap(SERVER_MAP);
-	const canPublish = game.JobId !== "" && kernel.serverType !== "studio";
+	// Kernel 0.3.2+ is the only writer of this server's entry; older kernels: this generation writes it.
+	const canPublish = game.JobId !== "" && kernel.serverType !== "studio" && !kernelOwnsHeartbeat(kernel);
 	let startedAt = os.time();
 	{
 		const [ok, status] = pcall(() => kernel.status());
@@ -568,20 +587,32 @@ export function registerAdminOps(
 		return ok && info !== undefined;
 	};
 
-	const ownEntry = (): StoredServer => ({
-		t: kernel.serverType,
-		b: kernel.branch,
-		c: kernel.channel,
-		a: kernel.artifact.id,
-		n: Players.GetPlayers().size(),
-		m: Players.MaxPlayers,
-		s: startedAt,
-		u: os.time(),
-		p: game.PlaceId,
-		k: kernel.serverType === "reserved" ? accessCode() : undefined,
-		x: experimentNow() ? 1 : undefined,
-		v: kernel.kernelVersion,
-	});
+	/** Kernel 0.3.2+: this server's health and applied seq, for its own row (status() is cheap). */
+	const healthNow = (): { h?: string; q?: number } => {
+		const [ok, status] = pcall(() => kernel.status());
+		if (!ok || !typeIs(status, "table")) return {};
+		return { h: status.health?.state, q: status.appliedSeq };
+	};
+
+	const ownEntry = (): StoredServer => {
+		const health = healthNow();
+		return {
+			t: kernel.serverType,
+			b: kernel.branch,
+			c: kernel.channel,
+			a: kernel.artifact.id,
+			n: Players.GetPlayers().size(),
+			m: Players.MaxPlayers,
+			s: startedAt,
+			u: os.time(),
+			p: game.PlaceId,
+			k: kernel.serverType === "reserved" ? accessCode() : undefined,
+			x: experimentNow() ? 1 : undefined,
+			v: kernel.kernelVersion,
+			h: health.h,
+			q: health.q,
+		};
+	};
 
 	const publish = () => {
 		if (!canPublish || shuttingDown || saved.migration || Players.GetPlayers().size() === 0) return;
@@ -680,6 +711,8 @@ export function registerAdminOps(
 			experiment: value.x === 1,
 			kernel: version,
 			ab: version !== undefined ? !versionLess(version, AB_KERNEL) : undefined,
+			health: text(value.h),
+			seq: num(value.q),
 		};
 	};
 

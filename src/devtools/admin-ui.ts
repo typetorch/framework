@@ -1109,6 +1109,10 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 		idBox.Size = new UDim2(0, ID_WIDTH, 1, 0);
 		let tags = tag(server.type.upper(), COLORS.info);
 		if (server.experiment) tags += tag("A/B", COLORS.warn);
+		// Kernel 0.3.2 heartbeats carry the server's health: only the bad states get a tag.
+		if (server.health === "failed") tags += tag("DOWN", COLORS.bad);
+		else if (server.health === "unverified") tags += tag("UNVERIFIED", COLORS.bad);
+		else if (server.health === "degraded") tags += tag("DEGRADED", COLORS.warn);
 		if (server.here) tags = tag("HERE", COLORS.accent) + tags;
 		const tagLabel = style(make("TextLabel", { BackgroundTransparency: 1, RichText: true }, top), tags, 14);
 		tagLabel.TextWrapped = false;
