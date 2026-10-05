@@ -1,4 +1,3 @@
-import { Reflect } from "@flamework/core";
 import { Players, RunService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $print, $warn } from "rbxts-transform-debug";
@@ -20,6 +19,7 @@ import type {
 } from "../module";
 import { ClientDispatcher, ServerDispatcher, setClientDispatcher, setServerDispatcher } from "../net/runtime";
 import { observePlayers } from "../players";
+import { Reflect } from "../reflection/reflect";
 import { bindTypeTorch, startedTypeTorch, swapOutTypeTorch, TypeTorch, unbindTypeTorch } from "../typetorch";
 import { persistKeys, RegisteredModule, registered, runningModules } from "./registry";
 
@@ -31,8 +31,6 @@ export interface StartOptions {
 	/** Include the in-game dev menu (only devs ever see it). Default true. */
 	devtools?: boolean;
 }
-
-const idToObj = (Reflect as unknown as { idToObj: Record<string, object> }).idToObj;
 
 function has(instance: object, method: string): boolean {
 	return typeIs((instance as Record<string, unknown>)[method], "function");
@@ -48,9 +46,10 @@ function requireAll(folders: Instance[]) {
 }
 
 function dependenciesOf(ctor: object): object[] {
-	const ids = Reflect.getOwnMetadata<string[]>(ctor, "flamework:parameters") ?? [];
+	// Written by @typetorch/transformer on classes decorated with @Service / @Controller (constructor parameter ids).
+	const ids = Reflect.getOwnMetadata<string[]>(ctor, "typetorch:parameters") ?? [];
 	return ids.map((id) => {
-		const dependency = idToObj[id];
+		const dependency = Reflect.idToObj.get(id);
 		assert(dependency, `${tostring(ctor)} needs ${id}, which is not a loaded @Service/@Controller`);
 		return dependency;
 	});

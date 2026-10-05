@@ -1,4 +1,4 @@
-import { Modding } from "@flamework/core";
+import type { Modding } from "../reflection/modding";
 import { Players } from "@rbxts/services";
 import { $warn } from "rbxts-transform-debug";
 import { clientDispatcher, registeredGuards, registeredLimits, serverDispatcher } from "./runtime";
@@ -106,7 +106,7 @@ function place<T extends object>(root: Record<string, unknown>, path: string, cr
  * //         network.client.coins.changed.on((total) => ...)
  * ```
  *
- * rbxts-transformer-flamework fills in a runtime type guard for every leaf (both directions, nested namespaces
+ * `@typetorch/transformer` fills in a runtime type guard for every leaf (both directions, nested namespaces
  * included); the server checks client -> server guards on every message, after rate and shape limits. Messages travel
  * over the kernel's stable remotes, so a generation swap never breaks the network.
  *
@@ -116,7 +116,7 @@ export function createNetwork<ClientToServer extends object, ServerToClient exte
 	clientToServer?: Modding.Many<GuardTree<ClientToServer>>,
 	serverToClient?: Modding.Many<GuardTree<ServerToClient>>,
 ): Network<ClientToServer, ServerToClient> {
-	assert(clientToServer && serverToClient, "createNetwork: guards were not generated (is rbxts-transformer-flamework enabled?)");
+	assert(clientToServer && serverToClient, "createNetwork: guards were not generated (is @typetorch/transformer in the tsconfig plugins?)");
 	const c2s = new Map<string, Guard>();
 	const s2c = new Map<string, Guard>();
 	flatten(clientToServer, "", c2s);

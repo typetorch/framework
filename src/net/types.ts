@@ -1,4 +1,4 @@
-import { Modding } from "@flamework/core";
+import type { Modding } from "../reflection/modding";
 
 /** `[value]` or `[false, reason]`, the shape every fallible call uses (reason is player-facing text). */
 export type ProperReturns<T = true> = [T] | [false, string];

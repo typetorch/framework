@@ -1,13 +1,18 @@
 {
 	"name": "@typetorch/framework",
-	"version": "0.1.0",
-	"description": "TypeTorch framework: hot-swappable modules (DI, lifecycle, troves), guarded networking and the in-game dev menu for roblox-ts. Ships inside every artifact.",
+	"version": "0.2.0",
+	"description": "TypeTorch framework for roblox-ts: hot-swappable modules (dependency injection, lifecycle, troves), guarded networking, hot assets and the in-game dev menu. Ships inside every TypeTorch artifact.",
 	"license": "MIT",
+	"author": "TypeTorch",
+	"homepage": "https://github.com/typetorch/framework#readme",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/typetorch/framework"
+		"url": "git+https://github.com/typetorch/framework.git"
 	},
-	"keywords": ["roblox", "roblox-ts", "hot-reload", "typetorch"],
+	"bugs": {
+		"url": "https://github.com/typetorch/framework/issues"
+	},
+	"keywords": ["roblox", "roblox-ts", "rbxts", "hot-reload", "hot-swap", "dependency-injection", "typetorch"],
 	"main": "out/init.luau",
 	"types": "out/index.d.ts",
 	"files": ["out", "!**/*.tsbuildinfo"],
@@ -16,10 +21,19 @@
 	},
 	"scripts": {
 		"build": "rbxtsc --type package",
-		"watch": "rbxtsc --type package -w"
+		"watch": "rbxtsc --type package -w",
+		"clean": "node -e \"require('fs').rmSync('out',{recursive:true,force:true})\"",
+		"prepublishOnly": "node -e \"require('fs').rmSync('out',{recursive:true,force:true})\" && rbxtsc --type package"
 	},
 	"peerDependencies": {
-		"@flamework/core": "^1.3.2"
+		"@rbxts/compiler-types": "^3.0.0-types.0",
+		"@typetorch/transformer": "^0.2.0",
+		"roblox-ts": "^3.0.0"
+	},
+	"peerDependenciesMeta": {
+		"@typetorch/transformer": {
+			"optional": true
+		}
 	},
 	"dependencies": {
 		"@rbxts/services": "^1.6.0",
@@ -27,7 +41,6 @@
 		"@rbxts/trove": "^1.3.0"
 	},
 	"devDependencies": {
-		"@flamework/core": "^1.3.2",
 		"@rbxts/compiler-types": "^3.0.0-types.0",
 		"@rbxts/types": "^1.0.956",
 		"rbxts-transform-debug": "2.2.0",

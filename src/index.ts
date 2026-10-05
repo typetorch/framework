@@ -17,6 +17,10 @@ export type {
 } from "./module";
 export { Controller, Service } from "./decorators";
 export type { ModuleConfig } from "./decorators";
+// The runtime of @typetorch/transformer: generated code imports Reflect (and t) from here; games write user macros
+// with Modding (`/** @metadata macro */ function f<T>(guard?: Modding.Generic<T, "guard">)`).
+export { Modding, Reflect, t } from "./reflection";
+export type { AbstractConstructor, ClassDescriptor, Constructor, MethodDescriptor, PropertyDescriptor } from "./reflection";
 export { startClient, startServer } from "./runtime/start";
 export type { StartOptions, StopGeneration } from "./runtime/start";
 export { TypeTorch } from "./typetorch";
