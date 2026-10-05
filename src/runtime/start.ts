@@ -2,6 +2,8 @@ import { Reflect } from "@flamework/core";
 import { Players, RunService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $print, $warn } from "rbxts-transform-debug";
+import { bindHotAssets } from "../assets/hot-asset";
+import { syncHotAssets } from "../assets/sync";
 import { startDevtoolsClient } from "../devtools/client";
 import { startDevtoolsServer } from "../devtools/server";
 import type { ClientKernel, ServerKernel, SwapOutInfo } from "../kernel";
@@ -91,6 +93,7 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 	persistKeys.clear();
 	// Before anything else, so module top-level code, devtools and modules can use TypeTorch.
 	bindTypeTorch(realm, kernel, options.build ?? {}, root);
+	bindHotAssets(root);
 	const context: ModuleContext = {
 		realm,
 		artifact: kernel.artifact,
@@ -126,6 +129,10 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 			setClientDispatcher(undefined);
 		};
 	}
+
+	// Hot assets (plans/13): the place matches this artifact's asset manifest before any module loads. Yields up to 8 s
+	// when versions change, never throws; loads still running after that swap in later (hotAsset().changed).
+	if (realm === "server") syncHotAssets(kernel as ServerKernel, root);
 
 	requireAll(options.modules);
 	const ordered = order(registered.filter((mod) => mod.realm === realm));

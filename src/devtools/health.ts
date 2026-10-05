@@ -1,3 +1,4 @@
+import type { AssetFacts } from "../assets/manifest";
 import type { KernelStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
@@ -26,6 +27,8 @@ export interface ServerFacts {
 	http?: boolean;
 	/** The kernel has A/B experiment pins (0.2.3+, devtools/ab.ts). */
 	experiments?: boolean;
+	/** Hot assets (assets/sync.ts): failed loads and manifest problems; absent without a manifest. */
+	assets?: AssetFacts;
 }
 
 /** "0.2.0" < "0.2.1"; missing parts count as 0, non-numbers as 0. */
@@ -90,6 +93,25 @@ export function signingIssues(status: KernelStatus): HealthIssue[] {
 	return issues;
 }
 
+/**
+ * Hot assets (plans/13): a failed load keeps the old copy (warn); a failure with nothing live for the key is an
+ * error; an unusable manifest is a warning.
+ */
+export function assetIssues(assets: AssetFacts | undefined): HealthIssue[] {
+	const issues = new Array<HealthIssue>();
+	if (assets === undefined) return issues;
+	if (assets.failed > 0) {
+		const more = assets.failed > 1 ? ` (+${assets.failed - 1} more)` : "";
+		issues.push({
+			level: assets.missing > 0 ? "error" : "warn",
+			title: assets.missing > 0 ? "Hot asset missing" : "Hot asset failed",
+			detail: `${assets.first ?? "-"}${more}`,
+		});
+	}
+	if (assets.manifestError !== undefined) issues.push({ level: "warn", title: "Asset manifest", detail: assets.manifestError });
+	return issues;
+}
+
 /** Everything about this server a dev should notice, worst first. */
 export function checkHealth(status: KernelStatus, facts?: ServerFacts): HealthIssue[] {
 	const issues = new Array<HealthIssue>();
@@ -130,6 +152,7 @@ export function checkHealth(status: KernelStatus, facts?: ServerFacts): HealthIs
 	if (facts?.loadstring === false && status.channel === "dev") {
 		issues.push({ level: "info", title: "run_luau off", detail: "LoadStringEnabled is off in this place." });
 	}
+	for (const issue of assetIssues(facts?.assets)) issues.push(issue);
 	for (const issue of signingIssues(status)) issues.push(issue);
 	if (status.experiment !== undefined) {
 		issues.push({ level: "info", title: "A/B experiment", detail: `${status.experiment.artifactId} until the next deploy` });

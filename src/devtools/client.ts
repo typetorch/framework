@@ -37,6 +37,7 @@ import { CLAUDE_TOOL_REQUEST, CLAUDE_TOOL_RESPONSE, findTool, inspectTool } from
 import { renderClaudeChat } from "./claude-ui";
 import { adminTabs, migrateControl } from "./admin-ui";
 import { renderNetworkInspector } from "./network-inspector";
+import { renderAssetsTab } from "./assets-ui";
 import { describeState } from "./state";
 import type { ArtifactNotes } from "./artifact-notes";
 import { badgeLevel, checkHealth, HealthIssue, HealthLevel, ServerFacts } from "./health";
@@ -111,7 +112,7 @@ const OTHER_LOG_ERRORS: Record<string, string> = {
 const TABS = ["Artifact", "Modules", "Server", "Admin", "Logs", "Dex", "Network", "Claude"] as const;
 type TabName = (typeof TABS)[number];
 /** Tabs with sub-tabs (a segmented bar on top of the content); the first one is the default. */
-const SUBTABS: Partial<Record<TabName, readonly string[]>> = { Modules: ["Overview", "State"], Server: ["Status", "Branch"], Admin: ["Players", "Servers", "Bans"], Network: ["Packets", "Stats"] };
+const SUBTABS: Partial<Record<TabName, readonly string[]>> = { Modules: ["Overview", "State", "Assets"], Server: ["Status", "Branch"], Admin: ["Players", "Servers", "Bans"], Network: ["Packets", "Stats"] };
 
 interface StatusReply {
 	server: KernelStatus;
@@ -1139,6 +1140,14 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		Artifact: renderArtifact,
 		"Modules/Overview": renderModulesOverview,
 		"Modules/State": renderModulesState,
+		"Modules/Assets": (tab) =>
+			renderAssetsTab(tab, {
+				call,
+				realm: () => modulesRealm,
+				setRealm: (realm) => {
+					modulesRealm = realm;
+				},
+			}),
 		"Server/Status": renderServer,
 		"Server/Branch": renderBranch,
 		...adminTabs({ kernel, call }),

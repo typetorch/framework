@@ -58,7 +58,8 @@ export class CoinService extends Module implements OnStart {
 - **Dev menu:** devs (Studio, project members, dev badge) get a DEV button, `Ctrl+Shift+D` and `/tt dev`: artifact,
   server status, logs (server, own client, other players' clients), client and server dex, network stats, module
   state, a branch and artifact picker (Server > Branch) and a Claude prompt. Prod-channel servers are read-only. The
-  window can be dragged by its header and resized from its corner (double-tap the header to reset). In the Dex,
+  window can be dragged by its header and resized from its corner (double-tap the header to reset). Modules has
+  Overview, State and Assets (hot assets), each with a Server | Client toolbar. In the Dex,
   right-click or long-press a property for Copy value / Copy name and a tree row for Copy path (Roblox has no
   clipboard, so copying opens a small popup with the text selected: Ctrl+C, or long-press > Copy on touch).
 - **Remote Claude** (dev-channel servers only): while `typetorch remote-claude` runs on a dev's machine, allowlisted
@@ -105,6 +106,9 @@ TypeTorch.requestReload(player); // owner and admins only, checked by the kernel
 // Logs (the kernel's ring buffer)
 TypeTorch.logs(0, 50);
 TypeTorch.onLog((entry) => errors.push(entry)); // don't print from inside it
+
+// Hot assets (below): same as hotAsset(...)
+const shop = TypeTorch.asset("ui/shop");
 ```
 
 - **`startInfo.reason`:** `boot`, `deploy`, `rollback`, `branch`, `pin`, `reload`, `server_rollback`,
@@ -123,6 +127,54 @@ TypeTorch.onLog((entry) => errors.push(entry)); // don't print from inside it
   framework records them), `onBranchChanged` still fires, and the reason of a swap is `unknown`.
 - **Edit mode** (UI Labs stories, no kernel): `running` is false, identity has defaults, `persist` keeps a local table,
   events never fire, and the server-only reads throw.
+
+## Hot assets: `hotAsset`
+
+Builders mark models and UI templates in the place with the attribute `TypeTorchAsset` (a key such as `"ui/shop"`),
+`typetorch assets sync` uploads them, and the deploy puts the asset manifest in the artifact. Running servers then get
+new versions live, with no restart.
+
+```ts
+import { hotAsset } from "@typetorch/framework"; // or TypeTorch.asset("ui/shop")
+
+// In a controller's onStart: rebuild clones the template.
+const shop = hotAsset("ui/shop");
+shop.changed(rebuild, this.trove); // a new version went live
+rebuild(shop.get());
+```
+
+- **`hotAsset(keyOrId, fallback?)`** works on the server and the client. A number is the Roblox asset id, resolved
+  through the manifest (server) or the live copy's `TypeTorchAssetId` attribute (client).
+  - `get()` returns the live copy now. With none, it returns `fallback` (an instance you already hold, such as the
+    template in the place) if it is still parented, else `undefined`. **Clone it; don't parent or edit it:** a new
+    version destroys it.
+  - `wait(timeout?)` is `get()` that waits for a live copy (forever without a timeout).
+  - `changed(fn, trove?)` calls `fn(instance)` each time a new copy replaces the live one: a new version, a rollback,
+    or the first copy reaching a client. It returns a disconnect function. Pass the module's trove so the connection
+    ends with it (`shop.changed(rebuild, this.trove)` or `this.trove.add(shop.changed(rebuild))`). Without a trove it
+    ends when the generation stops.
+  - `key` and `version` (the live copy's `TypeTorchAssetVersion`, an assetVersionId).
+- **Clients never request anything.** They read the CollectionService tag `__typetorch_asset:<key>`, and replicated
+  assets arrive through replication. Assets under ServerStorage stay server-only.
+- **AssetSync** is a server built-in. It runs on every generation start, before any module loads (top-level code
+  included). For each manifest key:
+  1. it keeps the live copy that already has the manifest's version;
+  2. else it adopts the place's own copy, if its `TypeTorchAssetHash` matches (or if the manifest's optional
+     `placeVersion` is this server's place version);
+  3. else it runs `InsertService:LoadAssetVersion(ver)` (all loads in parallel), strips any scripts, places the copy
+     at its path (creating missing Folders), tags it, then destroys the copy it replaces.
+
+  It holds the start for at most 8 s. Loads still running after that keep going, swap in when done and fire
+  `changed`. A failed load keeps the old copy (on a new server, the place's copy) and shows under Server > Status >
+  Attention.
+- **Hot assets persist across swaps.** They aren't in any trove. A swap changes them only when the manifest changes,
+  and a rollback brings back the older versions. **Keys the manifest doesn't name are left as they are:** AssetSync
+  never deletes builders' content. A key dropped from the manifest keeps its last live copy.
+- **Clones never count.** A clone keeps the tag and the attributes, but only the copy whose parent is its
+  `TypeTorchAssetPath` (stamped by AssetSync) is the live one. So a template cloned into PlayerGui never shows up in
+  `get()`, and AssetSync never destroys it.
+- **Dev menu:** Modules > Assets (Server | Client) lists each key's source (kept, baked, loaded, failed), version,
+  load time and last error.
 
 ## Develop
 

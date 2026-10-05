@@ -22,6 +22,7 @@ import type {
 } from "./kernel";
 import type { BuildInfo } from "./module";
 import { persistKeys } from "./runtime/registry";
+import { hotAsset, type HotAsset } from "./assets/hot-asset";
 
 /**
  * `TypeTorch`: the runtime API for game code, on the server and the client. It describes the running generation
@@ -158,6 +159,13 @@ export interface TypeTorchApi {
 	 * the first decision (use `isDev` in onPlayerAdded for the first). Client: the local player only.
 	 */
 	onPlayerDevChanged(callback: (player: Player, info: DevInfo) => void): () => void;
+
+	// Hot assets -------------------------------------------------------------------------------------------------------
+	/**
+	 * A handle on a hot asset (plans/13): the live copy of `keyOrId` (a key like "ui/shop", or its asset id), its
+	 * version and a `changed` event, on the server and the client. Same as `hotAsset(keyOrId, fallback)`.
+	 */
+	asset(keyOrId: string | number, fallback?: Instance): HotAsset;
 }
 
 // State of this generation's binding ------------------------------------------------------------------------------------
@@ -392,6 +400,10 @@ class TypeTorchRuntime implements TypeTorchApi {
 		const disconnect = listen(devListeners, callback);
 		ensureDevPolling();
 		return disconnect;
+	}
+
+	asset(keyOrId: string | number, fallback?: Instance): HotAsset {
+		return hotAsset(keyOrId, fallback);
 	}
 }
 

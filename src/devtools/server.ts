@@ -25,6 +25,7 @@ import type { ServerFacts } from "./health";
 import { ArtifactNotes, notesFromAttribute, parseArtifactNotes } from "./artifact-notes";
 import { loadstringAvailable } from "./claude-tools";
 import { kernelHasExperiments, NEEDS_KERNEL_AB } from "./ab";
+import { assetFacts, assetReport } from "../assets/sync";
 
 function isAssetId(value: unknown): value is number {
 	return typeIs(value, "number") && value > 0 && value % 1 === 0 && value < 2 ** 53;
@@ -50,7 +51,7 @@ function serverFacts(kernel: ServerKernel): ServerFacts {
 	if (loadstringWorks === undefined) {
 		loadstringWorks = loadstringAvailable();
 	}
-	return { loadstring: loadstringWorks, http: HttpService.HttpEnabled, experiments: kernelHasExperiments(kernel) };
+	return { loadstring: loadstringWorks, http: HttpService.HttpEnabled, experiments: kernelHasExperiments(kernel), assets: assetFacts() };
 }
 
 const LOG_KINDS = new Set(["output", "info", "warning", "error"]);
@@ -253,6 +254,8 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 	});
 	// The legacy dex.children/props/set/destroy ops are gone: the explorer (explorer.* ops) replaced them.
 	ops.set("state", () => describeState());
+	// Modules > Assets: the last AssetSync of this generation (hot assets, plans/13), read-only.
+	ops.set("assets", () => assetReport());
 
 	// Another player's client logs (Logs > Others). Dev only (checked for every op), the target must be in this
 	// server, one request per dev every 2 s; the target's framework answers on DEVLOGS_RESPONSE within 5 s.

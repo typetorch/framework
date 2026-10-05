@@ -58,3 +58,6 @@ export type {
 	SwapReport,
 } from "./kernel";
 export { bump, isRealFrame, observeElement, popIn, popOut, PopupQueue } from "./ui";
+export { hotAsset } from "./assets/hot-asset";
+export type { HotAsset } from "./assets/hot-asset";
+export type { AssetEntry, AssetSource, AssetStatus, AssetSyncReport } from "./assets/manifest";
