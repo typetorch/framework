@@ -133,6 +133,12 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 		const dispatcher = new ClientDispatcher(clientKernel);
 		setClientDispatcher(dispatcher);
 		clientKernel.onMessage(dispatcher.dispatch);
+		// Kernel 0.3.2: the server dropped a message of this generation: fail pending requests now (P-N1).
+		if (typeIs((clientKernel as unknown as Record<string, unknown>).onResync, "function")) {
+			clientKernel.onResync!(() => dispatcher.resync());
+		}
+		// The server queues what it sends this player until this (0.2.1).
+		dispatcher.hello();
 		if (options.devtools !== false) onStarted = startDevtoolsClient(clientKernel, dispatcher, root.extend()).started;
 		stopNetwork = () => {
 			dispatcher.stop();

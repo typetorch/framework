@@ -665,5 +665,76 @@ do
 	check("admin: kernel 0.3.2 owns the heartbeat (feature-detected)", admin.kernelOwnsHeartbeat({ heartbeat = function() end }) == true and admin.kernelOwnsHeartbeat({}) == false)
 end
 
+-- Networking across a swap (0.2.1, plans/12 P-N1): the server queues reliable sends per player until that client's
+-- generation says hello; a resync fails the client's pending requests at once.
+do
+	local alice = { Name = "Alice", Parent = "Players" }
+	local bob = { Name = "Bob", Parent = "Players" }
+	local fakePlayers = { alice, bob }
+	services.Players = setmetatable({
+		GetPlayers = function()
+			return table.clone(fakePlayers)
+		end,
+	}, {
+		__index = function(_, key)
+			return inert(`Players.{key}`)
+		end,
+	})
+	local model = convert(roblox.deserializeModel(bytes)[1], nil)
+	inner[model].Name = "payload#net"
+	local TS = requireModule(model.include.RuntimeLib)
+	local frameworkOut = model.include.node_modules["@typetorch"].framework.out
+	local runtime = TS.import(model.Server, frameworkOut, "net", "runtime")
+	local sent, broadcasts = {}, {}
+	local serverKernel = {
+		send = function(_, player, channel, ...)
+			table.insert(sent, { player, channel, ... })
+		end,
+		sendUnreliable = function(_, player, channel, ...)
+			table.insert(sent, { player, channel, ... })
+		end,
+		broadcast = function(_, channel, ...)
+			table.insert(broadcasts, { channel, ... })
+		end,
+		broadcastUnreliable = function(_, channel, ...)
+			table.insert(broadcasts, { channel, ... })
+		end,
+	}
+	local server = runtime.ServerDispatcher.new(serverKernel)
+	server:send(alice, "coins.changed", { 5 })
+	server:send(alice, "fx.puff", { 1 }, true)
+	check("net: before hello a reliable send is queued and an unreliable one dropped", #sent == 0 and not server:isReady(alice))
+	server.dispatch(alice, runtime.HELLO)
+	check("net: hello flushes the queue in order", #sent == 1 and sent[1][1] == alice and sent[1][2] == "e:coins.changed" and sent[1][3] == 5 and server:isReady(alice))
+	server:sendAll("round.start", { 3 })
+	check("net: sendAll with a client not ready: per player (ready now, the other queued)", #broadcasts == 0 and #sent == 2 and sent[2][1] == alice and sent[2][2] == "e:round.start")
+	server.dispatch(bob, runtime.HELLO)
+	check("net: the late client gets what it missed", #sent == 3 and sent[3][1] == bob and sent[3][2] == "e:round.start" and sent[3][3] == 3)
+	server:sendAll("round.end", {})
+	check("net: every client ready: one broadcast", #broadcasts == 1 and broadcasts[1][1] == "e:round.end" and #sent == 3)
+	server:forget(bob)
+	server:send(bob, "coins.changed", { 1 })
+	check("net: a player who left and came back waits for a new hello", #sent == 3 and not server:isReady(bob))
+
+	local clientSent = {}
+	local clientKernel = {
+		send = function(_, channel, ...)
+			table.insert(clientSent, { channel, ... })
+		end,
+		sendUnreliable = function() end,
+	}
+	local client = runtime.ClientDispatcher.new(clientKernel)
+	client:hello()
+	check("net: the client says hello", clientSent[1] ~= nil and clientSent[1][1] == runtime.HELLO)
+	local pending = client:invoke("shop.buy", { "sword" })
+	pending:catch(function() end) -- handled: the checks read its status
+	check("net: a request is pending", pending:getStatus() == "Started" and clientSent[2][1] == "r:shop.buy")
+	client:resync()
+	check("net: a resync rejects the pending request at once", pending:getStatus() == "Rejected")
+	local later = client:invoke("shop.buy", { "axe" })
+	later:catch(function() end)
+	check("net: and every new request until the swap", later:getStatus() == "Rejected" and #clientSent == 2)
+end
+
 print(if failed == 0 then `test-generations: all {passed} checks passed` else `test-generations: {failed} of {passed + failed} checks failed`)
 process.exit(if failed == 0 then 0 else 1)

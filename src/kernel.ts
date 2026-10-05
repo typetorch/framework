@@ -18,6 +18,11 @@ export interface ArtifactInfo {
 	readonly seq?: number;
 	/** Kernel 0.3+, in `status().generation.artifact` only: its deploy's signatures (absent when unsigned). */
 	readonly verified?: Verified;
+	/**
+	 * Kernel 0.3.2+: the payload's network protocol hash (attribute `ProtocolHash`, stamped at build time), if any.
+	 * Client events of an older artifact with the same hash still reach this generation during a swap.
+	 */
+	readonly protocolHash?: string;
 }
 
 /**
@@ -580,6 +585,10 @@ export interface ClientKernel {
 	onPending?(handler: (update: PendingUpdate) => void): void;
 	/** One handler per generation: the server's decision about this player changed. */
 	onDevChanged?(handler: (info: DevInfo) => void): void;
+
+	// Kernel 0.3.2+ (additive).
+	/** One handler per generation: the server dropped one of this generation's messages (it runs a newer protocol). */
+	onResync?(handler: () => void): void;
 }
 
 export type Kernel = ServerKernel | ClientKernel;

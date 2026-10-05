@@ -18,6 +18,12 @@ local services = {
 			return string.format("%08x-0000-0000-0000-000000000000", guid)
 		end,
 	},
+	-- 0.2.1: sendAll broadcasts when every listed player's client said hello (none listed here).
+	Players = {
+		GetPlayers = function()
+			return {}
+		end,
+	},
 }
 local Promise = {}
 function Promise.new(executor)

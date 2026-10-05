@@ -1,3 +1,4 @@
+import { Players } from "@rbxts/services";
 import { $warn } from "rbxts-transform-debug";
 import type { ClientKernel, ServerKernel } from "../kernel";
 import { PacketRecord, PacketTap } from "./inspect";
@@ -9,12 +10,32 @@ import type { LeafLimits } from "./types";
  *   event    client <-> server   channel "e:<path>", args...
  *   request  client  -> server   channel "r:<path>", requestId, args...
  *   response server  -> client   channel "__tt/res", requestId, ok, result
+ *   hello    client  -> server   channel "__tt/hello" (0.2.1: this client's generation runs and listens)
  * Raw channels (devtools) are registered by exact name.
+ *
+ * 0.2.1 (plans/12 P-N1): a client drops server messages tagged with another generation than its own, so the server
+ * queues reliable sends to a player until that player's client generation says hello (at most QUEUE_MAX messages, at
+ * most HELLO_TIMEOUT seconds; unreliable ones are dropped meanwhile). After a swap, or for a player who just joined,
+ * nothing the new server generation sends early is lost. On the client, a resync from the kernel (0.3.2: the server
+ * dropped one of this generation's messages) fails every pending request at once instead of after REQUEST_TIMEOUT.
  */
 export const RESPONSE = "__tt/res";
+export const HELLO = "__tt/hello";
 const REQUEST_TIMEOUT = 15;
 const KICK_AFTER = 300;
 const KICK_WINDOW = 10;
+/** Reliable messages kept per player until their client says hello. */
+const QUEUE_MAX = 256;
+/** Seconds after the first queued message before a player's queue is sent anyway. */
+const HELLO_TIMEOUT = 30;
+/** What pending requests reject with after a resync. */
+const UPDATING = "The game is updating, try again.";
+
+interface SendQueue {
+	since: number;
+	items: Array<[channel: string, args: unknown[]]>;
+	dropped: number;
+}
 
 type Guard = (value: unknown) => boolean;
 type Listener = (...args: unknown[]) => void;
@@ -47,8 +68,47 @@ export class ServerDispatcher {
 	private readonly raw = new Map<string, (player: Player, ...args: unknown[]) => void>();
 	private readonly limiter = new RateLimiter();
 	private readonly strikes = new Map<Player, [count: number, since: number]>();
+	/** Players whose client generation said hello (it listens to this generation). */
+	private readonly ready = new Set<Player>();
+	private readonly queues = new Map<Player, SendQueue>();
 
 	constructor(readonly kernel: ServerKernel) {}
+
+	/** Whether `player`'s client generation runs (it said hello, or its queue timed out). */
+	isReady(player: Player): boolean {
+		return this.ready.has(player);
+	}
+
+	/** The player's client listens now: send what was queued, in order. */
+	private markReady(player: Player) {
+		if (this.ready.has(player)) return;
+		this.ready.add(player);
+		const queue = this.queues.get(player);
+		if (!queue) return;
+		this.queues.delete(player);
+		for (const [channel, args] of queue.items) this.kernel.send(player, channel, ...args);
+		if (queue.dropped > 0) $warn(`[net] ${player.Name}: ${queue.dropped} messages sent before their client was ready were dropped`);
+	}
+
+	/** One message to one player: now when their client listens, else queued (reliable) or dropped (unreliable). */
+	private deliver(player: Player, channel: string, args: unknown[], unreliable: boolean) {
+		if (!this.ready.has(player) && player.Parent !== undefined) {
+			if (unreliable) return;
+			let queue = this.queues.get(player);
+			if (!queue) {
+				queue = { since: os.clock(), items: [], dropped: 0 };
+				this.queues.set(player, queue);
+			}
+			if (os.clock() - queue.since <= HELLO_TIMEOUT) {
+				if (queue.items.size() < QUEUE_MAX) queue.items.push([channel, args]);
+				else queue.dropped += 1;
+				return;
+			}
+			this.markReady(player); // no hello in time: send what we have, then this one
+		}
+		if (unreliable) this.kernel.sendUnreliable(player, channel, ...args);
+		else this.kernel.send(player, channel, ...args);
+	}
 
 	stat(path: string): LeafStats {
 		let stats = this.stats.get(path);
@@ -90,21 +150,28 @@ export class ServerDispatcher {
 		this.stat(path).outbound += 1;
 		const tap = this.tap;
 		if (tap) tap.record("out", unreliable ? "unreliable" : "fire", path, args, "ok", undefined, player);
-		if (unreliable) this.kernel.sendUnreliable(player, `e:${path}`, ...args);
-		else this.kernel.send(player, `e:${path}`, ...args);
+		this.deliver(player, `e:${path}`, args, unreliable);
 	}
 
 	sendAll(path: string, args: unknown[], unreliable = false) {
 		this.stat(path).outbound += 1;
 		const tap = this.tap;
 		if (tap) tap.record("out", unreliable ? "unreliable" : "fire", path, args, "ok", undefined, "all");
-		if (unreliable) this.kernel.broadcastUnreliable(`e:${path}`, ...args);
-		else this.kernel.broadcast(`e:${path}`, ...args);
+		// One broadcast when every client listens; otherwise per player, so the ones that don't yet get it queued.
+		const players = Players.GetPlayers();
+		if (players.every((player) => this.ready.has(player))) {
+			if (unreliable) this.kernel.broadcastUnreliable(`e:${path}`, ...args);
+			else this.kernel.broadcast(`e:${path}`, ...args);
+			return;
+		}
+		for (const player of players) this.deliver(player, `e:${path}`, args, unreliable);
 	}
 
 	forget(player: Player) {
 		this.limiter.forget(player);
 		this.strikes.delete(player);
+		this.ready.delete(player);
+		this.queues.delete(player);
 	}
 
 	private strike(player: Player) {
@@ -123,6 +190,12 @@ export class ServerDispatcher {
 	}
 
 	readonly dispatch = (player: Player, channel: string, ...args: unknown[]) => {
+		// Only the hello proves the player's client runs THIS generation: other messages may come from the previous
+		// client generation (kernel 0.3.2 lets same-protocol events through a swap).
+		if (channel === HELLO) {
+			this.markReady(player);
+			return;
+		}
 		const raw = this.raw.get(channel);
 		if (raw) {
 			if (this.limiter.allow(player, channel, DEFAULT_LIMITS.rate)) raw(player, ...args);
@@ -237,8 +310,28 @@ export class ClientDispatcher {
 	private readonly pending = new Map<number, Pending>();
 	private nextId = 1;
 	private stopped = false;
+	/** The server dropped a message of this generation (kernel resync): it is about to be replaced. */
+	private outdated = false;
 
 	constructor(readonly kernel: ClientKernel) {}
+
+	/** Tells the server this client generation runs and listens (its queued messages come now). Call once, early. */
+	hello() {
+		this.kernel.send(HELLO);
+	}
+
+	/**
+	 * Kernel 0.3.2: the server runs a newer generation and dropped one of this generation's messages, so no pending
+	 * request will be answered. They fail now, and so does every new one until the swap replaces this generation.
+	 */
+	resync() {
+		this.outdated = true;
+		for (const [, pending] of this.pending) {
+			task.cancel(pending.timeout);
+			pending.reject(UPDATING);
+		}
+		this.pending.clear();
+	}
 
 	stat(path: string): LeafStats {
 		let stats = this.stats.get(path);
@@ -286,6 +379,10 @@ export class ClientDispatcher {
 		return new Promise((resolve, reject) => {
 			if (this.stopped) {
 				reject("This version of the game is shutting down.");
+				return;
+			}
+			if (this.outdated) {
+				reject(UPDATING);
 				return;
 			}
 			const tap = this.tap;
