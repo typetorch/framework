@@ -250,6 +250,78 @@ rebuild(shop.get());
 - **Dev menu:** Modules > Assets (Server | Client) lists each key's source (kept, baked, loaded, failed), version,
   load time and last error.
 
+## Analytics: `AnalyticsEngine`
+
+Optional, and all ours: the game server sends rows to the backend the dev picked (Cloudflare Basin streams, or a
+self-hosted DuckDB analytics server). Nothing runs until an engine is created: no connections, threads or requests.
+
+```ts
+import { AnalyticsEngine } from "@typetorch/framework";
+
+// A server module (onInit): reads the ConfigService key TypeTorchAnalytics.
+const analytics = new AnalyticsEngine();
+analytics.track(player, "quest_done", { quest: "tutorial" }); // custom
+analytics.step(player, "onboarding", 3, "opened_shop"); // funnels
+analytics.purchase(player, { product: 1234, robux: 99, where: "shop" }); // after the receipt is granted
+analytics.currency(player, "coins", 50, "round_reward"); // economy in (+) and out (-)
+analytics.state("round"); // every player's activity; analytics.state(player, "shop") for one
+const variant = analytics.experiment(player, "onboarding", ["short", "long"]); // first = control
+
+// A client controller (onStart): everything goes through the server, never to the internet.
+const analytics = new AnalyticsEngine();
+analytics.track("opened_map");
+analytics.screen("Inventory"); // for UIs that aren't separate ScreenGuis
+const variant = analytics.experiment("onboarding", ["short", "long"]); // same answer as the server's
+```
+
+- **One engine per generation and realm.** Every `new AnalyticsEngine()` joins the one already running (the first one's
+  options win), so any module can create its own. It stops with the generation; its unsent rows wait in `persist`
+  and the next generation sends them. In edit mode (UI Labs) it is inert.
+- **Server calls take the player first** (`track(player, ...)`); without one an event is server-only (no player id).
+  Client calls are always about the local player and are marked `src = "client"` (a client can lie). The server
+  checks their shape, size (props at most 4 KB) and rate.
+- **Options** (all on by default): `sessions` (joins, leaves, device, join source, account age bucket, Premium,
+  country, friends in the server, first-ever vs returning, days since the last visit), `tech` (FPS, ping, memory, load
+  time, client and server errors, swaps and rollbacks, leaves within 60 s of a swap), `zones` (parts or models tagged
+  `TTZone`, named by a `Name` attribute or the instance name), `screens` (ScreenGuis in PlayerGui, GuiObjects tagged
+  `TTScreen`), `recording` (the first-ever session in detail), `fleet` (kernel 0.3.2 heartbeats and deploy reports).
+  `settings` (server only) replaces the ConfigService key, for tests.
+- **Every row** carries the time (server clock), a random player id (never the UserId), the session, the server
+  (JobId, type, place), the artifact (id, seq, branch, channel), the device, new vs returning, the player's state
+  (`zone:Lobby|screen:Shop|activity:round`) and experiment variants. The exact rows: `src/analytics/SCHEMA.md`.
+- **Experiments:** `experiment(...)` is deterministic per player and name (they keep their variant in every session),
+  may yield briefly the first time (until the player's id loads), and stamps the variant on the player's later events.
+  The settings key turns one off (`active: false`: everyone gets the first variant), sets `weights` or forces a
+  `variant`, live.
+- **First-ever session:** for new players (a share of them, `recordShare`), the client records character and camera
+  about 10 times a second, every input (never while a TextBox or the chat has focus; text boxes only say which box was
+  used), buttons pressed and hovered, screens, prompts and deaths, from the join until 60 s after the first input.
+  Packed into small binary chunks (10-20 KB a player) and sent through the server.
+- **Never collected:** chat or anything typed, usernames and display names (error texts have them replaced), UserIds.
+- **Player ids:** DataStore `TypeTorchAnalytics`, key `p/<UserId>` -> `{ pid, first, last }`: one read per join, a
+  write on the first join and at leave. Deleting the key (Right to Erasure) leaves that player's rows anonymous.
+- **Sending:** one queue on the server (10,000 events; over that the oldest are dropped and counted), a flush every
+  `flushSeconds` (15) or at 500 rows, at most ~10 HttpService requests a minute, retries with backoff, and a last
+  flush on shutdown (kernel 0.3.2). Delivery is at least once (a swap mid-request sends that batch again).
+  `analytics.stats()` (server) has the counters; `flush()` sends soon.
+
+**Settings** (server only, never sent to clients): the ConfigService key `TypeTorchAnalytics`, written by the CLI or in
+Creator Hub (Configs), re-read live every few minutes:
+
+```json
+{ "backend": "basin", "events": "https://<stream-id>.ingest.cloudflare.com",
+  "recordings": "https://<stream-id>.ingest.cloudflare.com", "token": "<write-only token>",
+  "flushSeconds": 15, "recordShare": 1, "techEvery": 60,
+  "experiments": { "onboarding": { "weights": [1, 1] } } }
+```
+
+- `basin`: a JSON array per stream (`events`, `recordings`), `Authorization: Bearer <token>` when set (a token with
+  Basin Pipelines Send permission, if the stream requires authentication). Without `recordings` nothing is recorded.
+  The streams' schemas must match SCHEMA.md exactly: Basin drops rows that don't, silently.
+- `duckdb`: one `POST <events>` with `{"events":[...],"recordings":[...]}`, gzip, `Authorization: Bearer <token>`.
+- The token is write-only and never logged. Needs **Allow HTTP Requests** (Game Settings > Security). No key: the
+  engine collects but keeps only the newest 1,000 rows until settings appear. Removing the key stops sending, live.
+
 ## Develop
 
 ```sh
@@ -266,6 +338,8 @@ bun run build   # rbxtsc --type package -> out/
   with stub kernels (onStart failures reported to kernel 0.3.2, raised on older ones; onClose) and the health lines.
   To test framework changes before the template takes them, build the payload from a copy of the template whose
   `node_modules/@typetorch/framework/out` is this repo's `out/`.
+  `scripts/test-analytics.luau` checks the analytics engine's pure parts: experiment assignment, settings, the queue
+  and HTTP budget, tt-rec-1 and the sink request bodies.
 - **Publishing:** `npm publish` runs `prepublishOnly` (clean + build). The package ships only `out/` (no
   `.tsbuildinfo`), `README.md` and `LICENSE`; check with `bun pm pack --dry-run`.
 

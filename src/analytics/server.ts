@@ -546,8 +546,10 @@ export class ServerAnalytics {
 						delay = math.min(delay * 2, 30);
 					}
 				}
-				this.settingsTried = true;
-				if (!snapshot) return;
+				if (!snapshot) {
+					this.settingsTried = true;
+					return;
+				}
 				const current = snapshot;
 				this.trove.connect(current.UpdateAvailable, () => {
 					pcall(() => current.Refresh());
@@ -555,6 +557,7 @@ export class ServerAnalytics {
 				});
 				pcall(() => this.trove.connect(current.GetValueChangedSignal(SETTINGS_KEY), () => read(true)));
 				read(true);
+				this.settingsTried = true;
 				while (true) {
 					task.wait(SETTINGS_REFRESH);
 					pcall(() => current.Refresh());
