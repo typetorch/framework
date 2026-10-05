@@ -154,6 +154,9 @@ export function checkHealth(status: KernelStatus, facts?: ServerFacts): HealthIs
 	}
 	for (const issue of assetIssues(facts?.assets)) issues.push(issue);
 	for (const issue of signingIssues(status)) issues.push(issue);
+	if (status.localPayload === true) {
+		issues.push({ level: "info", title: "Studio: local payload", detail: "Edits need Stop + Play. Reload remounts it." });
+	}
 	if (status.experiment !== undefined) {
 		issues.push({ level: "info", title: "A/B experiment", detail: `${status.experiment.artifactId} until the next deploy` });
 	} else if (status.pinned === true) {

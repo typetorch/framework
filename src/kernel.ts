@@ -376,6 +376,11 @@ export interface KernelStatus {
 	 * prod channel, modules only). Updates stay strictly verified; the next signed deploy replaces or vouches for it.
 	 */
 	unverified?: boolean;
+	/**
+	 * Kernel 0.3.1+, Studio only: the running generation is the local payload (a clone of
+	 * ServerStorage.TypeTorchDev.Payload, synced by the template's studio.project.json) instead of an uploaded artifact.
+	 */
+	localPayload?: boolean;
 }
 
 export interface ServerKernel {
