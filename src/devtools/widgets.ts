@@ -155,7 +155,7 @@ export function buttonRow(): Frame {
 }
 
 /**
- * "45s", "12m", "3h 04m", "2d 3h": the short uptime and age text of Admin > Servers rows ("up 12m", "seen 2m ago") and
+ * "45s", "12m", "3h 04m", "2d 3h": the short uptime and age text of Manage > Servers rows ("up 12m", "seen 2m ago") and
  * the Artifact tab ("Running", "Server up", "Built ... (8m ago)").
  */
 export function shortDuration(seconds: number | undefined): string {

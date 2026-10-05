@@ -139,36 +139,42 @@ export interface KeyTrust {
 	refusals: Refusal[];
 }
 
-export type Role = "owner" | "admin" | "dev";
+/** Kernel 0.3.4: two roles. Owners: the experience creator, the owning group's owner, members with role "owner". */
+export type Role = "owner" | "dev";
+
+/**
+ * A kernel's role as the framework uses it. There is no "admin" role (kernel 0.3.4): an older kernel's "admin", or any
+ * other member role, counts as "dev" (least privilege).
+ */
+export function normalRole(role: unknown): Role | undefined {
+	if (role === "owner") return "owner";
+	return typeIs(role, "string") ? "dev" : undefined;
+}
 
 export interface DevInfo {
 	dev: boolean;
 	/** Why: "studio", "owner", "member", "badge", "revoked", "none". */
 	reason: string;
+	/** Older kernels may say "admin": read it through `normalRole`. */
 	role?: Role;
 	channel?: Channel;
-	/** Kernel 0.3.3+: this player may switch this server in place (the owner, admins unless the place is owner-only). */
-	canOverride?: boolean;
 }
 
-/** Kernel 0.3.3+: an owner override holds this server (`status().ov`, `fleetStatus().ov`). */
-export interface OverrideInfo {
-	/** User id of the owner or admin who switched it, and when (unix seconds). */
-	by: number;
+/** Kernel 0.3.4+: the last branch switch or build load on this server (`status().switched`). */
+export interface SwitchInfo {
+	/** Who (user id, name) and when (unix seconds). */
+	by?: number;
+	name: string;
 	at: number;
-	/** The branch it follows now, or the build it holds. */
-	branch?: string;
+	/** The branch it switched to (a build load: this server's branch) and, for a build load, the build. */
+	branch: string;
 	artifact?: string;
-	/** status() only: their name, the branch switching back returns to, the running build's seq. */
-	name?: string;
-	back?: string;
-	seq?: number;
 }
 
-/** Kernel 0.3.3+: what to switch this server to (`requestOverride`). */
-export type OverrideRequest = { branch: string } | { assetId: number } | { back: true };
+/** Kernel 0.3.4+: what `requestSwitch` asks for: a branch, or a known build to load here. */
+export type SwitchRequest = { branch: string } | { assetId: number };
 
-export interface OverrideReply {
+export interface SwitchReply {
 	ok: boolean;
 	error?: string;
 	/** The generation now running (the switch replaces this client generation too, so it may never be seen). */
@@ -183,7 +189,7 @@ export interface OverrideReply {
  * - `rollback`: its branch was rolled back (`typetorch rollback`);
  * - `branch`: this server switched branch (dev menu, `/tt branch`);
  * - `pin`: this server was pinned to a known artifact;
- * - `reload`: a dev or admin reloaded the branch head;
+ * - `reload`: a dev or the owner reloaded the branch head;
  * - `server_rollback`: `/tt rollback` (this server's own history);
  * - `auto_rollback`: the next artifact failed to start, so the kernel brought this one back;
  * - `unknown`: the kernel is older than 0.2.2 and didn't say.
@@ -219,7 +225,7 @@ export interface GenerationStart {
 	readonly branchChanged: boolean;
 	/** os.time() when it started. */
 	readonly startedAt: number;
-	/** Server only: user id of the dev or admin who asked (reload, branch, pin, server rollback). */
+	/** Server only: user id of the dev or owner who asked (reload, branch, pin, server rollback). */
 	readonly requestedBy?: number;
 	/** Server only (kernel 0.2.2+): seconds spent loading the payload. */
 	readonly loadSeconds?: number;
@@ -295,7 +301,7 @@ export interface SwapReport {
 export interface ExperimentInfo {
 	readonly artifactId: string;
 	readonly assetId: number;
-	/** User id of the owner or admin who started it (from this server or a TypeTorch/pin message). */
+	/** User id of the owner who started it (from this server or a TypeTorch/pin message). */
 	readonly by?: number;
 	/** os.time() when it started. */
 	readonly since: number;
@@ -304,7 +310,7 @@ export interface ExperimentInfo {
 /** Kernel 0.2.3+: options of `pinArtifact`. */
 export interface PinOptions {
 	/**
-	 * An A/B experiment (owner/admin only): any known artifact, any channel, public servers too (they stay "prod").
+	 * An A/B experiment (owner only): any known artifact, any channel, public servers too (they stay "prod").
 	 * Never stored; holds until the next deploy of the branch, `unpin`, or the server closing.
 	 */
 	experiment?: boolean;
@@ -393,7 +399,7 @@ export interface FailedArtifact {
 
 /**
  * Kernel 0.3.2+ `fleetStatus()`: this server's heartbeat (plans/01 "Fleet status and deploy reports"). The kernel
- * writes it nowhere; the analytics engine sends it, the Admin > Servers roll call answers with it, and with the
+ * writes it nowhere; the analytics engine sends it, the Manage > Servers roll call answers with it, and with the
  * `TypeTorchFleet` setting the kernel posts it to the fleet API itself (without `k`).
  */
 export interface FleetStatus {
@@ -426,8 +432,6 @@ export interface FleetStatus {
 	h: HealthState;
 	/** The last error (<= 200 bytes), while recent or unhealthy. */
 	e?: string;
-	/** Kernel 0.3.3+: an owner override holds this server. */
-	ov?: OverrideInfo;
 	sv: 2;
 }
 
@@ -550,8 +554,8 @@ export interface KernelStatus {
 	reports?: { total: number; kept: number; listeners: number };
 	/** Kernel 0.3.2+: the kernel's own fleet API sender (the `TypeTorchFleet` setting). */
 	fleet?: FleetSenderInfo;
-	/** Kernel 0.3.3+: an owner override holds this server (who, when, the branch or build, and where back goes). */
-	ov?: OverrideInfo;
+	/** Kernel 0.3.4+: the last branch switch or build load here ("switched by <name> 3m ago"). */
+	switched?: SwitchInfo;
 	/** Kernel 0.3.2+: client generation reports. */
 	clients?: ClientsSummary;
 }
@@ -597,8 +601,8 @@ export interface ServerKernel {
 	artifacts?(): ArtifactEntry[];
 	/**
 	 * Swap this server to a known artifact and hold it until a newer deploy of its branch. Devs on private/reserved/
-	 * studio servers; on public servers only owner/admin and only prod-channel artifacts. Kernel 0.2.3+:
-	 * `{ experiment: true }` (owner/admin) allows any channel on public servers too (older kernels ignore options).
+	 * studio servers; on public servers only the owner and only prod-channel artifacts. Kernel 0.2.3+:
+	 * `{ experiment: true }` (owner) allows any channel on public servers too (older kernels ignore options).
 	 */
 	pinArtifact?(player: Player, assetId: number, options?: PinOptions): SwapReport;
 
@@ -611,13 +615,13 @@ export interface ServerKernel {
 	onPending?(handler: (update: PendingUpdate) => void): void;
 	/** One handler per generation: a player's dev decision changed after the first one. */
 	onDevChanged?(handler: (player: Player, info: DevInfo) => void): void;
-	/** Reload this server to its branch head; the owner or admins only (checked by the kernel). */
+	/** Reload this server to its branch head; the owner only (checked by the kernel). */
 	requestReload?(player: Player): SwapReport;
 
 	// Kernel 0.2.3+ (additive): A/B experiments. `experiment` doubles as the feature test (devtools/ab.ts).
 	/** The running experiment pin, if any. */
 	experiment?(): ExperimentInfo | undefined;
-	/** End this server's experiment (back to its branch head). Owner/admin on public servers, devs elsewhere. */
+	/** End this server's experiment (back to its branch head). The owner on public servers, devs elsewhere. */
 	unpin?(player: Player): SwapReport;
 
 	// Kernel 0.3+ (additive): signed prod deploys. `keys` doubles as the feature test.
@@ -683,14 +687,15 @@ export interface ClientKernel {
 	/** One handler per generation: the server dropped one of this generation's messages (it runs a newer protocol). */
 	onResync?(handler: () => void): void;
 
-	// Kernel 0.3.3+ (additive).
+	// Kernel 0.3.4+ (additive).
 	/**
-	 * Asks the server to switch ITSELF in place, for this player (the owner, or an admin unless the place is
-	 * owner-only; `devStatus().canOverride`): to a branch, a known build, or back. Yields until it answers (up to
-	 * 30 s). A switch replaces this client generation too, so the caller may not see the answer. The server has no API
-	 * for this: payload code can't do it on another player's behalf.
+	 * Asks the server to switch THIS server to a branch or load a known build here, for this player. The kernel decides:
+	 * on public servers, and for builds on servers that take only signed artifacts, only owners (an ordinary switch or
+	 * pin; a public switch is never stored); elsewhere devs, as the dev menu's ops. Yields until it answers (up to 30 s).
+	 * A switch replaces this client generation too, so the caller may not see the answer. The server has no API for the
+	 * owner's way in: payload code can't do it on another player's behalf.
 	 */
-	requestOverride?(request: OverrideRequest): OverrideReply;
+	requestSwitch?(request: SwitchRequest): SwitchReply;
 }
 
 export type Kernel = ServerKernel | ClientKernel;

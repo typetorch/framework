@@ -1,13 +1,12 @@
 import { Players, UserInputService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
-import type { ArtifactEntry, ClientKernel } from "../kernel";
+import { normalRole, type ArtifactEntry, type ClientKernel, type Role } from "../kernel";
 import { bump, popIn, popOut, PopupQueue } from "../ui";
 import type {
 	AdminBanEntry,
 	AdminPlayer,
 	AdminPlayersReply,
-	AdminRole,
 	AdminServer,
 	AdminServersReply,
 	AdminYou,
@@ -21,8 +20,8 @@ import {
 	loadButtonLabel,
 	loadProgress,
 	loadSummary,
-	overrideOffered,
-	requestOverride,
+	requestSwitch,
+	switchOffered,
 	type LoadTarget,
 	type LoadWhere,
 } from "./build-actions";
@@ -52,18 +51,18 @@ import {
 } from "./widgets";
 
 /**
- * The dev menu's Admin tab (plans/10, "Admin"): sub-tabs Players, Servers and Bans. The server (admin-server.ts)
- * decides every permission; this UI only hides what the server says you can't do.
+ * The dev menu's Manage group (plans/10; "Admin" before framework 0.3.2), for owners only: sub-tabs Players, Servers
+ * and Bans. The server (admin-server.ts) decides every permission; this UI only hides what the server says you can't do.
  *  - Players: one row per player (headshot, display name, role, @name and user id, ping) and a "more" button that
  *    opens a small menu: Teleport to, Bring, Respawn, Kick, Ban. Kick and Ban open a card (reason; Ban adds a duration
  *    and "ban alts"); their button arms "Confirm" on the first tap.
  *  - Servers: the universe's live servers (short JobId, copyable by focusing it; type, branch, channel, artifact,
- *    players, uptime; tags are chips that wrap) with Join, plus New server and, for admins, Shut down (a card, then an
- *    armed button). A summary line per artifact says how many servers (and players) run it. "Load a build..." (owner/
- *    admin) runs a known build on this server (in place, kernel 0.3.3 owner override), on the ticked servers or on a
- *    share of one branch's servers (A/B pins, kernel 0.2.3, admin.ab, devtools/ab.ts); one status line under the list
- *    follows it. "Back to branch head" ends those.
- *  - Bans: Unban by user id and the ban history of a user id (admins).
+ *    players, uptime; tags are chips that wrap) with Join, plus New server and Shut down (a card, then an armed
+ *    button). A summary line per artifact says how many servers (and players) run it. "Load a build..." runs a known
+ *    build on this server (a pin from the owner's own client, kernel 0.3.4), on the ticked servers or on a share of one
+ *    branch's servers (A/B pins, kernel 0.2.3, admin.ab, devtools/ab.ts); one status line under the list follows it.
+ *    "Back to branch head" ends those.
+ *  - Bans: Unban by user id and the ban history of a user id.
  * Cards go through one PopupQueue (never two at once) and pop in and out through a UIScale; everything lives in the tab
  * trove, so a tab switch or a swap removes it.
  */
@@ -92,10 +91,10 @@ const BUILD_LIST_MAX = 220;
 const LOAD_TIMEOUT = 90;
 const LOAD_SHOWN = 60;
 /** Client persist key of the load in progress (an in-place load replaces this client generation). */
-const LOAD_PERSIST = "typetorch/admin-load";
+const LOAD_PERSIST = "typetorch/manage-load";
 
-const ROLE_COLORS: Record<AdminRole, Color3> = { owner: COLORS.accent, admin: COLORS.info, dev: COLORS.good };
-const ROLE_ORDER: Record<AdminRole, number> = { owner: 3, admin: 2, dev: 1 };
+const ROLE_COLORS: Record<Role, Color3> = { owner: COLORS.accent, dev: COLORS.good };
+const ROLE_ORDER: Record<Role, number> = { owner: 2, dev: 1 };
 
 /** Ban presets (ids match admin-server.ts BAN_PRESETS). */
 const PRESETS: Array<[id: string, label: string]> = [
@@ -108,8 +107,7 @@ const PRESETS: Array<[id: string, label: string]> = [
 /** Short text for the error codes of admin-server.ts. */
 const ERRORS: Record<string, string> = {
 	rate_limited: "Slow down",
-	admins_only: "Admins only",
-	prod_admin_only: "Admins only on prod",
+	owners_only: "Owners only",
 	protected: "Their role is too high",
 	self: "Not on yourself",
 	not_in_server: "They left",
@@ -141,12 +139,12 @@ export interface AdminDeps {
 	call: (op: string, payload?: unknown) => [ok: boolean, result: unknown];
 }
 
-/** The Admin sub-tabs, keyed like client.ts RENDER ("Tab/Sub"). */
+/** The Manage sub-tabs, keyed like client.ts RENDER ("Tab/Sub"). */
 export function adminTabs(deps: AdminDeps): Record<string, (tab: AdminTab) => void> {
 	return {
-		"Admin/Players": (tab) => renderPlayers(tab, deps),
-		"Admin/Servers": (tab) => renderServers(tab, deps),
-		"Admin/Bans": (tab) => renderBans(tab, deps),
+		"Manage/Players": (tab) => renderPlayers(tab, deps),
+		"Manage/Servers": (tab) => renderServers(tab, deps),
+		"Manage/Bans": (tab) => renderBans(tab, deps),
 	};
 }
 
@@ -161,7 +159,7 @@ function every(trove: Trove, interval: number, callback: () => void) {
 	spawnIn(trove, () => {
 		while (true) {
 			const [ok, err] = pcall(callback);
-			if (!ok) $warn(`[devtools] admin refresh failed: ${err}`);
+			if (!ok) $warn(`[devtools] manage refresh failed: ${err}`);
 			task.wait(interval);
 		}
 	});
@@ -421,7 +419,7 @@ class Cards {
 			const cardTrove = this.tab.trove.extend();
 			const overlay = cardTrove.add(
 				make("TextButton", {
-					Name: "AdminCard",
+					Name: "ManageCard",
 					AutoButtonColor: false,
 					Text: "",
 					BackgroundColor3: Color3.fromRGB(0, 0, 0),
@@ -604,9 +602,9 @@ export interface MigrateInfo {
 	serverType: string;
 }
 
-/** Mirrors admin.migrate (cosmetic; the server decides): admins on public servers, any dev elsewhere. */
-function mayMigrate(role: AdminRole | undefined, serverType: string): boolean {
-	if (serverType === "public") return role === "owner" || role === "admin";
+/** Mirrors admin.migrate (cosmetic; the server decides): owners on public servers, any dev elsewhere. */
+function mayMigrate(role: Role | undefined, serverType: string): boolean {
+	if (serverType === "public") return role === "owner";
 	return role !== undefined;
 }
 
@@ -650,7 +648,7 @@ export function migrateControl(tab: AdminTab, deps: AdminDeps): (parent: Page, i
 	const cards = new Cards(tab);
 	return (parent, info) => {
 		const [ok, devInfo] = pcall(() => deps.kernel.devStatus());
-		const role = ok && typeIs(devInfo, "table") ? devInfo.role : undefined;
+		const role = ok && typeIs(devInfo, "table") && devInfo.dev === true ? normalRole(devInfo.role) : undefined;
 		if (!mayMigrate(role, info.serverType)) return;
 		colorButton(parent.buttons(), "Migrate", COLORS.accent, () => openMigrate(cards, deps, info));
 	};
@@ -1100,8 +1098,8 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 	const loadLine = page.text("", COLORS.dim);
 	loadLine.Visible = false;
 	const loadState = deps.kernel.persist<LoadState>(LOAD_PERSIST, () => ({}));
-	/** The owner override is offered here (kernel 0.3.3, owner/admin): "This server" loads in place. */
-	let overrideOn = false;
+	/** Kernel 0.3.4: the owner's own client loads builds on this server (and Reload takes it back). */
+	let switchOn = false;
 	let followUp = false;
 	let loading = false;
 	let busy = false;
@@ -1110,7 +1108,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 	let you: AdminYou | undefined;
 	/** The last list, for the A/B cards. */
 	let servers = new Array<AdminServer>();
-	/** A/B controls are on: an owner/admin, and this server's kernel has experiments (0.2.3+). */
+	/** A/B controls are on: an owner, and this server's kernel has experiments (0.2.3+). */
 	let abOn = false;
 	/** JobIds picked for A/B; kept across refreshes, dropped when their server leaves the list. */
 	const selected = new Set<string>();
@@ -1271,7 +1269,6 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 		if (server.here) chips.push(chip(top, "Here", COLORS.accent));
 		chips.push(chip(top, typeWord(server.type), COLORS.info));
 		if (server.experiment) chips.push(chip(top, "A/B", COLORS.warn));
-		if (server.override !== undefined) chips.push(chip(top, "Override", COLORS.warn));
 		// Kernel 0.3.2 heartbeats carry the server's health: only the bad states get a chip.
 		if (server.health === "failed") chips.push(chip(top, "Down", COLORS.bad));
 		else if (server.health === "unverified") chips.push(chip(top, "Unverified", COLORS.bad));
@@ -1345,11 +1342,11 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 				return;
 			}
 			const data = reply as AdminServersReply;
-			footButtons.Visible = data.you.admin;
+			footButtons.Visible = data.you.owner;
 			you = data.you;
-			abOn = data.you.admin && data.ab === true;
-			overrideOn = data.you.admin && overrideOffered(deps.kernel)[1];
-			abNote.Visible = data.you.admin && data.ab !== true;
+			abOn = data.you.owner && data.ab === true;
+			switchOn = data.you.owner && switchOffered(deps.kernel)[0];
+			abNote.Visible = data.you.owner && data.ab !== true;
 			servers = data.servers;
 			// Servers that left drop out of the selection.
 			const listed = new Set<string>();
@@ -1424,15 +1421,15 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 		servers.filter((server) => server.branch === branch && server.type !== "studio").map((server) => server.jobId);
 
 	// "Load a build...": step 1 picks a known build (newest first), step 2 where it runs: this server (in place, the kernel
-	// 0.3.3 owner override), the ticked servers, or a share of one branch's servers (A/B pins). One summary line; the
+	// owner's pin from their own client, kernel 0.3.4), the ticked servers, or a share of one branch's servers (A/B pins). One summary line; the
 	// primary button says the action and takes two taps (green Confirm, then a locked dark "Loading...").
 	const openLoad = () =>
 		cards.open((card, close, cardTrove) => {
 			cardTitle(card, "Load a build");
 			const here = servers.find((server) => server.here);
 			const hereProd = here !== undefined && prodTarget(here);
-			// In place through the override, or (older kernels) an A/B pin of this server when it isn't prod.
-			const hereVia: "override" | "pin" | undefined = overrideOn ? "override" : abOn && here !== undefined && !hereProd ? "pin" : undefined;
+			// The owner's pin from their own client (kernel 0.3.4), or (older kernels) an A/B pin of this server when it isn't prod.
+			const hereVia: "switch" | "pin" | undefined = switchOn ? "switch" : abOn && here !== undefined && !hereProd ? "pin" : undefined;
 			const branches = branchesOf(servers);
 			let where: LoadWhere = selected.size() > 0 && abOn ? "selected" : hereVia !== undefined ? "here" : "share";
 			let pct = 10;
@@ -1550,8 +1547,8 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 					refresh();
 				}),
 			]);
-			// Prod servers take only CLI-signed pins: one dim line; "This server" still works (the owner override).
-			const anyProd = servers.some((server) => server.type !== "studio" && prodTarget(server) && !(server.here && hereVia === "override"));
+			// Prod servers take only CLI-signed pins: one dim line; "This server" still works (the owner's own pin).
+			const anyProd = servers.some((server) => server.type !== "studio" && prodTarget(server) && !(server.here && hereVia === "switch"));
 			const prodLine = card.text(PROD_PIN_NOTE, COLORS.dim);
 			prodLine.Visible = anyProd;
 			const summaryLine = card.text("", COLORS.text);
@@ -1569,7 +1566,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 			const blocked = (): string | undefined => {
 				if (!chosen) return "Pick a build";
 				if (where === "here" && chosen.running) return `${buildName(chosen)} already runs here`;
-				if (where === "here" && hereVia === undefined) return "Needs kernel 0.3.3";
+				if (where === "here" && hereVia === undefined) return "Needs kernel 0.3.4";
 				if (where === "selected" && selected.size() === 0) return "Tick servers in the list";
 				if (where === "share" && (shareBranch === undefined || prodBranch(servers, shareBranch))) return PROD_PIN_NOTE;
 				return undefined;
@@ -1609,7 +1606,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 						loadState.pending = pending;
 						status("Switching this server...", COLORS.dim);
 						spawnIn(cardTrove, () => {
-							const reply = requestOverride(deps.kernel, { assetId: build.assetId });
+							const reply = requestSwitch(deps.kernel, { assetId: build.assetId });
 							if (reply.ok) {
 								paintLoad();
 								close();
@@ -1636,7 +1633,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 				// This server.
 				hereCard.title.Text = "This server";
 				hereCard.detail.Text =
-					hereVia === undefined ? "Needs kernel 0.3.3" : `${playersHere} player${playersHere === 1 ? "" : "s"} stay`;
+					hereVia === undefined ? "Needs kernel 0.3.4" : `${playersHere} player${playersHere === 1 ? "" : "s"} stay`;
 				// Selected servers.
 				selectedCard.title.Text = `Selected servers (${count})`;
 				selectedCard.detail.Text = !abOn ? "Needs kernel 0.2.3" : count === 0 ? "Tick servers in the list" : "Ticked in the list";
@@ -1684,13 +1681,13 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 			refresh();
 		});
 
-	// "Back to branch head": this server (when an owner override holds it), the ticked servers, or every A/B server of
-	// one branch go back to their branch head.
+	// "Back to branch head": this server (Reload, kernel 0.3.4), the ticked servers, or every A/B server of one branch go
+	// back to their branch head.
 	const openUnpin = () =>
 		cards.open((card, close, cardTrove) => {
 			cardTitle(card, "Back to branch head");
 			const here = servers.find((server) => server.here);
-			const hereBack = overrideOn && here?.override !== undefined;
+			const hereBack = switchOn && here !== undefined;
 			const branches = branchesOf(servers);
 			type BackMode = "here" | "picked" | "all";
 			let mode: BackMode = hereBack ? "here" : selected.size() > 0 ? "picked" : "all";
@@ -1740,10 +1737,10 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 					if (mode === "here") {
 						status("Switching this server...", COLORS.dim);
 						spawnIn(cardTrove, () => {
-							const reply = requestOverride(deps.kernel, { back: true });
-							if (reply.ok) return close();
+							const [ok, reply] = deps.call("reload");
+							if (succeeded(ok, reply)) return close();
 							unlock();
-							status(`Failed: ${reply.error ?? "unknown error"}`, COLORS.bad);
+							status(`Failed: ${errorText(reply)}`, COLORS.bad);
 						});
 						return;
 					}
@@ -1769,7 +1766,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 				warning.TextColor3 = prodAll ? COLORS.dim : COLORS.warn;
 				warning.Text =
 					mode === "here"
-						? `This server goes back to ${here?.override?.branch !== undefined ? "its branch" : "the branch head"}`
+						? `This server goes back to its branch head`
 						: prodAll
 							? PROD_PIN_NOTE
 							: mode === "picked"
@@ -1806,7 +1803,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 
 	addButton(bar, "Refresh", load);
 	addButton(bar, "New server", () => act("Opening a server", "admin.newServer", undefined, "Teleporting..."));
-	// Footer (owner/admin): Load a build (in place on kernel 0.3.3, A/B pins on 0.2.3), Back to branch head, then Shut
+	// Footer (owners): Load a build (here on kernel 0.3.4, A/B pins on 0.2.3), Back to branch head, then Shut
 	// down for this server (red, with its own confirm).
 	const loadButton = colorButton(footButtons, "Load a build...", COLORS.accent, openLoad);
 	const unpinButton = addButton(footButtons, "Back to branch head", openUnpin);
@@ -1821,9 +1818,8 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 	countLabel.LayoutOrder = footButtons.GetChildren().size();
 	countLabel.Parent = footButtons;
 	paintAb = () => {
-		const hereOverridden = servers.some((server) => server.here && server.override !== undefined);
-		loadButton.Visible = abOn || overrideOn;
-		unpinButton.Visible = abOn || (overrideOn && hereOverridden);
+		loadButton.Visible = abOn || switchOn;
+		unpinButton.Visible = abOn || switchOn;
 		countLabel.Visible = abOn && selected.size() > 0;
 		countLabel.Text = `${selected.size()} selected`;
 	};
@@ -1845,10 +1841,10 @@ function colorButton(row: Instance, label: string, color: Color3, onClick: () =>
 function renderBans(tab: AdminTab, deps: AdminDeps) {
 	const { page, trove } = tab;
 	const [statusOk, info] = pcall(() => deps.kernel.devStatus());
-	const role = statusOk && typeIs(info, "table") ? info.role : undefined;
-	if (role !== "owner" && role !== "admin") {
-		// Cosmetic: the server refuses these ops for non-admins anyway.
-		page.text("Admins only", COLORS.dim);
+	const role = statusOk && typeIs(info, "table") && info.dev === true ? normalRole(info.role) : undefined;
+	if (role !== "owner") {
+		// Cosmetic: the server refuses these ops for non-owners anyway.
+		page.text("Owners only", COLORS.dim);
 		return;
 	}
 

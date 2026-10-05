@@ -20,6 +20,7 @@ import type {
 	SwapOutInfo,
 	SwapReport,
 } from "./kernel";
+import { normalRole } from "./kernel";
 import type { BuildInfo } from "./module";
 import { persistKeys } from "./runtime/registry";
 import { hotAsset, type HotAsset } from "./assets/hot-asset";
@@ -103,9 +104,11 @@ export interface TypeTorchApi {
 	 * server re-checks everything); other players are false.
 	 */
 	isDev(player: Player): boolean;
-	/** "owner" | "admin" | "dev", or undefined. Same rules as `isDev`. */
+	/** "owner" | "dev", or undefined. Same rules as `isDev`. An older kernel's "admin" counts as "dev". */
 	role(player: Player): Role | undefined;
-	/** A dev whose role is owner or admin. Same rules as `isDev`. */
+	/** A dev whose role is owner (the experience creator, the owning group's owner, members with role "owner"). */
+	isOwner(player: Player): boolean;
+	/** @deprecated There are no admins (framework 0.3.2): the same as `isOwner`. */
 	isAdmin(player: Player): boolean;
 	devInfo(player: Player): DevInfo;
 
@@ -120,8 +123,8 @@ export interface TypeTorchApi {
 	 */
 	artifacts(): ArtifactEntry[] | undefined;
 	/**
-	 * Server only, kernel 0.2.2+. Reloads this server to its branch head. The kernel allows it only for the owner and
-	 * admins. On success it returns at once ({ ok: true, queued: true }) and the swap follows, which stops this
+	 * Server only, kernel 0.2.2+. Reloads this server to its branch head. The kernel allows it only for the owner. On
+	 * success it returns at once ({ ok: true, queued: true }) and the swap follows, which stops this
 	 * generation (onSwapOut fires).
 	 */
 	requestReload(player: Player): SwapReport;
@@ -340,12 +343,15 @@ class TypeTorchRuntime implements TypeTorchApi {
 
 	role(player: Player): Role | undefined {
 		const info = this.devInfo(player);
-		return info.dev ? info.role : undefined;
+		return info.dev ? normalRole(info.role) : undefined;
+	}
+
+	isOwner(player: Player): boolean {
+		return this.role(player) === "owner";
 	}
 
 	isAdmin(player: Player): boolean {
-		const role = this.role(player);
-		return role === "owner" || role === "admin";
+		return this.isOwner(player);
 	}
 
 	status(): KernelStatus {

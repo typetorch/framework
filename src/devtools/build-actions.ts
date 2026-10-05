@@ -1,15 +1,17 @@
-import type { ClientKernel, OverrideReply, OverrideRequest, ServerType } from "../kernel";
+import { normalRole, type ClientKernel, type ServerType, type SwitchReply, type SwitchRequest } from "../kernel";
 import { jobBucket } from "./ab";
 
 /**
- * What the dev menu offers for branches and builds (framework 0.3.1), as pure functions: the Branch tab and Admin >
+ * What the dev menu offers for branches and builds (framework 0.3.1+), as pure functions: the Branch tab and Manage >
  * Servers' "Load a build" card use the same words and rules, and test-generations.luau checks them.
  *
  * Words: a "build" is one artifact. "Switch" moves THIS server to another branch, "Load here" runs a build on THIS
- * server, "Join" moves only you to a reserved server. The kernel re-checks everything.
+ * server (a pin), "Join" moves only you to a reserved server. The kernel re-checks everything.
  *
- * Kernel 0.3.3 adds the owner override: the owner (and admins unless the place is owner-only) switch any server in place,
- * public and prod ones too (`kernel.requestOverride`, `devStatus().canOverride`). Older kernels keep the 0.3.0 rules.
+ * Kernel 0.3.4: owners switch any server and load builds on it, public and prod ones too, from their own client
+ * (`kernel.requestSwitch`). These are ordinary switches and pins: Reload and Rollback keep working, and going back to
+ * prod is Switch on the prod row. There are no admins (framework 0.3.2): owners and devs. Older kernels keep the 0.3.0
+ * rules.
  */
 
 export interface PickerContext {
@@ -17,23 +19,21 @@ export interface PickerContext {
 	serverType?: ServerType;
 	/** This server takes only signed prod builds (kernel 0.3). */
 	signedOnly: boolean;
-	/** The viewer is the owner or an admin. */
-	isAdmin: boolean;
-	/** The kernel has the owner override (0.3.3: `requestOverride`). */
-	overrideKernel: boolean;
-	/** The kernel lets this viewer switch this server in place (`devStatus().canOverride`). */
-	canOverride: boolean;
+	/** The viewer is an owner (`normalRole`: an older kernel's "admin" is a dev). */
+	isOwner: boolean;
+	/** The kernel takes switches from the owner's own client (0.3.4: `requestSwitch`). */
+	switchKernel: boolean;
 	/** The kernel has A/B experiment pins (0.2.3+). */
 	experiments: boolean;
 }
 
-/** "here": switch THIS server in place (owner override); "stored": the private/reserved server's own switch (it is
- * kept); "join": move only you to a reserved server on that branch; undefined: no button. */
+/** "here": the owner switches THIS public server (for its lifetime, never stored); "stored": the private/reserved
+ * server's own switch (it is kept); "join": move only you to a reserved server on that branch; undefined: no button. */
 export type BranchAction = "here" | "stored" | "join" | undefined;
 
 export function branchAction(ctx: PickerContext, current: boolean): BranchAction {
 	if (ctx.serverType === undefined || current) return undefined;
-	if (ctx.serverType === "public") return ctx.overrideKernel && ctx.canOverride ? "here" : "join";
+	if (ctx.serverType === "public") return ctx.switchKernel && ctx.isOwner ? "here" : "join";
 	return "stored";
 }
 
@@ -42,17 +42,18 @@ export function branchLabel(action: BranchAction): string {
 	return action === "join" ? "Join" : "Switch";
 }
 
-/** "here": load in place through the owner override; "pin": the kernel pin (private/reserved/Studio, or an A/B
- * experiment on a public server before 0.3.3); "join": move only you to a reserved server on it; undefined: none. */
+/** "here": the owner's pin from their own client (public and prod servers, kernel 0.3.4); "pin": the dev pin
+ * (private/reserved/Studio dev servers, or an A/B experiment on a public server before 0.3.4); "join": move only you to
+ * a reserved server on it; undefined: none. */
 export type BuildAction = "here" | "pin" | "join" | undefined;
 
 export function buildAction(ctx: PickerContext, entry: { running: boolean; channel: string }): BuildAction {
 	if (ctx.serverType === undefined || entry.running) return undefined;
 	const isPublic = ctx.serverType === "public";
-	if ((isPublic || ctx.signedOnly) && ctx.overrideKernel && ctx.canOverride) return "here";
+	if ((isPublic || ctx.signedOnly) && ctx.switchKernel && ctx.isOwner) return "here";
 	if (isPublic) {
-		if (ctx.isAdmin && ctx.signedOnly) return undefined; // an older kernel: only `typetorch pin` reaches it
-		if (ctx.isAdmin && (ctx.experiments || entry.channel === "prod")) return "pin";
+		if (ctx.isOwner && ctx.signedOnly) return undefined; // an older kernel: only `typetorch pin` reaches it
+		if (ctx.isOwner && (ctx.experiments || entry.channel === "prod")) return "pin";
 		return "join";
 	}
 	if (ctx.signedOnly) return undefined;
@@ -63,25 +64,30 @@ export function buildLabel(action: BuildAction): string {
 	return action === "join" ? "Join" : "Load here";
 }
 
-/** Kernels before 0.3.3 on prod servers: in-game loads can't reach them, only `typetorch pin`. */
+/** Kernels before 0.3.4 on prod servers: in-game loads can't reach them, only `typetorch pin`. */
 export function showCliNote(ctx: PickerContext): boolean {
-	return !ctx.overrideKernel && ctx.signedOnly && (ctx.isAdmin || ctx.serverType !== "public");
+	return !ctx.switchKernel && ctx.signedOnly && (ctx.isOwner || ctx.serverType !== "public");
 }
 
-/** Kernel 0.3.3: [the kernel has the owner override, this player may use it] (`requestOverride`, `canOverride`). */
-export function overrideOffered(kernel: ClientKernel): [kernelHas: boolean, mayUse: boolean] {
-	const has = typeIs((kernel as unknown as Record<string, unknown>).requestOverride, "function");
-	if (!has) return [false, false];
+/** Whether this client's player is an owner (cosmetic: the kernel re-checks). An older kernel's "admin" is a dev. */
+export function viewerIsOwner(kernel: ClientKernel): boolean {
 	const [ok, info] = pcall(() => kernel.devStatus());
-	return [true, ok && typeIs(info, "table") && info.canOverride === true];
+	return ok && typeIs(info, "table") && info.dev === true && normalRole(info.role) === "owner";
 }
 
-/** Asks the kernel to switch this server in place (yields; a switch replaces this client generation). */
-export function requestOverride(kernel: ClientKernel, request: OverrideRequest): OverrideReply {
-	const [ok, reply] = pcall(() => kernel.requestOverride!(request));
+/** Kernel 0.3.4: [the kernel takes switches from the owner's own client, this player is an owner]. */
+export function switchOffered(kernel: ClientKernel): [kernelHas: boolean, owner: boolean] {
+	const has = typeIs((kernel as unknown as Record<string, unknown>).requestSwitch, "function");
+	return [has, viewerIsOwner(kernel)];
+}
+
+/** Asks the kernel to switch this server or load a build here (yields; a switch replaces this client generation). */
+export function requestSwitch(kernel: ClientKernel, request: SwitchRequest): SwitchReply {
+	const [ok, reply] = pcall(() => kernel.requestSwitch!(request));
 	if (!ok || !typeIs(reply, "table")) return { ok: false, error: tostring(reply) };
 	return reply;
 }
+
 
 // Builds ---------------------------------------------------------------------------------------------------------------
 
@@ -129,7 +135,7 @@ export function buildBadge(entry: BuildEntry): string | undefined {
 	return undefined;
 }
 
-// Where a build goes (Admin > Servers) -------------------------------------------------------------------------------
+// Where a build goes (Manage > Servers) ------------------------------------------------------------------------------
 
 export type LoadWhere = "here" | "selected" | "share";
 
@@ -183,4 +189,11 @@ export function loadProgress(name: string, expected: number, switched: number, t
 	if (expected > 0 && switched >= expected) return [`Done: ${switched} switched`, true, false];
 	if (timedOut) return [`${switched} of ${expected} switched`, true, true];
 	return [`Loading ${name} on ${servers(expected)}`, false, false];
+}
+
+/** "switched by Owner 3m ago" (status().switched), or undefined. */
+export function switchedText(info: { name?: string; at?: number } | undefined, now: number): string | undefined {
+	if (info === undefined || !typeIs(info.at, "number")) return undefined;
+	const age = math.max(0, now - info.at);
+	return `switched by ${info.name ?? "?"} ${age < 60 ? "just now" : ageText(age)}`;
 }

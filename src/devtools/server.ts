@@ -2,6 +2,7 @@ import { DataStoreService, HttpService, InsertService, MarketplaceService, Playe
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
 import type { ServerKernel } from "../kernel";
+import { normalRole } from "../kernel";
 import type { ServerDispatcher } from "../net/runtime";
 import { runningModules } from "../runtime/registry";
 import { registerRemoteClaude } from "./claude";
@@ -99,14 +100,14 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 	const ops = new Map<string, DevOp>();
 	const guard = kernel.persist<SwapGuard>("typetorch/devtools-swaps", () => ({}));
 
-	/** The owner or an admin (kernel roles). */
-	const isAdmin = (player: Player) => {
+	/** An owner (kernel 0.3.4 roles; an older kernel's "admin" is a dev). */
+	const isOwner = (player: Player) => {
 		const info = kernel.devInfo(player);
-		return info.dev && (info.role === "owner" || info.role === "admin");
+		return info.dev && normalRole(info.role) === "owner";
 	};
 	/**
 	 * The reserved server's creator: setBy of the kernel's registry record private/<PrivateServerId>, written by
-	 * newServer. Read once and kept (later switches rewrite setBy, but only the creator or an admin can switch).
+	 * newServer. Read once and kept (later switches rewrite setBy, but only the creator or an owner can switch).
 	 */
 	const reservedCreator = (): number | undefined => {
 		if (guard.reservedCreator !== undefined) return guard.reservedCreator;
@@ -118,10 +119,10 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 	};
 	/**
 	 * Reload and switch (security audit L3): Studio, the private server's owner, the dev who created this reserved
-	 * server, or an admin/owner of the game. Everyone else (any other dev, any dev on a public server) is refused.
+	 * server, or an owner of the game. Everyone else (any other dev, any dev on a public server) is refused.
 	 */
 	const mayRetarget = (player: Player): boolean => {
-		if (isAdmin(player)) return true;
+		if (isOwner(player)) return true;
 		const kind = kernel.serverType;
 		if (kind === "studio") return true;
 		if (kind === "private") return game.PrivateServerOwnerId === player.UserId;
@@ -137,7 +138,7 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 		}
 		guard.lastSwap = now;
 	};
-	const NOT_YOURS = "only this server's owner (or a game admin) can reload it or switch its branch";
+	const NOT_YOURS = "only this server's owner (or a game owner) can reload it or switch its branch";
 
 	ops.set("status", (player) => {
 		const modules = runningModules.map(
@@ -227,8 +228,8 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 		if (useful && notesCache.size() < 200) notesCache.set(payload, notes);
 		return notes;
 	});
-	// Pin this server to a known artifact. The kernel re-checks everything (dev, server type, admin, channel).
-	// payload: assetId, or { assetId, experiment: true } (kernel 0.2.3+: an A/B experiment, owner/admin; any channel on
+	// Pin this server to a known artifact. The kernel re-checks everything (dev, server type, owner, channel).
+	// payload: assetId, or { assetId, experiment: true } (kernel 0.2.3+: an A/B experiment, owner only; any channel on
 	// public servers, which stay prod).
 	ops.set("pin", (player, payload) => {
 		let assetId: unknown = payload;
@@ -317,7 +318,8 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 	);
 	// Network inspector ops (net.packets/packet/stop): packet capture while a dev watches.
 	registerNetworkOps(kernel, dispatcher, trove, ops);
-	// Admin ops (admin.players/tp/bring/respawn/kick/ban/unban/history/servers/join/newServer/shutdown).
+	// Manage ops, owners only (admin.players/tp/bring/respawn/kick/ban/unban/history/servers/join/newServer/shutdown/ab/
+	// migrate).
 	registerAdminOps((op, handler) => {
 		ops.set(op, handler);
 	}, kernel, trove);

@@ -120,15 +120,15 @@ export class CoinService extends Module implements OnStart {
   logs (server, own client, other players' clients), client and server dex, network stats, module state, a branch and
   build picker (Server > Branch) and a Claude prompt. Prod-channel servers are read-only. The window can be dragged by
   its header and resized from its corner (double-tap the header to reset).
-- **Switch a live server (kernel 0.3.3):** the owner (and admins, unless the place is owner-only) switch THIS server in
-  place, public and prod ones too: Server > Branch, "Switch" on a branch or "Load here" on a build, then the green
-  Confirm. Everyone stays; the server follows that branch (dev rules) or holds that build until "Back to prod" on
-  Server > Status (or the server closes). Nothing is stored: new servers still boot the signed prod head. Others see
-  "Join", which moves only them to a reserved server. Admin > Servers "Load a build..." does the same for this server,
-  the ticked servers or a share of one branch (A/B pins), with one status line under the list. Modules has
-  Overview, State and Assets (hot assets), each with a Server | Client toolbar. In the Dex,
-  right-click or long-press a property for Copy value / Copy name and a tree row for Copy path (Roblox has no
-  clipboard, so copying opens a small popup with the text selected: Ctrl+C, or long-press > Copy on touch).
+- **Switch a live server (kernel 0.3.4):** owners switch any server and load builds on it, public and prod ones too:
+  Server > Branch, "Switch" on a branch or "Load here" on a build, then the green Confirm. Everyone stays. These are
+  ordinary switches and pins: Reload and Rollback keep working, and going back to prod is Switch on the prod row (its
+  verified head). A public switch lasts for that server's lifetime and is never stored, so new servers still boot the
+  signed prod head. Others see "Join", which moves only them to a reserved server. Manage > Servers "Load a build..."
+  does the same for this server, the ticked servers or a share of one branch (A/B pins), with one status line under
+  the list.
+- **Owners and devs:** two roles (no admins: an older kernel's or typetorch.json's "admin" counts as a dev). The Manage
+  group (Players, Servers, Bans) is for owners only.
 - **Remote Claude** (dev-channel servers only): while `typetorch remote-claude` (`@typetorch/dev-server`) runs on a dev's machine, allowlisted
   devs prompt Claude Code from the Claude tab. Each dev pairs once by pasting the pairing code printed by
   typetorch-dev-server; the game server keeps the session URL and the tokens in memory and never sends them to clients.
@@ -162,13 +162,13 @@ this.trove.add(TypeTorch.onUpdatePending((update) => (hint.Visible = !update.can
 const scores = TypeTorch.persist("scores.v1", () => new Map<number, number>());
 
 // Dev and roles (server: the kernel decides; client: only the local player, cosmetic)
-if (TypeTorch.isAdmin(player)) showAdminPanel(player);
-TypeTorch.onPlayerDevChanged((player, info) => setAdminTools(player, info.dev));
+if (TypeTorch.isOwner(player)) showOwnerPanel(player);
+TypeTorch.onPlayerDevChanged((player, info) => setDevTools(player, info.dev));
 
 // Server only
 TypeTorch.status(); // uptime, players, memory, history: cheap
 TypeTorch.branches(); TypeTorch.artifacts(); // registry reads, cached ~30 s: may yield, don't call per frame
-TypeTorch.requestReload(player); // owner and admins only, checked by the kernel
+TypeTorch.requestReload(player); // owners only, checked by the kernel
 
 // Logs (the kernel's ring buffer)
 TypeTorch.logs(0, 50);

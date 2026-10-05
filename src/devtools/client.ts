@@ -12,20 +12,23 @@ import type {
 	KeyTrust,
 	LogEntry,
 	NewServerReport,
-	OverrideRequest,
 	SwapReport,
+	SwitchRequest,
 	Verified,
 } from "../kernel";
+import { normalRole } from "../kernel";
 import {
 	branchAction,
 	branchLabel,
 	buildAction,
 	buildLabel,
 	buildName,
-	overrideOffered,
 	PickerContext,
-	requestOverride,
+	requestSwitch,
 	showCliNote,
+	switchedText,
+	switchOffered,
+	viewerIsOwner,
 } from "./build-actions";
 import type { ClientDispatcher, LeafStats } from "../net/runtime";
 import { runningModules } from "../runtime/registry";
@@ -127,10 +130,10 @@ const OTHER_LOG_ERRORS: Record<string, string> = {
 	rate_limited: "Slow down",
 };
 
-const TABS = ["Artifact", "Modules", "Server", "Admin", "Logs", "Dex", "Network", "Claude"] as const;
+const TABS = ["Artifact", "Modules", "Server", "Manage", "Logs", "Dex", "Network", "Claude"] as const;
 type TabName = (typeof TABS)[number];
 /** Tabs with sub-tabs (a segmented bar on top of the content); the first one is the default. */
-const SUBTABS: Partial<Record<TabName, readonly string[]>> = { Modules: ["Overview", "State", "Assets"], Server: ["Status", "Branch"], Admin: ["Players", "Servers", "Bans"], Network: ["Packets", "Stats"] };
+const SUBTABS: Partial<Record<TabName, readonly string[]>> = { Modules: ["Overview", "State", "Assets"], Server: ["Status", "Branch"], Manage: ["Players", "Servers", "Bans"], Network: ["Packets", "Stats"] };
 
 interface StatusReply {
 	server: KernelStatus;
@@ -373,6 +376,14 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		state.tab = "Modules";
 		subs.Modules = "State";
 	}
+	// Framework 0.3.2: the Admin group is Manage (owners only).
+	if (state.tab === "Admin") state.tab = "Manage";
+	const oldSubs = subs as Record<string, string | undefined>;
+	const adminSub = oldSubs.Admin;
+	if (adminSub !== undefined) {
+		subs.Manage = adminSub;
+		oldSubs.Admin = undefined;
+	}
 
 	// Requests ------------------------------------------------------------------------------------------------------
 	// Random start: a response addressed to the previous generation can't match one of ours after a swap.
@@ -567,7 +578,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		page.section("Client");
 		page.field("Artifact", kernel.artifact.id);
 		page.field("Generation", `#${kernel.generation}`);
-		// How long this client generation has run (kernel 0.2.2+ `start`), in Admin > Servers' words ("12m", "3h 04m").
+		// How long this client generation has run (kernel 0.2.2+ `start`), in Manage > Servers' words ("12m", "3h 04m").
 		const clientStarted = kernel.start?.startedAt;
 		const clientRunning = page.field("Running", "-");
 		page.field("Branch", str(kernel.branch));
@@ -653,27 +664,6 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		const { page, trove: tabTrove } = tab;
 		// "Migrate" on the kernel-update issue (admin-ui.ts): moves everyone to a fresh server on the new kernel.
 		const migrateButton = migrateControl(tab, { kernel, call });
-		// Kernel 0.3.3: an owner override holds this server; "Back to <branch>" (two taps) for the owner and admins.
-		const backArm = newArmState();
-		const backButton = (parent: typeof body, status: KernelStatus) => {
-			const ov = status.ov;
-			const [, mayUse] = overrideOffered(kernel);
-			if (ov === undefined || !mayUse) return;
-			const back = ov.back ?? "the branch head";
-			const button = addButton(parent.buttons(), `Back to ` + back, () => {});
-			armLock(
-				button,
-				backArm,
-				{ label: `Back to ` + back, color: COLORS.accent },
-				"Switching...",
-				() => {},
-				(unlock) =>
-					spawnIn(tabTrove, () => {
-						const reply = requestOverride(kernel, { back: true });
-						if (!reply.ok) unlock();
-					}),
-			);
-		};
 		const body = page.group();
 		body.text("Loading...", COLORS.dim);
 		every(tabTrove, REFRESH, () => {
@@ -691,7 +681,6 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				for (const issue of issues) {
 					body.field(issue.title, issue.detail, ISSUE_COLORS[issue.level]);
 					if (issue.action === "migrate") migrateButton(body, status);
-					if (issue.action === "back") backButton(body, status);
 				}
 			}
 			body.section("Server");
@@ -699,6 +688,9 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			body.field("Job", str(status.jobId));
 			body.field("Place version", str(status.placeVersion));
 			body.field("Branch", `${str(status.branch)} (${str(status.channel)})`);
+			// Kernel 0.3.4: who switched this server (or loaded a build here), one dim line.
+			const switchedLine = switchedText(status.switched, os.time());
+			if (switchedLine !== undefined) body.text(switchedLine, COLORS.dim);
 			if (status.pinned !== undefined) body.field("Pinned", status.pinned ? "yes" : "no", status.pinned ? COLORS.warn : COLORS.text);
 			body.field("Uptime", duration(status.uptime));
 			if (status.generation) {
@@ -989,11 +981,11 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				if (op !== "newServer") load();
 			});
 		};
-		/** Kernel 0.3.3: switches THIS server in place through the owner override; a switch restarts this menu. */
-		const override = (label: string, request: OverrideRequest, unlock: () => void) => {
+		/** Kernel 0.3.4: the owner switches THIS server or loads a build here from their own client (a swap restarts this menu). */
+		const ownerSwitch = (label: string, request: SwitchRequest, unlock: () => void) => {
 			setResult(`${label}...`, COLORS.dim);
 			spawnIn(tabTrove, () => {
-				const reply = requestOverride(kernel, request);
+				const reply = requestSwitch(kernel, request);
 				if (reply.ok) setResult(reply.generation !== undefined ? `Running ${reply.generation}` : "Done", COLORS.good);
 				else {
 					setResult(`Failed: ${reply.error ?? "unknown error"}`, COLORS.bad);
@@ -1051,15 +1043,14 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			const status = data.status;
 			const serverType = status?.serverType;
 			const isPublic = serverType === "public";
-			const isAdmin = data.you?.role === "owner" || data.you?.role === "admin";
+			const isOwner = data.you?.dev === true && normalRole(data.you.role) === "owner";
 			const running = status?.generation?.artifact;
-			const [overrideKernel, canOverride] = overrideOffered(kernel);
+			const [switchKernel] = switchOffered(kernel);
 			const ctx: PickerContext = {
 				serverType,
 				signedOnly: status?.signedOnly === true,
-				isAdmin,
-				overrideKernel,
-				canOverride,
+				isOwner,
+				switchKernel,
 				experiments: data.experiments === true,
 			};
 			const players = status?.players ?? 0;
@@ -1084,17 +1075,15 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				const pinned = status.pinned === true;
 				const pinText = status.experiment !== undefined ? "A/B experiment, until the next deploy" : pinned ? "yes, until the next deploy" : "no";
 				body.field("Pinned", pinText, pinned ? COLORS.warn : COLORS.text);
-				const ov = status.ov;
-				if (ov !== undefined) {
-					const what = ov.branch ?? ov.artifact ?? "-";
-					body.field("Override", `by ${ov.name ?? ov.by}: ${what}${ov.seq !== undefined ? ` #${ov.seq}` : ""}`, COLORS.warn);
-				}
+				// Kernel 0.3.4: who switched this server (or loaded a build here), one dim line.
+				const switchedLine = switchedText(status.switched, os.time());
+				if (switchedLine !== undefined) body.text(switchedLine, COLORS.dim);
 			} else {
 				body.text("Status unavailable", COLORS.bad);
 			}
 
-			// Branch picker (framework 0.3.1, build-actions.ts): "Switch" moves THIS server (in place: the owner override on
-			// public servers, kernel 0.3.3; the stored switch on private/reserved/Studio servers); "Join" moves only you to a
+			// Branch picker (build-actions.ts): "Switch" moves THIS server (on public servers the owner's switch, kernel 0.3.4,
+			// for this server's lifetime; the stored switch on private/reserved/Studio servers); "Join" moves only you to a
 			// reserved server on that branch (everyone else on public servers).
 			body.section("Branches");
 			if (data.branchesError !== undefined) body.text(`Failed: ${data.branchesError}`, COLORS.bad);
@@ -1133,7 +1122,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 							{ label: branchLabel(action), color: COLORS.accent },
 							"Switching...",
 							() => setResult(`Switch this server (${playersText}) to ${branch.name}?`, COLORS.warn),
-							(unlock) => override(`Switching to ${branch.name}`, { branch: branch.name }, unlock),
+							(unlock) => ownerSwitch(`Switching to ${branch.name}`, { branch: branch.name }, unlock),
 						);
 					}
 				}
@@ -1147,10 +1136,10 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				return;
 			}
 			if (artifacts.size() === 0) body.text("None yet", COLORS.dim);
-			// Kernels before 0.3.3: a prod server takes only CLI-signed pins, so nothing loads in place there.
+			// Kernels before 0.3.4: a prod server takes only CLI-signed pins, so nothing loads in place there.
 			if (showCliNote(ctx)) body.text("Use the CLI: typetorch pin", COLORS.dim);
-			const abInPlace = ctx.serverType === "public" && isAdmin && ctx.experiments && !ctx.signedOnly;
-			if (ctx.serverType === "public" && isAdmin && !ctx.experiments && !ctx.signedOnly && !canOverride) {
+			const abInPlace = ctx.serverType === "public" && isOwner && ctx.experiments && !ctx.signedOnly;
+			if (ctx.serverType === "public" && isOwner && !ctx.experiments && !ctx.signedOnly && !switchKernel) {
 				body.text("A/B needs kernel 0.2.3", COLORS.dim);
 			}
 			const order = new Array<string>();
@@ -1188,7 +1177,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 						return;
 					}
 					if (action === "here") {
-						// Kernel 0.3.3: the owner/admins load it on THIS server in place (two taps; everyone stays).
+						// Kernel 0.3.4: the owner loads it on THIS server (a pin; two taps; everyone stays).
 						const row = body.row(title, detail, { label: buildLabel(action), color: COLORS.accent, onClick: () => {} });
 						const button = row.FindFirstChildWhichIsA("TextButton");
 						if (button) {
@@ -1198,7 +1187,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 								{ label: buildLabel(action), color: COLORS.accent },
 								"Loading...",
 								() => setResult(`Load ${buildName(entry)} on this server (${playersText})?`, COLORS.warn),
-								(unlock) => override(`Loading ${short}`, { assetId: entry.assetId }, unlock),
+								(unlock) => ownerSwitch(`Loading ${short}`, { assetId: entry.assetId }, unlock),
 							);
 						}
 						expandable(row, entry.assetId);
@@ -1215,7 +1204,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 						expandable(moveRow, entry.assetId);
 						return;
 					}
-					// "pin": private/reserved/Studio servers, or an A/B experiment on a public server before kernel 0.3.3.
+					// "pin": private/reserved/Studio servers, or an A/B experiment on a public server before kernel 0.3.4.
 					// A dev-channel build on a prod-channel server: a dark "Dev channel" button, so it isn't loaded by mistake.
 					const crossChannel = status?.channel === "prod" && entry.channel === "dev";
 					let armed = !isPublic && !crossChannel; // public server or cross-channel: tap twice
@@ -1305,13 +1294,15 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	let tabTrove: Trove | undefined;
 	let isOpen = false;
 	let dev = false;
+	/** This player is an owner (framework 0.3.2: the Manage group shows only for owners). */
+	let owner = false;
 
 	/** Group headers' expand state and the active sub-tab (from state.tab and subs). */
 	const paintGroups = () => {
 		if (!ui) return;
 		for (const [tab, group] of ui.groups) {
 			const expanded = openGroups.has(tab);
-			group.frame.Visible = expanded;
+			group.frame.Visible = expanded && (tab !== "Manage" || owner);
 			group.collapsed.Visible = !expanded;
 			group.expanded.Visible = expanded;
 			for (const [child, button] of group.children) {
@@ -1701,7 +1692,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		isOpen = true;
 		state.open = true;
 		popIn(ui.window);
-		selectTab(TABS.includes(state.tab as TabName) ? (state.tab as TabName) : "Artifact");
+		const remembered = TABS.includes(state.tab as TabName) ? (state.tab as TabName) : "Artifact";
+		selectTab(remembered === "Manage" && !owner ? "Artifact" : remembered);
 	};
 
 	const setDev = (value: boolean) => {
@@ -1721,9 +1713,23 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		}
 	};
 
+	/** Framework 0.3.2: the Manage group shows only for owners (the server re-checks every Manage op). */
+	const paintOwner = () => {
+		if (!ui) return;
+		const button = ui.tabButtons.get("Manage");
+		if (button) button.Visible = owner;
+		paintGroups();
+		if (!owner && isOpen && state.tab === "Manage") selectTab("Artifact");
+	};
+
 	const refreshDev = () => {
 		const [ok, info] = pcall(() => kernel.devStatus());
 		setDev(ok && typeIs(info, "table") && info.dev === true);
+		const nowOwner = viewerIsOwner(kernel);
+		if (nowOwner !== owner || (ui && ui.tabButtons.get("Manage")?.Visible !== owner)) {
+			owner = nowOwner;
+			paintOwner();
+		}
 	};
 
 	paintBadges = () => {

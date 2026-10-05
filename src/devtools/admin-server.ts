@@ -1,21 +1,21 @@
 import { DataStoreService, HttpService, MessagingService, Players, TeleportService, TextService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
-import type { Channel, NewServerReport, ServerKernel, ServerType } from "../kernel";
+import { normalRole, type Channel, type NewServerReport, type Role, type ServerKernel, type ServerType } from "../kernel";
 import { RateLimiter } from "../net/limits";
 import { AB_KERNEL, AbReply, kernelHasExperiments, NEEDS_KERNEL_AB, PIN_JOBS_PER_MESSAGE, PIN_TOPIC, PinMessage } from "./ab";
 import { versionLess } from "./health";
 import { RollCall } from "./roll-call";
 
 /**
- * Server half of the dev menu's Admin tab (plans/10, "Admin"): players (teleport to, bring, respawn, kick, ban),
- * bans (unban, history) and the live servers of this universe (list, join, new server, shut down).
+ * Server half of the dev menu's Manage group (plans/10; "Admin" before framework 0.3.2): players (teleport to, bring,
+ * respawn, kick, ban), bans (unban, history) and the live servers of this universe (list, join, new server, shut down,
+ * A/B). The op names keep their "admin." prefix (internal).
  *
  * Every op is checked here, never on the client:
- *  - the actor must be a dev (the devtools dispatcher checks it, re-checked here);
- *  - kick, ban, unban, bring, respawning others and shut down need owner/admin; respawning yourself needs admin on
- *    prod-channel servers;
- *  - nobody can kick or ban someone with an equal or higher role (so never the owner); bring and respawn can't target
+ *  - framework 0.3.2: two roles, owner and dev (no admins; an older kernel's "admin" is a dev). Every Manage op needs an
+ *    owner; Migrate needs an owner on public servers and any dev elsewhere;
+ *  - nobody can kick or ban someone with an equal or higher role (so never an owner); bring and respawn can't target
  *    a higher role;
  *  - payloads are validated (user ids are positive integers, reasons are short valid UTF-8, job ids are short ids);
  *  - per-dev token buckets: moderation 3 then 1 per 6 s, movement 4 then 1/s, reads 8 then 2/s, ban history 3 then
@@ -27,20 +27,21 @@ import { RollCall } from "./roll-call";
  * Server list (0.3.0, user decision: no MemoryStore): a MessagingService roll call (devtools/roll-call.ts). When a dev
  * opens the list, this server asks every server on `TypeTorch/rollcall` and collects their rows for 3 s on its own reply
  * topic; the list is cached 15 s. Each server answers with the kernel's `fleetStatus()` (kernel 0.3.2+; t, b, c, a,
- * n, m, s, u, p, k?, x?, v, q, g, h, e?, sv) or the admin fields on older kernels, and stays silent while it shuts down or
+ * n, m, s, u, p, k?, x?, v, q, g, h, e?, sv) or the framework's own fields on older kernels, and stays silent while it shuts down or
  * migrates. Nothing is written anywhere: the list is live, and servers on frameworks before 0.3.0 don't show up.
  *
  * Migrate (`admin.migrate`, see the Migrate section): everyone moves to one new reserved server on this branch (and
- * pin), which starts on the newest place version, so a server on an old kernel gets the new one. Admins on public
+ * pin), which starts on the newest place version, so a server on an old kernel gets the new one. Owners on public
  * servers, any dev elsewhere; one migration per server.
  *
- * A/B (`admin.ab`, owner/admin, 2 then 1 per 10 s; kernel 0.2.3): publishes TypeTorch/pin messages (devtools/ab.ts)
+ * A/B (`admin.ab`, owners, 2 then 1 per 10 s; kernel 0.2.3): publishes TypeTorch/pin messages (devtools/ab.ts)
  * that pin the chosen servers (by JobId, grouped by branch, 15 per message) or a random percent of one branch's servers
  * to a known artifact as an experiment, or unpin them. Each heartbeat carries `x` (experiment) and `v` (kernel
  * version), so the list shows which servers run what and which kernels can take a pin.
  */
 
-export type AdminRole = "owner" | "admin" | "dev";
+/** Framework 0.3.2: the kernel's roles, owner and dev (`normalRole`). */
+export type AdminRole = Role;
 
 /** What the acting dev may do to one player (the server re-checks on every op). */
 export interface AdminCan {
@@ -53,7 +54,8 @@ export interface AdminCan {
 
 export interface AdminYou {
 	role?: AdminRole;
-	admin: boolean;
+	/** An owner: the Manage group is for owners only. */
+	owner: boolean;
 	channel: Channel;
 	serverType: ServerType;
 }
@@ -100,8 +102,6 @@ export interface AdminServer {
 	health?: string;
 	/** Kernel 0.3.2+: its applied deploy seq. */
 	seq?: number;
-	/** Kernel 0.3.3+: an owner override holds it (who, and the branch or build it was switched to). */
-	override?: { by?: number; branch?: string; artifact?: string };
 }
 
 export interface AdminServersReply {
@@ -208,8 +208,6 @@ interface StoredServer {
 	h?: unknown;
 	e?: unknown;
 	sv?: unknown;
-	/** Kernel 0.3.3+: the owner override ({by, at, branch | artifact}). */
-	ov?: unknown;
 }
 
 /** Kernel 0.3.2+: `fleetStatus()` is this server's row (the roll call answers with it). */
@@ -228,12 +226,11 @@ interface Actor {
 	player: Player;
 	role?: AdminRole;
 	rank: number;
-	admin: boolean;
+	owner: boolean;
 }
 
 function rank(role: AdminRole | undefined): number {
-	if (role === "owner") return 3;
-	if (role === "admin") return 2;
+	if (role === "owner") return 2;
 	if (role === "dev") return 1;
 	return 0;
 }
@@ -301,14 +298,21 @@ export function registerAdminOps(
 	const roleOf = (player: Player): AdminRole | undefined => {
 		const [ok, info] = pcall(() => kernel.devInfo(player));
 		if (!ok || !typeIs(info, "table") || info.dev !== true) return undefined;
-		return info.role;
+		return normalRole(info.role);
 	};
 
 	const actorOf = (player: Player): Actor => {
 		// The dispatcher checks this too; re-checked so these ops stay dev-only wherever they are registered.
 		if (player.Parent === undefined || !kernel.isDev(player)) error("not a dev", 0);
 		const role = roleOf(player);
-		return { player, role, rank: rank(role), admin: role === "owner" || role === "admin" };
+		return { player, role, rank: rank(role), owner: role === "owner" };
+	};
+
+	/** Framework 0.3.2: every Manage op is for owners only. */
+	const ownerOf = (player: Player): Actor => {
+		const actor = ownerOf(player);
+		if (!actor.owner) error("owners_only", 0);
+		return actor;
 	};
 
 	const limit = (actor: Actor, bucket: keyof typeof BUCKETS) => {
@@ -317,7 +321,7 @@ export function registerAdminOps(
 
 	const youOf = (actor: Actor): AdminYou => ({
 		role: actor.role,
-		admin: actor.admin,
+		owner: actor.owner,
 		channel: kernel.channel,
 		serverType: kernel.serverType,
 	});
@@ -327,17 +331,17 @@ export function registerAdminOps(
 		const targetRank = rank(targetRole);
 		return {
 			tp: !isSelf,
-			bring: !isSelf && actor.admin && actor.rank >= targetRank,
-			respawn: isSelf ? kernel.channel === "dev" || actor.admin : actor.admin && actor.rank >= targetRank,
-			kick: !isSelf && actor.admin && actor.rank > targetRank,
-			ban: !isSelf && actor.admin && actor.rank > targetRank,
+			bring: !isSelf && actor.owner && actor.rank >= targetRank,
+			respawn: isSelf ? kernel.channel === "dev" || actor.owner : actor.owner && actor.rank >= targetRank,
+			kick: !isSelf && actor.owner && actor.rank > targetRank,
+			ban: !isSelf && actor.owner && actor.rank > targetRank,
 		};
 	};
 
 	/** The error code for a refused player action. */
 	const refusal = (actor: Actor, target: Player, action: keyof AdminCan): string => {
-		if (target === actor.player) return action === "respawn" ? "prod_admin_only" : "self";
-		return actor.admin ? "protected" : "admins_only";
+		if (target === actor.player) return action === "respawn" ? "owners_only" : "self";
+		return actor.owner ? "protected" : "owners_only";
 	};
 
 	const targetOf = (payload: unknown): Player => {
@@ -362,7 +366,7 @@ export function registerAdminOps(
 		const who = `@${actor.player.Name} (${actor.player.UserId}, ${actor.role ?? "?"})`;
 		const whom = targetId !== undefined ? ` @${targetName ?? "?"} (${targetId})` : "";
 		const why = reason !== "" ? `, reason: ${reason}` : "";
-		print(`[TypeTorch admin] ${who} ${action}${whom}${why} on ${jobLabel}`);
+		print(`[TypeTorch manage] ${who} ${action}${whom}${why} on ${jobLabel}`);
 		saved.modSeq += 1;
 		const now = DateTime.now();
 		const key = `mod/${now.FormatUniversalTime("YYYY-MM-DD", "en-us")}/${jobKey}/${saved.modSeq}`;
@@ -382,14 +386,14 @@ export function registerAdminOps(
 		if (extra) for (const [name, value] of pairs(extra)) entry[name] = value;
 		task.spawn(() => {
 			const [ok, err] = pcall(() => DataStoreService.GetDataStore(MOD_STORE).SetAsync(key, entry));
-			if (!ok) $warn(`[admin] durable record ${key} failed: ${err}`);
+			if (!ok) $warn(`[manage] durable record ${key} failed: ${err}`);
 		});
 	};
 
 	// Players -------------------------------------------------------------------------------------------------------
 
 	register("admin.players", (player) => {
-		const actor = actorOf(player);
+		const actor = ownerOf(player);
 		limit(actor, "read");
 		const players = Players.GetPlayers().map((target): AdminPlayer => {
 			const [pingOk, ping] = pcall(() => target.GetNetworkPing());
@@ -409,7 +413,7 @@ export function registerAdminOps(
 	});
 
 	register("admin.tp", (player, payload) => {
-		const actor = actorOf(player);
+		const actor = ownerOf(player);
 		limit(actor, "move");
 		const target = targetOf(payload);
 		if (!permissions(actor, target).tp) error(refusal(actor, target, "tp"), 0);
@@ -417,12 +421,12 @@ export function registerAdminOps(
 		const theirs = liveCharacter(target);
 		if (!mine || !theirs) error("no_character", 0);
 		moveCharacter(mine, theirs.GetPivot().mul(new CFrame(0, 0, 4)));
-		print(`[TypeTorch admin] @${player.Name} (${player.UserId}) teleported to @${target.Name} (${target.UserId})`);
+		print(`[TypeTorch manage] @${player.Name} (${player.UserId}) teleported to @${target.Name} (${target.UserId})`);
 		return { ok: true };
 	});
 
 	register("admin.bring", (player, payload) => {
-		const actor = actorOf(player);
+		const actor = ownerOf(player);
 		limit(actor, "move");
 		const target = targetOf(payload);
 		if (!permissions(actor, target).bring) error(refusal(actor, target, "bring"), 0);
@@ -435,7 +439,7 @@ export function registerAdminOps(
 	});
 
 	register("admin.respawn", (player, payload) => {
-		const actor = actorOf(player);
+		const actor = ownerOf(player);
 		limit(actor, "move");
 		const target = targetOf(payload);
 		if (!permissions(actor, target).respawn) error(refusal(actor, target, "respawn"), 0);
@@ -446,9 +450,8 @@ export function registerAdminOps(
 	});
 
 	register("admin.kick", (player, payload) => {
-		const actor = actorOf(player);
+		const actor = ownerOf(player);
 		limit(actor, "mod");
-		if (!actor.admin) error("admins_only", 0);
 		const target = targetOf(payload);
 		if (!permissions(actor, target).kick) error(refusal(actor, target, "kick"), 0);
 		const reason = reasonOf(field(payload, "reason"));
@@ -459,9 +462,8 @@ export function registerAdminOps(
 	});
 
 	register("admin.ban", (player, payload) => {
-		const actor = actorOf(player);
+		const actor = ownerOf(player);
 		limit(actor, "mod");
-		if (!actor.admin) error("admins_only", 0);
 		const target = targetOf(payload);
 		if (!permissions(actor, target).ban) error(refusal(actor, target, "ban"), 0);
 		const preset = field(payload, "preset");
@@ -497,9 +499,8 @@ export function registerAdminOps(
 	// Bans ------------------------------------------------------------------------------------------------------------
 
 	register("admin.unban", (player, payload) => {
-		const actor = actorOf(player);
+		const actor = ownerOf(player);
 		limit(actor, "mod");
-		if (!actor.admin) error("admins_only", 0);
 		const userId = field(payload, "userId");
 		if (!isUserId(userId)) error("bad_request", 0);
 		const [ok, err] = pcall(() => Players.UnbanAsync({ UserIds: [userId], ApplyToUniverse: true }));
@@ -509,9 +510,8 @@ export function registerAdminOps(
 	});
 
 	register("admin.history", (player, payload) => {
-		const actor = actorOf(player);
+		const actor = ownerOf(player);
 		limit(actor, "history");
-		if (!actor.admin) error("admins_only", 0);
 		const userId = field(payload, "userId");
 		if (!isUserId(userId)) error("bad_request", 0);
 		// @rbxts/types types the parameter as `User`; the engine takes the user id.
@@ -547,7 +547,7 @@ export function registerAdminOps(
 	}
 	let shuttingDown = false;
 
-	/** A reserved server's own access code, when the kernel exposes it (kernel need: see plans/10, Admin). */
+	/** A reserved server's own access code, when the kernel exposes it (kernel need: see plans/10, Manage). */
 	const accessCode = (): string | undefined => {
 		const api = kernel as unknown as { accessCode?: unknown };
 		if (typeIs(api.accessCode, "function")) {
@@ -669,18 +669,11 @@ export function registerAdminOps(
 			ab: version !== undefined ? !versionLess(version, AB_KERNEL) : undefined,
 			health: text(value.h),
 			seq: num(value.q),
-			override: typeIs(value.ov, "table")
-				? {
-						by: num((value.ov as Record<string, unknown>).by),
-						branch: text((value.ov as Record<string, unknown>).branch),
-						artifact: text((value.ov as Record<string, unknown>).artifact),
-					}
-				: undefined,
 		};
 	};
 
 	register("admin.servers", (player) => {
-		const actor = actorOf(player);
+		const actor = ownerOf(player);
 		limit(actor, "read");
 		const list = readServers();
 		const now = os.time();
@@ -703,15 +696,14 @@ export function registerAdminOps(
 
 	// A/B ---------------------------------------------------------------------------------------------------------------
 	// Pins (or unpins) servers through the kernel topic TypeTorch/pin. The servers re-check everything themselves
-	// (branch, target, owner/admin `by`, known deployment); this op checks the request, the role and the rate.
+	// (branch, target, owner `by`, known deployment); this op checks the request, the role and the rate.
 
 	const isJobId = (value: unknown): value is string =>
 		typeIs(value, "string") && value.size() > 0 && value.size() <= 64 && value.match("^[%w%-]+$")[0] !== undefined;
 
 	register("admin.ab", (player, payload): AbReply => {
-		const actor = actorOf(player);
+		const actor = ownerOf(player);
 		limit(actor, "ab");
-		if (!actor.admin) error("admins_only", 0);
 		if (!kernelHasExperiments(kernel)) error(NEEDS_KERNEL_AB, 0);
 		if (kernel.serverType === "studio" || game.JobId === "") error("studio", 0);
 		const unpin = field(payload, "unpin");
@@ -769,7 +761,7 @@ export function registerAdminOps(
 			const [ok, err] = pcall(() => MessagingService.PublishAsync(PIN_TOPIC, HttpService.JSONEncode(message)));
 			if (!ok) {
 				failed += 1;
-				$warn(`[admin] A/B publish failed: ${err}`);
+				$warn(`[manage] A/B publish failed: ${err}`);
 			}
 		};
 		for (const [branch, group] of groups) {
@@ -807,7 +799,7 @@ export function registerAdminOps(
 	});
 
 	register("admin.join", (player, payload) => {
-		const actor = actorOf(player);
+		const actor = ownerOf(player);
 		limit(actor, "move");
 		const jobId = field(payload, "jobId");
 		if (!typeIs(jobId, "string") || jobId.size() > 64 || jobId.match("^[%w%-]+$")[0] === undefined) error("bad_request", 0);
@@ -824,7 +816,7 @@ export function registerAdminOps(
 			error("not_joinable", 0);
 		}
 		const placeId = isUserId(value.p) ? value.p : game.PlaceId;
-		print(`[TypeTorch admin] @${player.Name} (${player.UserId}) joins server ${jobId}`);
+		print(`[TypeTorch manage] @${player.Name} (${player.UserId}) joins server ${jobId}`);
 		const [ok, err] = pcall(() => TeleportService.TeleportAsync(placeId, [player], options));
 		if (!ok) error(`teleport failed: ${err}`, 0);
 		return { ok: true };
@@ -832,7 +824,7 @@ export function registerAdminOps(
 
 	// A new reserved server on this server's branch (the kernel checks dev status and the branch).
 	register("admin.newServer", (player): NewServerReport => {
-		const actor = actorOf(player);
+		const actor = ownerOf(player);
 		limit(actor, "move");
 		return kernel.newServer(player, kernel.branch);
 	});
@@ -842,9 +834,8 @@ export function registerAdminOps(
 	});
 
 	register("admin.shutdown", (player) => {
-		const actor = actorOf(player);
+		const actor = ownerOf(player);
 		limit(actor, "mod");
-		if (!actor.admin) error("admins_only", 0);
 		if (shuttingDown) return { ok: true };
 		shuttingDown = true;
 		const count = Players.GetPlayers().size();
@@ -860,7 +851,7 @@ export function registerAdminOps(
 	// Moves everyone to one fresh reserved server on this server's branch (and pin). A new server starts on the newest
 	// place version, so this is how a server on an old kernel gets the new one without waiting for it to empty. Works
 	// on kernels 0.2.0+: it reserves the server and writes the kernel's own private/<PrivateServerId> record
-	// ({branch, setBy, setAt, pin?}, plus `code` for Admin > Servers) itself. One migration per server.
+	// ({branch, setBy, setAt, pin?}, plus `code` for Manage > Servers) itself. One migration per server.
 
 	/** This server's pin in the kernel's `private/<id>` pin shape, if it is pinned. */
 	const currentPin = (): Record<string, unknown> | undefined => {
@@ -899,7 +890,7 @@ export function registerAdminOps(
 		const entry = attempts.get(target);
 		if (!entry) return;
 		backoff(entry);
-		$warn(`[admin] migrate: ${target.Name} failed (${result.Name}): ${message}`);
+		$warn(`[manage] migrate: ${target.Name} failed (${result.Name}): ${message}`);
 	});
 	trove.connect(Players.PlayerRemoving, (leaving) => attempts.delete(leaving));
 
@@ -939,7 +930,7 @@ export function registerAdminOps(
 						for (const target of batch) attempts.get(target)!.sentAt = os.clock();
 						const [ok, err] = pcall(() => TeleportService.TeleportAsync(game.PlaceId, batch, options));
 						if (!ok) {
-							$warn(`[admin] migrate: teleport of ${batch.size()} failed: ${err}`);
+							$warn(`[manage] migrate: teleport of ${batch.size()} failed: ${err}`);
 							for (const target of batch) {
 								const entry = attempts.get(target);
 								if (entry) backoff(entry);
@@ -963,8 +954,8 @@ export function registerAdminOps(
 		const actor = actorOf(player);
 		limit(actor, "mod");
 		if (kernel.serverType === "studio" || game.JobId === "") error("studio", 0);
-		// Public servers: players leave public matchmaking for a reserved server, so only owner/admin.
-		if (kernel.serverType === "public" && !actor.admin) error("admins_only", 0);
+		// Public servers: players leave public matchmaking for a reserved server, so only owners.
+		if (kernel.serverType === "public" && !actor.owner) error("owners_only", 0);
 		if (saved.migration || reserving || shuttingDown) error("already_migrating", 0);
 		reserving = true;
 		const branch = kernel.branch;

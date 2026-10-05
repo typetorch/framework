@@ -1,5 +1,5 @@
 /**
- * Admin > Servers' server list (framework 0.3.0, user decision): a MessagingService roll call, no MemoryStore.
+ * Manage > Servers' server list (framework 0.3.0, user decision): a MessagingService roll call, no MemoryStore.
  *
  * - A dev opens the list: this server subscribes to its own reply topic `TypeTorch/rollcall/<its JobId>`, publishes one
  *   ask `{ q, j = its JobId, t }` on `TypeTorch/rollcall`, collects replies for COLLECT_SECONDS and caches the list for
@@ -7,7 +7,7 @@
  * - Every server listens on `TypeTorch/rollcall` and answers an ask with one message `{ q, j = its JobId, s = its row }`
  *   on the asker's reply topic, after a random wait of up to REPLY_JITTER seconds: at most REPLIES_PER_MINUTE per
  *   minute and one per asker every REPLY_GAP seconds, never to an ask older than ASK_MAX_AGE seconds. The row is the
- *   kernel's `fleetStatus()` on kernel 0.3.2+ (else the admin fields), cut to fit one message (`e`, then `k`, dropped).
+ *   kernel's `fleetStatus()` on kernel 0.3.2+ (else the framework's own fields), cut to fit one message (`e`, then `k`, dropped).
  * - MessagingService limits (Roblox docs; conservative figures): a server publishes 150 + 60 x players messages a minute,
  *   a topic takes 10 + 20 x servers messages a minute, the whole game 100 + 50 x servers. One roll call costs the asker
  *   1 publish and each server 1 (so 100 servers: 101 messages, against 2,010 a minute on the reply topic and 5,100 a
@@ -93,7 +93,7 @@ export class RollCall {
 		this.deps.spawn(() => {
 			const [ok, connection] = pcall(() => this.deps.subscribe(ROLL_CALL_TOPIC, (data) => this.onAsk(data)));
 			if (!ok) {
-				this.deps.warn(`[admin] roll call unavailable: ${connection}`);
+				this.deps.warn(`[servers] roll call unavailable: ${connection}`);
 				return;
 			}
 			if (this.stopped) connection.Disconnect();
@@ -148,7 +148,7 @@ export class RollCall {
 			if (body === undefined || this.stopped) return;
 			const [ok, err] = pcall(() => this.deps.publish(replyTopic(asker), body));
 			if (ok) this.counters.answered += 1;
-			else this.deps.warn(`[admin] roll call reply failed: ${err}`);
+			else this.deps.warn(`[servers] roll call reply failed: ${err}`);
 		});
 	}
 

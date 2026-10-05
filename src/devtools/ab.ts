@@ -1,15 +1,15 @@
 import type { ServerKernel } from "../kernel";
 
 /**
- * A/B experiments on live servers (kernel 0.2.3; plans/10 "Admin > Servers (A/B)", plans/01).
+ * A/B experiments on live servers (kernel 0.2.3; plans/10 "Manage > Servers (A/B)", plans/01).
  *
- * - On a public server, the owner or an admin may pin ANY known artifact (dev channel too) as an experiment:
+ * - On a public server, an owner may pin ANY known artifact (dev channel too) as an experiment:
  *   `kernel.pinArtifact(player, assetId, { experiment: true })`. The server stays "prod" (public), so devtools stay
  *   read-only there. The pin holds until the next deploy of the server's branch, an unpin, or the server closing.
- * - Admin > Servers pins many servers at once through the kernel topic `TypeTorch/pin` (PinMessage): by JobId, or a
+ * - Manage > Servers pins many servers at once through the kernel topic `TypeTorch/pin` (PinMessage): by JobId, or a
  *   random `pct` of the servers on one branch (`jobBucket(JobId) < pct`, the same buckets as deploy rollouts `ro`).
  * - Unsigned, like deploy messages (plans/12 S-C2 stays open): the kernel re-checks the fields, a 120 s freshness
- *   window and that `by` is the owner or an admin, and only pins known deployments.
+ *   window and that `by` is an owner, and only pins known deployments.
  */
 
 /** Kernel 0.2.3 MessagingService topic for remote experiment pins (kernel Constants.PIN_TOPIC). */
@@ -31,7 +31,7 @@ export interface PinMessage {
 	a?: number;
 	/** Only servers on this branch apply it. */
 	b: string;
-	/** The owner or admin who asked (the kernel checks the role). */
+	/** The owner who asked (the kernel checks the role). */
 	by: number;
 	/** Sent at, unix milliseconds (refused when more than 120 s off). */
 	t: number;
@@ -39,7 +39,7 @@ export interface PinMessage {
 	unpin?: boolean;
 }
 
-/** What Admin > Servers asks the server to publish (op admin.ab). Exactly one of jobIds / pct. */
+/** What Manage > Servers asks the server to publish (op admin.ab). Exactly one of jobIds / pct. */
 export interface AbRequest {
 	jobIds?: string[];
 	pct?: number;
