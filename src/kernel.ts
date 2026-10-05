@@ -329,6 +329,81 @@ export interface GenerationHistoryEntry {
 	swapSeconds?: number;
 }
 
+/** Kernel 0.3.2+: the running generation's health ("ok" | "failed": nothing runs | "unverified" | "degraded"). */
+export type HealthState = "ok" | "failed" | "unverified" | "degraded";
+
+/** Kernel 0.3.2+ `status().health` (plans/12 P-F1: the health window). */
+export interface HealthInfo {
+	state: HealthState;
+	/** Errors from the running generation's own scripts since it started. */
+	errors: number;
+	lastError?: string;
+	lastErrorAt?: number;
+	/** A failed onStart the framework reported (it rolls back inside the window). */
+	startFailed?: string;
+	/** Why this generation failed its health check (it is being, or couldn't be, rolled back). */
+	failed?: string;
+	/** Seconds of the health window left (30 s from ready). */
+	windowLeft?: number;
+	/** The last health-window rollback on this server: from, to (the last known good it ran), why, unix seconds. */
+	lastRollback?: { from: string; to?: string; why: string; at: number };
+}
+
+/** Kernel 0.3.2+: an artifact that failed on this server (start, mount or the health window); never run again
+ * automatically here (a dev's reload or pin still may). */
+export interface FailedArtifact {
+	assetId: number;
+	artifactId?: string;
+	seq?: number;
+	why: string;
+	at: number;
+}
+
+/** Kernel 0.3.2+: counters of the kernel's MemoryStore writes (heartbeat or reports). */
+export interface WriteStats {
+	writes: number;
+	failures: number;
+	/** Writes given up after their retries. */
+	dropped: number;
+	lastOkAt?: number;
+	lastError?: string;
+	lastErrorAt?: number;
+	/** The last write failed. */
+	failing: boolean;
+}
+
+/** Kernel 0.3.2+ `heartbeat()` and `status().heartbeat`: the kernel writes the server list and deploy reports. */
+export interface HeartbeatInfo {
+	/** False in Studio (no JobId), or when the place doesn't map the kernel's Reports module (`missing`). */
+	enabled: boolean;
+	missing?: boolean;
+	map?: string;
+	reportsMap?: string;
+	heartbeat?: WriteStats;
+	reports?: WriteStats;
+}
+
+/** Kernel 0.3.2+ `status().clients`: what clients reported about their generation start (P-K7). */
+export interface ClientsSummary {
+	players: number;
+	reported: number;
+	ok: number;
+	failed: number;
+	/** Reported another generation than the running one. */
+	behind: number;
+	/** Failed reports since boot. */
+	failures: number;
+	lastFailure?: { userId: number; generation: string; error?: string; at: number };
+}
+
+/** Kernel 0.3.2+: a failed lifecycle hook the framework reports (`reportError`). */
+export interface ReportedError {
+	/** "onStart" (a health failure: rolls back inside the window) or another hook (counts as one error). */
+	kind: string;
+	module: string;
+	message: string;
+}
+
 export interface KernelStatus {
 	jobId: string;
 	placeId: number;
@@ -381,6 +456,14 @@ export interface KernelStatus {
 	 * ServerStorage.TypeTorchDev.Payload, synced by the template's studio.project.json) instead of an uploaded artifact.
 	 */
 	localPayload?: boolean;
+	/** Kernel 0.3.2+: the running generation's health window and errors. */
+	health?: HealthInfo;
+	/** Kernel 0.3.2+: artifacts that failed on this server, newest first. */
+	failed?: FailedArtifact[];
+	/** Kernel 0.3.2+: the kernel's heartbeat and deploy report writes. */
+	heartbeat?: HeartbeatInfo;
+	/** Kernel 0.3.2+: client generation reports. */
+	clients?: ClientsSummary;
 }
 
 export interface ServerKernel {
@@ -452,6 +535,20 @@ export interface ServerKernel {
 	readonly kernelBuild?: string;
 	/** The trust state (key asset, keys, fallback key, last change, refusals). Devs only: check the asking player. */
 	keys?(): KeyTrust;
+
+	// Kernel 0.3.2+ (additive): bad deploys are safe. `reportError` doubles as the feature test.
+	/**
+	 * Reports a failed lifecycle hook of this generation. A failed onStart within 30 s of ready rolls the server back to
+	 * its last known good artifact; other kinds count as one error (3 within the window also roll back). The kernel
+	 * prints it as an error line. Returns false once this generation is stopping.
+	 */
+	reportError?(info: ReportedError): boolean;
+	/** One handler per generation, run from the kernel's BindToClose (server shutdown), for at most 20 s. */
+	onClose?(handler: () => void): void;
+	/** The kernel writes the server list (TypeTorchServers) and deploy reports; the framework then doesn't. */
+	heartbeat?(): HeartbeatInfo;
+	/** A reserved server's own access code (server-only data: never send it to a client). */
+	accessCode?(): string | undefined;
 }
 
 export interface ClientKernel {

@@ -86,6 +86,17 @@ function order(modules: RegisteredModule[]): RegisteredModule[] {
 /** The generation's stop function. The kernel (0.2.2+) passes what replaces it; older kernels pass nothing. */
 export type StopGeneration = (info?: SwapOutInfo) => void;
 
+/**
+ * Kernel 0.3.2+ (plans/12 P-F1): reports a failed lifecycle hook to the kernel. A failed onStart inside the health
+ * window (30 s from ready) rolls the server back to its last known good artifact, and the kernel prints the error.
+ * Returns false when the kernel can't take it (older kernels, clients), so the caller raises it as before.
+ */
+function reportToKernel(kernel: ServerKernel | ClientKernel, kind: string, module: string, message: string): boolean {
+	if (!typeIs((kernel as unknown as Record<string, unknown>).reportError, "function")) return false;
+	const [ok, taken] = pcall(() => (kernel as ServerKernel).reportError!({ kind, module, message }));
+	return ok && taken === true;
+}
+
 function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, options: StartOptions): StopGeneration {
 	const startedAt = os.clock();
 	const root = new Trove();
@@ -192,8 +203,30 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 		if (has(instance, "onPlayerAdded")) {
 			observePlayers(running.trove, (player, playerTrove) => (instance as OnPlayerAdded).onPlayerAdded(player, playerTrove));
 		}
-		// In the module trove, so a soft stop also ends an onStart that is still running (e.g. a loop).
-		if (has(instance, "onStart")) running.trove.add(task.spawn(() => (instance as OnStart).onStart()));
+		// In the module trove, so a soft stop also ends an onStart that is still running (e.g. a loop). Kernel 0.3.2: a
+		// throwing onStart is reported (the kernel rolls the server back inside the health window); older kernels and
+		// clients get the error raised in its thread as before.
+		if (has(instance, "onStart")) {
+			const name = running.name;
+			running.trove.add(
+				task.spawn(() => {
+					const [ok, trace] = xpcall(
+						() => (instance as OnStart).onStart(),
+						(err: unknown) => debug.traceback(tostring(err), 2),
+					);
+					if (ok) return;
+					const text = tostring(trace);
+					if (realm === "server" && reportToKernel(kernel, "onStart", name, text)) return;
+					error(`${name}.onStart failed: ${text}`, 0);
+				}),
+			);
+		}
+	}
+
+	// Kernel 0.3.2: a real shutdown runs every module's onStop too (reverse order; the kernel gives it up to 20 s).
+	// onSwapOut doesn't run: nothing replaces this generation.
+	if (realm === "server" && typeIs((kernel as unknown as Record<string, unknown>).onClose, "function")) {
+		(kernel as ServerKernel).onClose!(() => stopModules());
 	}
 
 	onStarted?.();

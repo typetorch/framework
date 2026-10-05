@@ -479,5 +479,148 @@ if first and second then
 	check("generation 1's registry is untouched by generation 2", stillFirst == firstCount and #first.registered == #second.registered, `{stillFirst} of {firstCount}`)
 end
 
+-- Lifecycle under startServer (kernel 0.3.2, plans/12 P-F1) ---------------------------------------------------------
+-- A third copy of the payload runs the real startServer with stub kernels and one injected module whose onStart
+-- throws: a 0.3.2 kernel gets reportError (the kernel rolls the server back inside its health window; nothing is raised
+-- in the module's thread), an older kernel (no reportError, or one that refuses it) gets the error raised as before, and
+-- onClose runs every module's onStop on a real shutdown.
+
+local threadErrors = {}
+-- The payload's task library: errors in spawned threads are recorded instead of printed.
+local recordingTask = table.clone(task)
+recordingTask.spawn = function(fn, ...)
+	if type(fn) == "thread" then
+		return task.spawn(fn, ...)
+	end
+	return task.spawn(function(...)
+		local ok, err = pcall(fn, ...)
+		if not ok then
+			table.insert(threadErrors, tostring(err))
+		end
+	end, ...)
+end
+
+local function lifecycle(label: string, extras)
+	local savedTask = globals.task
+	globals.task = recordingTask
+	table.clear(threadErrors)
+	local model = convert(roblox.deserializeModel(bytes)[1], nil)
+	inner[model].Name = `payload#{label}`
+	local TS = requireModule(model.include.RuntimeLib)
+	local frameworkOut = model.include.node_modules["@typetorch"].framework.out
+	local framework = TS.import(model.Server, frameworkOut)
+	local registry = TS.import(model.Server, frameworkOut, "runtime", "registry")
+	local calls = { onStart = 0, onStop = 0, fineStarted = 0, reports = {} }
+	local Broken = setmetatable({}, {
+		__tostring = function()
+			return "BrokenService"
+		end,
+	})
+	Broken.__index = Broken
+	function Broken.new()
+		return setmetatable({}, Broken)
+	end
+	function Broken:onStart()
+		calls.onStart += 1
+		error("attempt to index nil with 'price'")
+	end
+	function Broken:onStop()
+		calls.onStop += 1
+	end
+	local Fine = setmetatable({}, {
+		__tostring = function()
+			return "FineService"
+		end,
+	})
+	Fine.__index = Fine
+	function Fine.new()
+		return setmetatable({}, Fine)
+	end
+	function Fine:onStart()
+		calls.fineStarted += 1
+	end
+	table.insert(registry.registered, { ctor = Broken, realm = "server", config = {} })
+	table.insert(registry.registered, { ctor = Fine, realm = "server", config = {} })
+	local store = {}
+	local kernel = {
+		kernelApi = 1,
+		kernelVersion = "0.3.2",
+		artifact = { id = `lifecycle-{label}` },
+		generation = 3,
+		branch = "dev",
+		channel = "dev",
+		serverType = "reserved",
+		persist = function(_, key, init)
+			store[key] = store[key] or init()
+			return store[key]
+		end,
+		onMessage = function() end,
+		send = function() end,
+		broadcast = function() end,
+		sendUnreliable = function() end,
+		broadcastUnreliable = function() end,
+		isDev = function()
+			return false
+		end,
+		devInfo = function()
+			return { dev = false, reason = "none" }
+		end,
+		logs = function()
+			return {}
+		end,
+	}
+	for key, value in extras(calls) do
+		kernel[key] = value
+	end
+	local ok, stop = pcall(framework.startServer, kernel, { modules = {}, devtools = false })
+	task.wait(0.1)
+	globals.task = savedTask
+	return ok, stop, calls, table.clone(threadErrors), kernel
+end
+
+do
+	local closeHandler = nil
+	local ok, stop, calls, errors = lifecycle("report", function(calls)
+		return {
+			reportError = function(_, info)
+				table.insert(calls.reports, info)
+				return true
+			end,
+			onClose = function(_, fn)
+				closeHandler = fn
+			end,
+		}
+	end)
+	check("lifecycle: startServer runs with a 0.3.2 stub kernel", ok, stop)
+	local report = calls.reports[1]
+	check("lifecycle: a throwing onStart is reported to the kernel (kind onStart, module, traceback)", #calls.reports == 1 and report.kind == "onStart" and report.module == "BrokenService" and string.find(report.message, "index nil with 'price'", 1, true) ~= nil, report and report.message)
+	check("lifecycle: nothing is raised in the module's thread when the kernel took it", #errors == 0, errors[1])
+	check("lifecycle: the other modules start", calls.onStart == 1 and calls.fineStarted == 1)
+	check("lifecycle: onClose is registered and runs every module's onStop", typeof(closeHandler) == "function" and pcall(closeHandler) and calls.onStop == 1)
+	if ok then
+		pcall(stop)
+		check("lifecycle: the stop after a close doesn't run onStop twice", calls.onStop == 1)
+	end
+end
+
+do
+	local ok, stop, calls, errors = lifecycle("old-kernel", function()
+		return {}
+	end)
+	check("lifecycle: an older kernel (no reportError) gets the error raised as before", ok and #errors == 1 and string.find(errors[1], "BrokenService.onStart failed", 1, true) ~= nil and string.find(errors[1], "index nil with 'price'", 1, true) ~= nil, errors[1] or stop)
+	check("lifecycle: no onClose on older kernels, and nothing breaks", ok and calls.fineStarted == 1)
+end
+
+do
+	local ok, _, _, errors = lifecycle("refused", function()
+		return {
+			reportError = function()
+				return false -- the generation is stopping
+			end,
+		}
+	end)
+	check("lifecycle: a report the kernel refuses is raised in the module's thread", ok and #errors == 1, errors[1])
+end
+
 print(if failed == 0 then `test-generations: all {passed} checks passed` else `test-generations: {failed} of {passed + failed} checks failed`)
 process.exit(if failed == 0 then 0 else 1)
