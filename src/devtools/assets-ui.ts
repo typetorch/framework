@@ -41,7 +41,9 @@ export interface AssetsTabOptions {
 	 * the server realm. Without it, the tab polls on its own.
 	 */
 	feed?: {
-		watch: (trove: Trove, listener: (value: { ok: boolean; reply: unknown }) => void) => void;
+		// A method, not a function property: roblox-ts calls a property with `.`, which hands PollFeed.watch the trove as
+		// `self` ("attempt to index nil with nil" in feeds.ts).
+		watch(trove: Trove, listener: (value: { ok: boolean; reply: unknown }) => void): void;
 	};
 }
 
