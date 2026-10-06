@@ -11,7 +11,8 @@
  * quoter is passed in (HttpService.JSONEncode of a string in game).
  */
 
-import type { EventRow, RecordingRow, ResolvedSettings } from "./schema";
+import type { EventRow, IdentityRow, RecordingRow, ResolvedSettings } from "./schema";
+import type { IdentityTarget } from "./settings";
 
 type ColumnType = "int" | "string" | "bool";
 
@@ -53,6 +54,13 @@ export const RECORDING_COLUMNS: ReadonlyArray<[name: keyof RecordingRow, type: C
 	["n", "int"],
 ];
 
+/** Identity rows (never part of the events table). */
+export const IDENTITY_COLUMNS: ReadonlyArray<[name: keyof IdentityRow, type: ColumnType]> = [
+	["pid", "string"],
+	["uid", "int"],
+	["t", "int"],
+];
+
 export type Quote = (text: string) => string;
 
 function encodeValue(value: unknown, kind: ColumnType, quote: Quote): string {
@@ -89,8 +97,8 @@ export function estimateRecordingBytes(row: RecordingRow): number {
 }
 
 export interface SinkRequest {
-	/** "events" or "recordings" (basin), "both" (duckdb). */
-	table: "events" | "recordings" | "both";
+	/** "events" or "recordings" (basin), "both" (duckdb), "identities" (basin: the fleet API). */
+	table: "events" | "recordings" | "both" | "identities";
 	url: string;
 	body: string;
 	gzip: boolean;
@@ -98,6 +106,7 @@ export interface SinkRequest {
 	/** Rows in the request, per table. */
 	events: number;
 	recordings: number;
+	identities: number;
 }
 
 function headersFor(settings: ResolvedSettings): Record<string, string> {
@@ -115,22 +124,33 @@ export function buildRequests(
 	events: EventRow[],
 	recordings: RecordingRow[],
 	quote: Quote,
+	identities: IdentityRow[] = [],
+	target?: IdentityTarget,
 ): SinkRequest[] {
 	const requests = new Array<SinkRequest>();
 	const headers = headersFor(settings);
 	if (settings.backend === "duckdb") {
-		if (events.size() === 0 && recordings.size() === 0) return requests;
-		const body = `{"events":${encodeRows(events, EVENT_COLUMNS, quote)},"recordings":${encodeRows(recordings, RECORDING_COLUMNS, quote)}}`;
-		requests.push({ table: "both", url: settings.events, body, gzip: true, headers, events: events.size(), recordings: recordings.size() });
+		if (events.size() === 0 && recordings.size() === 0 && identities.size() === 0) return requests;
+		// Identities ride in the same body, in their own array (never mixed into events).
+		const who = identities.size() > 0 ? `,"identities":${encodeRows(identities, IDENTITY_COLUMNS, quote)}` : "";
+		const body = `{"events":${encodeRows(events, EVENT_COLUMNS, quote)},"recordings":${encodeRows(recordings, RECORDING_COLUMNS, quote)}${who}}`;
+		requests.push({ table: "both", url: settings.events, body, gzip: true, headers, events: events.size(), recordings: recordings.size(), identities: identities.size() });
 		return requests;
 	}
 	if (events.size() > 0) {
 		const body = encodeRows(events, EVENT_COLUMNS, quote);
-		requests.push({ table: "events", url: settings.events, body, gzip: false, headers, events: events.size(), recordings: 0 });
+		requests.push({ table: "events", url: settings.events, body, gzip: false, headers, events: events.size(), recordings: 0, identities: 0 });
 	}
 	if (recordings.size() > 0 && settings.recordings !== undefined) {
 		const body = encodeRows(recordings, RECORDING_COLUMNS, quote);
-		requests.push({ table: "recordings", url: settings.recordings, body, gzip: false, headers, events: 0, recordings: recordings.size() });
+		requests.push({ table: "recordings", url: settings.recordings, body, gzip: false, headers, events: 0, recordings: recordings.size(), identities: 0 });
+	}
+	// Basin rows can't be deleted, so identities go to the dev's fleet API instead (none without a target).
+	if (identities.size() > 0 && target !== undefined) {
+		const identityHeaders: Record<string, string> = { "Content-Type": "application/json" };
+		if (target.token !== undefined) identityHeaders.Authorization = `Bearer ${target.token}`;
+		const body = `{"identities":${encodeRows(identities, IDENTITY_COLUMNS, quote)}}`;
+		requests.push({ table: "identities", url: target.url, body, gzip: false, headers: identityHeaders, events: 0, recordings: 0, identities: identities.size() });
 	}
 	return requests;
 }

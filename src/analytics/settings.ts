@@ -107,12 +107,47 @@ export function parseSettings(raw: unknown, decode: (text: string) => unknown): 
 	const recordShare = clampNumber(entry.recordShare, 1, 0, 1, "recordShare", errors);
 	const techEvery = clampNumber(entry.techEvery, DEFAULT_TECH_EVERY, 15, 3600, "techEvery", errors);
 	const experiments = parseExperiments(entry.experiments, errors);
+	let identity: string | undefined;
+	if (entry.identity !== undefined) {
+		if (isUrl(entry.identity)) identity = entry.identity;
+		else errors.push("identity must be an http(s) URL");
+	}
+	let identityToken: string | undefined;
+	if (entry.identityToken !== undefined) {
+		// Never echo the value.
+		if (typeIs(entry.identityToken, "string") && entry.identityToken.size() > 0 && entry.identityToken.size() <= 4096) identityToken = entry.identityToken;
+		else errors.push("identityToken must be a non-empty string");
+	}
 
 	if ((backend !== "basin" && backend !== "duckdb") || !isUrl(entry.events)) return { errors };
 	return {
-		settings: { backend, events: entry.events, recordings, token, flushSeconds, recordShare, techEvery, experiments },
+		settings: { backend, events: entry.events, recordings, token, flushSeconds, recordShare, techEvery, experiments, identity, identityToken },
 		errors,
 	};
+}
+
+/** Where identity rows go on a Basin game: the fleet API (`TypeTorchFleet` = { url, token }) at /v1/identity. */
+export interface IdentityTarget {
+	url: string;
+	token?: string;
+}
+
+/**
+ * The identity target for these settings: duckdb none (identities ride in the batch body); basin the `identity` URL,
+ * else the fleet API's /v1/identity from the `TypeTorchFleet` value (a table or JSON `{ url, token }`), else none.
+ */
+export function identityTarget(settings: ResolvedSettings, fleetRaw: unknown, decode: (text: string) => unknown): IdentityTarget | undefined {
+	if (settings.backend === "duckdb") return undefined;
+	let fleet: Record<string, unknown> | undefined;
+	if (typeIs(fleetRaw, "string")) {
+		const [ok, decoded] = pcall(decode, fleetRaw);
+		if (ok && typeIs(decoded, "table")) fleet = decoded as Record<string, unknown>;
+	} else if (typeIs(fleetRaw, "table")) fleet = fleetRaw as Record<string, unknown>;
+	const fleetToken = fleet !== undefined && typeIs(fleet.token, "string") && fleet.token.size() > 0 ? fleet.token : undefined;
+	if (settings.identity !== undefined) return { url: settings.identity, token: settings.identityToken ?? fleetToken };
+	if (fleet === undefined || !isUrl(fleet.url)) return undefined;
+	const base = (fleet.url as string).gsub("/+$", "")[0];
+	return { url: `${base}/v1/identity`, token: settings.identityToken ?? fleetToken };
 }
 
 /** Whether recordings can be sent at all: duckdb always (one body), basin only with a recordings stream URL. */

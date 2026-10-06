@@ -30,6 +30,7 @@ import {
 } from "./protocol";
 import { backoffSeconds, classifyStatus, newQueueState, RowQueue, takeToken, type BucketState, type QueueState } from "./queue";
 import {
+	FLEET_SETTINGS_KEY,
 	RECORDING_CODEC,
 	SCHEMA_VERSION,
 	SETTINGS_KEY,
@@ -42,10 +43,11 @@ import {
 	type EventRow,
 	type ExperimentOverride,
 	type FleetStatus,
+	type IdentityRow,
 	type RecordingRow,
 	type ResolvedSettings,
 } from "./schema";
-import { parseSettings, recordsSupported, DEFAULT_TECH_EVERY, type ParsedSettings } from "./settings";
+import { identityTarget, parseSettings, recordsSupported, DEFAULT_TECH_EVERY, type ParsedSettings } from "./settings";
 import { buildRequests, estimateEventBytes, estimateRecordingBytes, type SinkRequest } from "./sinks";
 
 /**
@@ -75,6 +77,9 @@ const BATCH_BYTES = 900000;
 /** HTTP budget: a burst of 3, refilled at 10 a minute (Roblox: 500 a minute per server for everything). */
 const HTTP_BURST = 3;
 const HTTP_PER_MINUTE = 10;
+/** Identity rows (pid -> UserId) waiting; past this the oldest go. */
+const IDENTITIES_CAP = 500;
+const BATCH_IDENTITIES = 200;
 /** Rows kept per player while their pid loads. */
 const PENDING_MAX = 200;
 /** Client events: burst and refill per minute, and the most per session. */
@@ -146,6 +151,9 @@ interface ServerStore {
 	/** Rows of a request that was running when the last generation stopped (sent again: at least once). */
 	inflightEvents: EventRow[];
 	inflightRecordings: RecordingRow[];
+	/** Identity rows waiting to be sent, and those of a request running when the last generation stopped. */
+	identities?: IdentityRow[];
+	inflightIdentities?: IdentityRow[];
 	budget: BucketState;
 	failures: number;
 	sent: number;
@@ -232,6 +240,8 @@ function newStore(): ServerStore {
 		fleetSeen: [],
 		inflightEvents: [],
 		inflightRecordings: [],
+		identities: [],
+		inflightIdentities: [],
 		budget: { tokens: HTTP_BURST, last: os.clock() },
 		failures: 0,
 		sent: 0,
@@ -261,6 +271,8 @@ export class ServerAnalytics {
 	private settingsErrors = new Array<string>();
 	/** The first settings read finished (found or not), so experiment overrides are as known as they get. */
 	private settingsTried = false;
+	/** The `TypeTorchFleet` value (Basin games send identities to the fleet API). */
+	private fleetSettings?: unknown;
 	private nextFlushAt = 0;
 	private backoffUntil = 0;
 	private batchRows = BATCH_ROWS;
@@ -296,6 +308,11 @@ export class ServerAnalytics {
 		// A request that was running when the last generation stopped: send its rows again.
 		if (this.store.inflightEvents.size() > 0) this.requeueEvents(this.store.inflightEvents);
 		if (this.store.inflightRecordings.size() > 0) this.recordings.requeue(this.store.inflightRecordings);
+		// Stores from before identities existed (a hot swap from an older framework) have neither list.
+		if (this.store.identities === undefined) this.store.identities = [];
+		const handedOver = this.store.inflightIdentities ?? [];
+		if (handedOver.size() > 0) this.requeueIdentities(handedOver);
+		this.store.inflightIdentities = [];
 		this.store.inflightEvents = [];
 		this.store.inflightRecordings = [];
 
@@ -524,6 +541,8 @@ export class ServerAnalytics {
 		let snapshot: ConfigSnapshot | undefined;
 		const read = (force: boolean) => {
 			if (!snapshot || (missing && !force)) return;
+			const [fleetOk, fleetValue] = pcall(() => snapshot!.GetValue(FLEET_SETTINGS_KEY));
+			if (fleetOk) this.fleetSettings = fleetValue;
 			const [ok, value] = pcall(() => snapshot!.GetValue(SETTINGS_KEY));
 			if (!ok) return;
 			missing = value === undefined;
@@ -666,6 +685,7 @@ export class ServerAnalytics {
 		session.first = first;
 		session.ret = ret;
 		session.ready = true;
+		if (this.options.identity !== false) this.queueIdentity(player.UserId, pid);
 		for (const row of session.pending) {
 			row.pid = session.pid;
 			row.newp = session.newp;
@@ -1209,7 +1229,12 @@ export class ServerAnalytics {
 			for (const row of this.events.take(this.batchRows - events.size(), BATCH_BYTES / 2, estimateEventBytes)) events.push(row);
 		}
 		const recordings = recordsSupported(settings) ? this.recordings.take(BATCH_RECORDINGS, BATCH_BYTES, estimateRecordingBytes) : [];
-		if (events.size() === 0 && recordings.size() === 0) {
+		const waiting = this.store.identities ?? [];
+		const identities = waiting.size() > 0 ? this.takeIdentities() : [];
+		// Basin without a fleet API to send them to: identities are dropped (they never go into Basin).
+		const target = settings.backend === "basin" && identities.size() > 0 ? identityTarget(settings, this.fleetSettings, decode) : undefined;
+		const sendIdentities = settings.backend === "duckdb" || target !== undefined ? identities : [];
+		if (events.size() === 0 && recordings.size() === 0 && sendIdentities.size() === 0) {
 			this.flushing = false;
 			return;
 		}
@@ -1217,7 +1242,8 @@ export class ServerAnalytics {
 		// to the next generation (sent again: at least once).
 		this.store.inflightEvents = events;
 		this.store.inflightRecordings = recordings;
-		const requests = buildRequests(settings, events, recordings, quote);
+		this.store.inflightIdentities = sendIdentities;
+		const requests = buildRequests(settings, events, recordings, quote, sendIdentities, target);
 		const settle = (request: SinkRequest, giveBack: boolean) => {
 			if (request.events > 0) {
 				if (giveBack) this.requeueEvents(events);
@@ -1226,6 +1252,10 @@ export class ServerAnalytics {
 			if (request.recordings > 0) {
 				if (giveBack) this.recordings.requeue(recordings);
 				this.store.inflightRecordings = [];
+			}
+			if (request.identities > 0) {
+				if (giveBack) this.requeueIdentities(sendIdentities);
+				this.store.inflightIdentities = [];
 			}
 		};
 		let failed = false;
@@ -1236,9 +1266,10 @@ export class ServerAnalytics {
 			}
 			const status = this.post(request);
 			const outcome = classifyStatus(status);
-			const rows = request.events + request.recordings;
+			const rows = request.events + request.recordings + request.identities;
 			if (outcome === "sent") {
-				this.store.sent += rows;
+				// Identity rows aren't analytics rows: "sent" counts events and recordings.
+				this.store.sent += request.events + request.recordings;
 				this.store.failures = 0;
 				this.batchRows = BATCH_ROWS;
 				settle(request, false);
@@ -1269,7 +1300,37 @@ export class ServerAnalytics {
 		// Recordings without a request (basin without a recordings URL) were never taken; nothing else is left.
 		this.store.inflightEvents = [];
 		this.store.inflightRecordings = [];
+		this.store.inflightIdentities = [];
 		this.flushing = false;
+	}
+
+	// Identities (pid -> UserId for the dev's own server) ----------------------------------------------------------------
+
+	private identityList(): IdentityRow[] {
+		if (this.store.identities === undefined) this.store.identities = [];
+		return this.store.identities;
+	}
+
+	private queueIdentity(userId: number, pid: string) {
+		const list = this.identityList();
+		list.push({ pid, uid: userId, t: nowMs() });
+		while (list.size() > IDENTITIES_CAP) list.remove(0);
+	}
+
+	private takeIdentities(): IdentityRow[] {
+		const list = this.identityList();
+		const taken = new Array<IdentityRow>();
+		while (list.size() > 0 && taken.size() < BATCH_IDENTITIES) taken.push(list.remove(0)!);
+		return taken;
+	}
+
+	/** Puts identity rows back in front (a failed or unsent request), keeping the cap. */
+	private requeueIdentities(rows: IdentityRow[]) {
+		const list = this.identityList();
+		const merged = [...rows];
+		for (const row of list) merged.push(row);
+		while (merged.size() > IDENTITIES_CAP) merged.remove(0);
+		this.store.identities = merged;
 	}
 
 	private startFlushing() {
@@ -1358,6 +1419,7 @@ export class ServerAnalytics {
 			queued: this.events.size(),
 			queuedRecordings: this.recordings.size(),
 			queuedFleet: this.fleet.size(),
+			queuedIdentities: this.store.identities?.size() ?? 0,
 			sent: this.store.sent,
 			dropped: this.store.events.dropped + this.store.recordings.dropped + this.store.fleet.dropped,
 			rejected: this.store.rejected,

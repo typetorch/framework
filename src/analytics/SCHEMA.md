@@ -150,6 +150,8 @@ ConfigService key `TypeTorchAnalytics` (server-only), a JSON object (or a JSON s
 | `recordShare` | 1 | 0..1, share of new players recorded (stable per pid) |
 | `techEvery` | 60 | 15..3600 seconds between tech samples |
 | `experiments` | none | Per experiment: `active: false` (everyone gets the first variant, not stamped), `weights` (per variant, in the game's order), `variant` (force one) |
+| `identity` | `TypeTorchFleet` url + `/v1/identity` | basin: where identity rows go (below); none and no readable `TypeTorchFleet`: not sent. duckdb: unused |
+| `identityToken` | the `TypeTorchFleet` token | basin: the token for `identity`. Never logged |
 
 Unknown fields are ignored. Settings errors are warned once (never with the token).
 
@@ -158,7 +160,13 @@ Unknown fields are ignored. Settings errors are warned once (never with the toke
 - **basin:** `POST <events>` with a JSON array of event rows and `POST <recordings>` with a JSON array of recording
   rows. `Content-Type: application/json`, `Authorization: Bearer <token>` when set, no compression.
 - **duckdb:** `POST <events>` with `{"events":[...],"recordings":[...]}`, gzip (`Content-Encoding: gzip`, HttpService
-  `Compress`), `Content-Type: application/json`, `Authorization: Bearer <token>`.
+  `Compress`), `Content-Type: application/json`, `Authorization: Bearer <token>`. With identity rows waiting, the body
+  also has `"identities":[...]`.
+- **Identities** (engine option `identity`, default on): once a player's pid is known, one row `{ "pid", "uid", "t" }`
+  (the UserId as a number, unix ms; nothing else about the player) per session, so the dev's own server can map pids
+  and UserIds (support, Right to Erasure) and delete the link. Never part of the events table. duckdb: in the batch
+  body; basin: `POST <identity>` with `{"identities":[...]}` and `Authorization: Bearer <identityToken>` (Basin rows
+  can't be deleted, so they never go to Basin). At most 200 per request; 500 wait at most.
 - **Batches:** every `flushSeconds`, or at 500 queued events or 20 recordings. At most 500 event rows (fleet rows
   first) and 50 recording rows per request, about 900 KB each. At most ~10 requests a minute per server (burst 3).
 - **Answers:** 2xx sent; 413 the batch is halved and resent (a single row is dropped); 401/403/404 rows are kept and
@@ -174,7 +182,8 @@ Unknown fields are ignored. Settings errors are warned once (never with the toke
 
 DataStore `TypeTorchAnalytics`, key `p/<UserId>` -> `{ "pid": "<32 hex>", "first": <unix s>, "last": <unix s> }`.
 One read per join (with retries), a write on the first join (UpdateAsync, keeps a pid another server wrote first) and
-one at leave (`last`). A Right to Erasure request deletes the key, which leaves the player's rows anonymous.
+one at leave (`last`). A Right to Erasure request deletes the key, which leaves the player's rows anonymous. The
+analytics server also keeps pid -> UserId from identity rows (above), which its erasure webhook uses and deletes.
 
 ## Suggested Basin stream schemas
 

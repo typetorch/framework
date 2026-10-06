@@ -519,7 +519,23 @@ check("bearer token", request.Headers.Authorization == "Bearer TKN-secret" and r
 local body = serde.decode("json", request.Body)
 check("body: fleet rows first", body.events[1].kind == "fleet")
 check("body: events and recordings", #body.events == queuedBefore + 3 and #body.recordings == 2, #body.events)
+-- One identity row per session with a known pid (pid -> UserId), in its own array, never among the events.
+local identityOk = body.identities ~= nil and #body.identities >= 1
+for _, who in body.identities or {} do
+	if typeof(who.uid) ~= "number" or who.uid <= 0 or typeof(who.pid) ~= "string" or #who.pid < 8 then
+		identityOk = false
+	end
+end
+check("body: identities", identityOk, body.identities and #body.identities)
+local identityInEvents = false
+for _, event in body.events do
+	if event.uid ~= nil then
+		identityInEvents = true
+	end
+end
+check("identities never in events", not identityInEvents)
 check("503: rows back in the queue", #store().events.rows == queuedBefore and #store().fleet.rows == 3 and #store().recordings.rows == 2)
+check("503: identities back too", #store().identities == #body.identities and #store().inflightIdentities == 0)
 check("503: failure counted", store().failures == 1 and #store().inflightEvents == 0)
 local tokenLeaked = false
 for _, line in warnings do
@@ -533,7 +549,7 @@ respond = function()
 end
 task.wait(7.5) -- backoff 3.75-6.25 s
 check("retry sent", #requests == 2, #requests)
-check("queue empty after 200", #store().events.rows == 0 and #store().fleet.rows == 0 and #store().recordings.rows == 0)
+check("queue empty after 200", #store().events.rows == 0 and #store().fleet.rows == 0 and #store().recordings.rows == 0 and #store().identities == 0)
 check("sent counted", store().sent == queuedBefore + 3 + 2 and store().failures == 0, store().sent)
 check("no token in rows", not string.find(requests[2].Body, "TKN", 1, true))
 

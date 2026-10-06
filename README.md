@@ -302,8 +302,9 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   country, friends in the server, first-ever vs returning, days since the last visit), `tech` (FPS, ping, memory, load
   time, client and server errors, swaps and rollbacks, leaves within 60 s of a swap), `zones` (parts or models tagged
   `TTZone`, named by a `Name` attribute or the instance name), `screens` (ScreenGuis in PlayerGui, GuiObjects tagged
-  `TTScreen`), `recording` (the first-ever session in detail), `fleet` (kernel 0.3.2 heartbeats and deploy reports).
-  `settings` (server only) replaces the ConfigService key, for tests.
+  `TTScreen`), `recording` (the first-ever session in detail), `fleet` (kernel 0.3.2 heartbeats and deploy reports),
+  `identity` (one `{ pid, uid }` row per session to the dev's own server, below). `settings` (server only) replaces the
+  ConfigService key, for tests.
 - **Every row** carries the time (server clock), a random player id (never the UserId), the session, the server
   (JobId, type, place), the artifact (id, seq, branch, channel), the device, new vs returning, the player's state
   (`zone:Lobby|screen:Shop|activity:round`) and experiment variants. The exact rows: `src/analytics/SCHEMA.md`.
@@ -315,7 +316,12 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   about 10 times a second, every input (never while a TextBox or the chat has focus; text boxes only say which box was
   used), buttons pressed and hovered, screens, prompts and deaths, from the join until 60 s after the first input.
   Packed into small binary chunks (10-20 KB a player) and sent through the server.
-- **Never collected:** chat or anything typed, usernames and display names (error texts have them replaced), UserIds.
+- **Never collected:** chat or anything typed, usernames and display names (error texts have them replaced). No event
+  row carries a UserId.
+- **Identities** (option `identity`, default on): once the pid is known, one row `{ pid, uid, t }` (the UserId, nothing
+  else) per session goes to the dev's own server only, never into the events: duckdb games in the batch body, Basin
+  games to the fleet API (`TypeTorchFleet` url + `/v1/identity`, or the `identity` / `identityToken` settings). The
+  analytics server keeps pid -> UserId in a deletable table (support lookups, Right to Erasure).
 - **Player ids:** DataStore `TypeTorchAnalytics`, key `p/<UserId>` -> `{ pid, first, last }`: one read per join, a
   write on the first join and at leave. Deleting the key (Right to Erasure) leaves that player's rows anonymous.
 - **Sending:** one queue on the server (10,000 events; over that the oldest are dropped and counted), a flush every

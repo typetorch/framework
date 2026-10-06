@@ -8,6 +8,8 @@
 export const SCHEMA_VERSION = 1;
 /** The ConfigService key (server-only) that holds the sink settings. */
 export const SETTINGS_KEY = "TypeTorchAnalytics";
+/** The kernel's fleet API settings `{ url, token }` (server-only ConfigService key); identities can go there. */
+export const FLEET_SETTINGS_KEY = "TypeTorchFleet";
 /** The first-session recording codec (column `codec`). */
 export const RECORDING_CODEC = "tt-rec-1";
 /** Most bytes of the `props` JSON text. Larger props become `{"_trunc":<bytes>}`. */
@@ -85,6 +87,19 @@ export interface RecordingRow {
 	n: number;
 }
 
+/**
+ * Which UserId a pid belongs to, sent once per session when the pid is known. Only to the dev's own server (the
+ * analytics server, or the fleet API for Basin games), never into the events table: it lets the dev map pids and
+ * UserIds (support, Right to Erasure) and delete the link.
+ */
+export interface IdentityRow {
+	pid: string;
+	/** The player's UserId. */
+	uid: number;
+	/** Unix ms. */
+	t: number;
+}
+
 /** Live overrides of one per-player experiment (settings key `experiments`). */
 export interface ExperimentOverride {
 	/** false: everyone gets the first variant (control) and the experiment isn't stamped on events. */
@@ -112,6 +127,14 @@ export interface AnalyticsSettings {
 	techEvery?: number;
 	/** Live experiment overrides by experiment name. */
 	experiments?: Record<string, ExperimentOverride>;
+	/**
+	 * basin: where identity rows go (the fleet API's `POST /v1/identity` URL). Default: the `TypeTorchFleet` key's url
+	 * + /v1/identity when the server can read it; without either, identities aren't sent. duckdb: unused (they go in
+	 * the batch body).
+	 */
+	identity?: string;
+	/** basin: the token for `identity` (default: the `TypeTorchFleet` token). Never logged. */
+	identityToken?: string;
 }
 
 /** AnalyticsSettings with every default filled in. */
@@ -124,6 +147,8 @@ export interface ResolvedSettings {
 	recordShare: number;
 	techEvery: number;
 	experiments: Map<string, ExperimentOverride>;
+	identity?: string;
+	identityToken?: string;
 }
 
 export type AnalyticsValue = string | number | boolean;
@@ -160,6 +185,12 @@ export interface AnalyticsOptions {
 	 * one row per deploy report, kind "fleet". They go before analytics events. Default true.
 	 */
 	fleet?: boolean;
+	/**
+	 * Server: one identity row `{ pid, uid, t }` per session once the pid is known (UserId and pid, nothing else), so
+	 * the dev's own server can map them. duckdb: in the batch body (`identities`); basin: to the fleet API (Basin rows
+	 * can't be deleted). Never part of the events table. Default true.
+	 */
+	identity?: boolean;
 }
 
 /** Kernel 0.3.2+ `fleetStatus()`: the server's heartbeat (sent as the props of a "fleet" / "heartbeat" row). */
@@ -178,6 +209,8 @@ export interface AnalyticsStats {
 	queuedRecordings: number;
 	/** Fleet rows waiting (they go first). */
 	queuedFleet: number;
+	/** Identity rows waiting (pid -> UserId, for the dev's own server). */
+	queuedIdentities: number;
 	/** Rows sent since the server started (across swaps). */
 	sent: number;
 	/** Rows dropped because the queue was full. */
