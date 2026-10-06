@@ -13,7 +13,8 @@ type Disconnect = () => void;
 /** Server view of a client → server leaf. Register `on` for events or `handle` for requests (one handler each). */
 export interface ServerReceiver<A extends unknown[], R> {
 	on(handler: (player: Player, ...args: A) => void): Disconnect;
-	handle(handler: (player: Player, ...args: A) => R): Disconnect;
+	/** The request's one handler. It may return a Promise: the answer waits for it (a rejection answers an error). */
+	handle(handler: (player: Player, ...args: A) => R | Promise<R>): Disconnect;
 	/**
 	 * Runs this generation's `on` handlers now, as if `player` had sent it: no network, no limits, no guard. For tests
 	 * and server-side reuse of a handler.

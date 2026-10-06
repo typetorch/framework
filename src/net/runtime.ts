@@ -306,7 +306,9 @@ export class ServerDispatcher {
 			this.reply(player, path, requestId, false, "Not available.");
 			return;
 		}
-		const [ok, result] = pcall(handler, player, ...callArgs);
+		let [ok, result] = pcall(handler, player, ...callArgs);
+		// A handler may answer with a Promise: the reply waits for it (this message's own thread, spawned by the kernel).
+		if (ok && Promise.is(result)) [ok, result] = result.await();
 		if (!ok) {
 			stats.errors += 1;
 			if (record) PacketTap.outcome(record, "error", result);

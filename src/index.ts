@@ -30,6 +30,16 @@ export { TypeTorch } from "./typetorch";
 export type { BranchChange, TypeTorchApi, TypeTorchFeatures } from "./typetorch";
 export { observePlayers } from "./players";
 export { createNetwork, setNetworkLimits } from "./net";
+// @flamework/networking names on the same network, for migrating Flamework games (guides/from-flamework.md).
+export { createFlameworkCompat } from "./net/compat";
+export type {
+	FlameworkClientEvents,
+	FlameworkClientFunctions,
+	FlameworkCompat,
+	FlameworkCompatConfig,
+	FlameworkServerEvents,
+	FlameworkServerFunctions,
+} from "./net/compat";
 export type {
 	ClientNetwork,
 	ClientReceiver,

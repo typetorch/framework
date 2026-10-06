@@ -121,7 +121,10 @@ function place<T extends object>(root: Record<string, unknown>, path: string, cr
  * included); the server checks client -> server guards on every message, after rate and shape limits. Messages travel
  * over the kernel's stable remotes, so a generation swap never breaks the network.
  *
- * @metadata macro
+ * `network` (in the tag below): the transformer names the leaf in guard errors and warns about generic leaves and
+ * parameters that never arrive (functions, threads, AnimationTracks); older transformers ignore it.
+ *
+ * @metadata macro network
  */
 export function createNetwork<ClientToServer extends object, ServerToClient extends object>(
 	clientToServer?: Modding.Many<GuardTree<ClientToServer>>,
