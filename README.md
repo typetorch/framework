@@ -328,6 +328,13 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   `flushSeconds` (15) or at 500 rows, at most ~10 HttpService requests a minute, retries with backoff, and a last
   flush on shutdown (kernel 0.3.2). Delivery is at least once (a swap mid-request sends that batch again).
   `analytics.stats()` (server) has the counters; `flush()` sends soon.
+- **The cloud test sends nothing.** `typetorch test --cloud` boots the payload headless in a Luau Execution task where
+  HttpService works; there the engine (stub kernel `test = true`, or `workspace:GetAttribute("TypeTorchTest")`) collects
+  as usual but never uploads: no event rows, no identity rows, no HTTP request, so a prod deploy never puts a fake
+  server session into your analytics.
+- **Bounds on what a client can cause:** at most 32 experiments per session (each is stamped on every later row), and
+  a client's `exp` messages count against its event budget (120 a minute, 5,000 a session). Revenue queries on the
+  analytics server count `purchase` rows the server sent, never client-sent ones.
 
 **Settings** (server only, never sent to clients): the ConfigService key `TypeTorchAnalytics`, written with
 `writeSettings()` from `@typetorch/analytics` (Open Cloud, universe:write) or in Creator Hub (Configs); no CLI command

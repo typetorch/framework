@@ -223,6 +223,10 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 		assert(isAssetId(payload), "bad asset id");
 		const cached = notesCache.get(payload);
 		if (cached) return cached;
+		// Only known artifacts (security audit 2026-10-06): the op loads the asset into this server to read its notes, so
+		// it must not be a way to LoadAsset any asset id a dev names.
+		if (!kernelHasArtifacts(kernel)) error(NEEDS_KERNEL_02, 0);
+		if (!kernel.artifacts!().some((entry) => entry.assetId === payload)) error("unknown artifact", 0);
 		let notes = notesFromPayload(payload);
 		if (!notes) {
 			const [ok, info] = pcall(() => MarketplaceService.GetProductInfo(payload, Enum.InfoType.Asset));

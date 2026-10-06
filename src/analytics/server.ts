@@ -86,6 +86,12 @@ const PENDING_MAX = 200;
 const CLIENT_BURST = 120;
 const CLIENT_PER_MINUTE = 120;
 const CLIENT_SESSION_MAX = 5000;
+/**
+ * Distinct experiments one session may hold. Each one is re-encoded into `exp` and stamped on every later row, and a
+ * client can name experiments ("exp" messages), so without a cap one player could grow `exp` past the ingest limit
+ * (1 KB) and have every row of theirs dropped, or spend the server's time re-encoding it.
+ */
+const EXPERIMENTS_MAX = 32;
 /** A recording: at most this many bytes, chunks and seconds after the join. */
 const RECORDING_MAX_BYTES = 262144;
 const RECORDING_MAX_CHUNKS = 80;
@@ -207,6 +213,13 @@ function ageBucket(days: number): string {
 	return "3y+";
 }
 
+/** Whether this generation runs inside `typetorch test --cloud` (cli/src/cloudtest.ts: stub kernel `test = true`, attribute). */
+function isCloudTest(kernel: ServerKernel | undefined): boolean {
+	if ((kernel as unknown as { test?: unknown } | undefined)?.test === true) return true;
+	const [ok, flag] = pcall(() => Workspace.GetAttribute("TypeTorchTest"));
+	return ok && flag === true;
+}
+
 function newSession(): PlayerSession {
 	return {
 		pid: "",
@@ -282,6 +295,12 @@ export class ServerAnalytics {
 	private readonly identity: { job: string; srv: string; place: number; art: string; seq: number; branch: string; channel: string };
 	private sexp = "";
 	private stopped = false;
+	/**
+	 * `typetorch test --cloud`: the payload boots headless in a Luau Execution task, where HttpService works. The engine
+	 * then collects as usual but sends nothing (no rows, no identity rows, no HTTP), or every prod deploy would put a
+	 * fake server session into the owner's analytics. Set by the stub kernel's `test` or the TypeTorchTest attribute.
+	 */
+	private readonly testMode: boolean;
 
 	constructor(
 		private readonly options: AnalyticsOptions,
@@ -289,6 +308,7 @@ export class ServerAnalytics {
 		private readonly trove: Trove,
 	) {
 		this.kernel = scope.server;
+		this.testMode = isCloudTest(scope.server);
 		this.store = TypeTorch.persist(PERSIST_KEY, newStore);
 		this.events = new RowQueue(this.store.events, EVENTS_CAP_UNCONFIGURED);
 		this.recordings = new RowQueue(this.store.recordings, RECORDINGS_CAP);
@@ -319,6 +339,7 @@ export class ServerAnalytics {
 		trove.add(() => {
 			this.stopped = true;
 		});
+		if (this.testMode) print("[analytics] cloud test: rows are collected but nothing is sent (no uploads, no identity rows)");
 		this.startSettings();
 		this.startIntake();
 		this.startSessions();
@@ -491,6 +512,10 @@ export class ServerAnalytics {
 		const deadline = os.clock() + 10;
 		while ((!session.ready || !this.settingsTried) && os.clock() < deadline && !this.stopped) task.wait(0.1);
 		if (!session.ready) return control;
+		if (!session.exp.has(name) && session.exp.size() >= EXPERIMENTS_MAX) {
+			this.warn(`experiment("${name}") not assigned: a session holds at most ${EXPERIMENTS_MAX} experiments`);
+			return control;
+		}
 		const assignment = assignVariant(session.pid, name, variants, this.settings?.experiments.get(name));
 		const current = session.exp.get(name);
 		if (assignment.active && current !== assignment.variant) {
@@ -905,26 +930,32 @@ export class ServerAnalytics {
 		else this.helloWaiting.add(player);
 	}
 
-	private onEvents(player: Player, session: PlayerSession, batch: unknown) {
-		if (!typeIs(batch, "table")) return;
-		const list = batch as unknown[];
-		if (list.size() > CLIENT_BATCH_MAX) return;
+	/** One client-sent event (or an "exp" message, which may add a row): within the player's budget and the session cap. */
+	private takeClientEvent(player: Player, session: PlayerSession): boolean {
+		if (session.clientEvents >= CLIENT_SESSION_MAX) return false;
 		let budget = this.clientBudgets.get(player);
 		if (!budget) {
 			budget = { tokens: CLIENT_BURST, last: os.clock() };
 			this.clientBudgets.set(player, budget);
 		}
+		if (!takeToken(budget, os.clock(), CLIENT_BURST, CLIENT_PER_MINUTE)) return false;
+		session.clientEvents += 1;
+		return true;
+	}
+
+	private onEvents(player: Player, session: PlayerSession, batch: unknown) {
+		if (!typeIs(batch, "table")) return;
+		const list = batch as unknown[];
+		if (list.size() > CLIENT_BATCH_MAX) return;
 		const now = nowMs();
 		const halfPing = math.floor(math.clamp(player.GetNetworkPing(), 0, 2) * 500);
 		for (const raw of list) {
-			if (session.clientEvents >= CLIENT_SESSION_MAX) return;
-			if (!takeToken(budget, os.clock(), CLIENT_BURST, CLIENT_PER_MINUTE)) return;
 			const event = cleanClientEvent(raw);
 			if (!event) continue;
 			const [age, kind, name, props] = event;
 			const [ok, decoded] = pcall(decode, props);
 			if (!ok || !typeIs(decoded, "table")) continue;
-			session.clientEvents += 1;
+			if (!this.takeClientEvent(player, session)) return;
 			const t = now - age - halfPing;
 			if (kind === "state") {
 				const to = (decoded as { to?: unknown }).to;
@@ -999,8 +1030,11 @@ export class ServerAnalytics {
 				else if (op === "ev") this.onEvents(player, session, args[0]);
 				else if (op === "exp") {
 					const [name, variants] = args;
+					// A client names an experiment: within its event budget (it may add an "experiment" row and grows `exp`).
 					// experiment() may wait for the pid: not on the kernel's message thread.
-					if (isExperimentName(name) && isVariantList(variants)) task.spawn(() => this.experiment(player, name, variants));
+					if (isExperimentName(name) && isVariantList(variants) && this.takeClientEvent(player, session)) {
+						task.spawn(() => this.experiment(player, name, variants));
+					}
 				} else if (op === "rec") {
 					if (this.options.recording !== false) this.onChunk(player, session, args);
 				}
@@ -1218,6 +1252,14 @@ export class ServerAnalytics {
 
 	/** Sends one batch per table. `final`: shutdown, ignore the budget. */
 	private flushOnce(final: boolean) {
+		if (this.testMode) {
+			// The cloud test: drop what was collected instead of sending it (the task's rows are not real play).
+			this.store.events.rows.clear();
+			this.store.fleet.rows.clear();
+			this.store.recordings.rows.clear();
+			this.store.identities = [];
+			return;
+		}
 		const settings = this.settings;
 		if (!settings || this.flushing) return;
 		this.flushing = true;
@@ -1362,7 +1404,7 @@ export class ServerAnalytics {
 
 	/** Server shutdown: everyone leaves, the records get their `last`, and the queue is sent (about 15 s at most). */
 	close() {
-		if (this.closing || this.stopped) return;
+		if (this.closing || this.stopped || this.testMode) return;
 		this.closing = true;
 		for (const player of Players.GetPlayers()) this.leave(player, "shutdown");
 		const deadline = os.clock() + 14;
