@@ -706,7 +706,7 @@ do
 		end
 		return list
 	end
-	local base = { kernelApi = 1, kernelVersion = "0.3.7", serverType = "public", generation = { name = "x#1" }, history = {}, memoryMb = 1 }
+	local base = { kernelApi = 1, kernelVersion = "0.3.8", serverType = "public", generation = { name = "x#1" }, history = {}, memoryMb = 1 }
 	local function with(fields)
 		local status = table.clone(base)
 		for key, value in fields do
@@ -714,7 +714,7 @@ do
 		end
 		return status
 	end
-	check("health: LATEST_KERNEL is 0.3.7", health.LATEST_KERNEL == "0.3.7")
+	check("health: LATEST_KERNEL is 0.3.8", health.LATEST_KERNEL == "0.3.8")
 	local old = titles(with({ kernelVersion = "0.3.1" }))
 	check("health: a 0.3.1 server: Kernel update (warn) and No deploy reports (info)", old["Kernel update"] == "warn" and old["No deploy reports"] == "info")
 	local studio = titles(with({ kernelVersion = "0.3.1", serverType = "studio" }))
@@ -724,12 +724,12 @@ do
 	local missing = titles(with({ reports = { total = 0, kept = 0, listeners = 0 }, fleet = { enabled = false, missing = true } }))
 	check("health: the kernel's Fleet module not mapped: warn", missing["No fleet API"] == "warn")
 	local invalid = titles(with({ reports = { total = 0, kept = 0, listeners = 0 }, fleet = { enabled = false, settings = "invalid", settingsError = "url must be https://host[/path]" } }))
-	check("health: invalid TypeTorchFleet: warn", invalid["Fleet settings"] == "warn")
+	check("health: invalid settings.fleet: warn", invalid["Fleet settings"] == "warn")
 	local failing = titles(with({ reports = { total = 0, kept = 0, listeners = 0 }, fleet = { enabled = true, settings = "ok", lastOkAt = 5, lastErrorAt = 10, lastError = "HTTP 503" } }))
 	local recovered = titles(with({ reports = { total = 0, kept = 0, listeners = 0 }, fleet = { enabled = true, settings = "ok", lastOkAt = 12, lastErrorAt = 10, lastError = "HTTP 503" } }))
 	check("health: the fleet API failing (and not after it recovered): warn", failing["Fleet API failing"] == "warn" and recovered["Fleet API failing"] == nil)
 	local absent = titles(with({ reports = { total = 0, kept = 0, listeners = 0 }, fleet = { enabled = false, settings = "absent" } }))
-	check("health: no TypeTorchFleet setting: no line", next(absent) == nil, next(absent))
+	check("health: no settings.fleet: no line", next(absent) == nil, next(absent))
 	local rolled = titles(with({ reports = { total = 1, kept = 1, listeners = 1 }, health = { state = "degraded", errors = 0, lastRollback = { from = "g-1", why = "3 errors", at = os.time() } } }))
 	check("health: a recent health-window rollback: error", rolled["Failed health check"] == "error")
 	local degraded = titles(with({ reports = { total = 1, kept = 1, listeners = 1 }, health = { state = "degraded", errors = 4, lastError = "boom" } }))
@@ -768,6 +768,28 @@ do
 		health.healthLimitsText({ state = "ok", errors = 0, limit = 5, window = 60, rollback = true }) == "5 errors / 60 s"
 			and health.healthLimitsText({ state = "ok", errors = 0, limit = 3, window = 30, rollback = false }) == "3 errors / 30 s, no rollback"
 			and health.healthLimitsText({ state = "ok", errors = 0 }) == "3 errors / 30 s"
+	)
+	-- Kernel 0.3.8: the signed settings record and game messaging feed the Attention list.
+	local noRecord = titles(with({ reports = reports, settings = { state = "missing", fields = {}, reads = 1 } }))
+	local refusedRecord = titles(with({ reports = reports, settings = { state = "unsigned", fields = {}, reads = 1, error = "no signature" } }))
+	local goodRecord = titles(with({ reports = reports, settings = { state = "ok", seq = 3, age = 10, verifiedBy = "sig", fields = { "fleet" }, reads = 2 } }))
+	check("health: no settings record: warn; a refused one: error; a good one: no line", noRecord["No settings"] == "warn" and refusedRecord["Settings refused"] == "error" and next(goodRecord) == nil, next(goodRecord))
+	local quietTopic = { topic = "TypeTorch/game", state = "on", topics = 1, listeners = 1, received = 3, delivered = 3, ignored = 0, filtered = 0, replayed = 0, held = 0, published = 3, failed = 0, dropped = 0, throttled = 0, queued = 0, rate = 3, softLimit = 60 }
+	local function topicWith(fields)
+		local copy = table.clone(quietTopic)
+		for key, value in fields do
+			copy[key] = value
+		end
+		return copy
+	end
+	local quiet = titles(with({ reports = reports, messaging = quietTopic }))
+	local busy = titles(with({ reports = reports, messaging = topicWith({ rate = 61, queued = 4 }) }))
+	local dropped = titles(with({ reports = reports, messaging = topicWith({ dropped = 2, lastError = "waited over 30 s" }) }))
+	local offline = titles(with({ reports = reports, messaging = topicWith({ state = "subscribing", lastError = "SubscribeAsync failed" }) }))
+	check(
+		"health: messaging quiet: no line; busy, dropped, offline: warn",
+		next(quiet) == nil and busy["Messaging busy"] == "warn" and dropped["Messages dropped 2"] == "warn" and offline["Messaging offline"] == "warn",
+		next(quiet)
 	)
 	check("admin: kernel 0.3.2 fleetStatus is feature-detected", admin.kernelHasFleetStatus({ fleetStatus = function() end }) == true and admin.kernelHasFleetStatus({}) == false)
 	-- Kernel 0.3.4: a switched server is an ordinary server: no Attention line, no "Back" action.
