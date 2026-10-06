@@ -2,7 +2,7 @@ import { Players } from "@rbxts/services";
 import { $warn } from "rbxts-transform-debug";
 import type { ClientKernel, ServerKernel } from "../kernel";
 import { PacketRecord, PacketTap } from "./inspect";
-import { DEFAULT_LIMITS, RateLimiter, withinShape } from "./limits";
+import { boundedTimeout, DEFAULT_LIMITS, RateLimiter, withinShape } from "./limits";
 import type { LeafLimits } from "./types";
 
 /**
@@ -17,11 +17,10 @@ import type { LeafLimits } from "./types";
  * queues reliable sends to a player until that player's client generation says hello (at most QUEUE_MAX messages, at
  * most HELLO_TIMEOUT seconds; unreliable ones are dropped meanwhile). After a swap, or for a player who just joined,
  * nothing the new server generation sends early is lost. On the client, a resync from the kernel (0.3.2: the server
- * dropped one of this generation's messages) fails every pending request at once instead of after REQUEST_TIMEOUT.
+ * dropped one of this generation's messages) fails every pending request at once instead of after its timeout.
  */
 export const RESPONSE = "__tt/res";
 export const HELLO = "__tt/hello";
-const REQUEST_TIMEOUT = 15;
 const KICK_AFTER = 300;
 const KICK_WINDOW = 10;
 /** Reliable messages kept per player until their client says hello. */
@@ -44,6 +43,25 @@ type Listener = (...args: unknown[]) => void;
 export const registeredGuards = new Map<string, Guard>();
 /** Per-leaf limit overrides (network.limits()). */
 export const registeredLimits = new Map<string, LeafLimits>();
+
+/** "path:value" pairs already warned about, so a bad timeout called in a loop warns once. */
+const timeoutWarnings = new Set<string>();
+
+/**
+ * Seconds a request on `path` waits for its answer: `seconds` (invokeWithTimeout), else the leaf's `timeout`
+ * (setNetworkLimits), else 15; always within 0.5 to 120 (clamped with one warning per value).
+ */
+export function requestTimeout(path: string, seconds?: number): number {
+	const wanted = seconds ?? registeredLimits.get(path)?.timeout;
+	if (wanted === undefined) return DEFAULT_LIMITS.timeout;
+	const [bounded, changed] = boundedTimeout(wanted);
+	const warning = `${path}:${tostring(wanted)}`;
+	if (changed && !timeoutWarnings.has(warning)) {
+		timeoutWarnings.add(warning);
+		$warn(`[net] ${path}: a timeout of ${tostring(wanted)} s is outside 0.5 to 120 s (seconds, not ms); using ${bounded} s`);
+	}
+	return bounded;
+}
 
 export interface LeafStats {
 	inbound: number;
@@ -127,6 +145,19 @@ export class ServerDispatcher {
 		}
 		set.add(listener);
 		return () => set!.delete(listener);
+	}
+
+	/** Runs the `on` listeners of `path` now, as if `player` had sent it: no limits, no guard, no traffic (`emit`). */
+	emit(player: Player, path: string, args: unknown[]) {
+		const set = this.listeners.get(path);
+		if (!set) return;
+		for (const listener of set) {
+			const [ok, err] = pcall(listener, player, ...args);
+			if (!ok) {
+				this.stat(path).errors += 1;
+				$warn(`[net] ${path} listener threw (emit): ${err}`);
+			}
+		}
 	}
 
 	setHandler(path: string, handler: (player: Player, ...args: unknown[]) => unknown): () => void {
@@ -375,7 +406,24 @@ export class ClientDispatcher {
 		else this.kernel.send(`e:${path}`, ...args);
 	}
 
-	invoke(path: string, args: unknown[]): Promise<unknown> {
+	/**
+	 * Runs this generation's `on` listeners of a server -> client leaf now, as if the server had sent it (Flamework's
+	 * `predict`): no traffic, no guard, not counted as inbound.
+	 */
+	emit(path: string, args: unknown[]) {
+		const set = this.listeners.get(path);
+		if (!set) return;
+		for (const listener of set) {
+			const [ok, err] = pcall(listener, ...args);
+			if (!ok) {
+				this.stat(path).errors += 1;
+				$warn(`[net] ${path} listener threw (emit): ${err}`);
+			}
+		}
+	}
+
+	/** A request; `seconds` (invokeWithTimeout) overrides the leaf's timeout. See `requestTimeout`. */
+	invoke(path: string, args: unknown[], seconds?: number): Promise<unknown> {
 		return new Promise((resolve, reject) => {
 			if (this.stopped) {
 				reject("This version of the game is shutting down.");
@@ -395,7 +443,7 @@ export class ClientDispatcher {
 				tap.record("out", "invoke", path, args, "ok", undefined, undefined, 9);
 			}
 			const id = this.nextId++;
-			const timeout = task.delay(REQUEST_TIMEOUT, () => {
+			const timeout = task.delay(requestTimeout(path, seconds), () => {
 				if (this.pending.delete(id)) reject("The server didn't answer in time.");
 			});
 			this.pending.set(id, { resolve, reject, timeout, path });

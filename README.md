@@ -57,13 +57,18 @@ swap. It needs the TypeTorch kernel in the place (`@typetorch/kernel`).
 
 ### Coming from Flamework
 
-Game code only changes imports: `@Service`, `@Controller`, constructor injection, the lifecycle interfaces and
-`createNetwork` are the same.
+Game code only changes imports: `@Service`, `@Controller`, constructor injection, `Dependency<T>()`, the lifecycle
+interfaces and `createNetwork` are the same.
 
 | Flamework | TypeTorch |
 |---|---|
 | `rbxts-transformer-flamework` plugin, `node_modules/@flamework` type root | `@typetorch/transformer` plugin, `node_modules/@typetorch` type root |
 | `import { Modding, Reflect } from "@flamework/core"` | `import { Modding, Reflect } from "@typetorch/framework"` |
+| `import { Dependency } from "@flamework/core"` | `import { Dependency } from "@typetorch/framework"` (from onInit/onStart on, not in constructors) |
+| `import type` + `Dependency<T>()` to break a cycle | the same, or `Lazy<T>` (below) |
+| `ClientEvents.x.predict(...)` | `network.client.x.emit(...)` |
+| `invokeWithTimeout(timeout, ...)` | `invokeWithTimeout(seconds, ...)` (seconds, 0.5 to 120) |
+| `Observers.observeCharacter` / `observeLocalCharacter` (@rbxts/observers) | still fine: put the stop function in the trove, `this.trove.add(observeCharacter(...))` |
 | `import { t } from "@rbxts/t"` (still fine) | also `import { t } from "@typetorch/framework"` |
 | `@metadata flamework:parameters` keys, `"flamework:parameters"` metadata | `@metadata typetorch:parameters`, `"typetorch:parameters"` |
 | `flamework.build`, `include/flamework`, the `@flamework` Rojo mapping | gone; delete them |
@@ -99,6 +104,19 @@ export class CoinService extends Module implements OnStart {
 - **Modules:** `@Service()` (server) and `@Controller()` (client) classes extending `Module`. Constructor parameters
   are other modules, injected by type. Lifecycle: `OnInit` (sequential, dependencies first), `OnStart` (spawned),
   `OnStop` (reverse order), `OnTick`, `OnPhysics`, `OnRender`, `OnPlayerAdded` (replays players already in the server).
+- **Modules outside the constructor:** `Dependency<T>()` (or `TypeTorch.module<T>()`) returns the running module of
+  type T from anywhere: a method, a plain class a module built, a command handler. `TypeTorch.tryModule<T>()` returns
+  undefined instead of throwing. They work once every module is constructed (from onInit on); in a constructor, a
+  field initializer or module top-level code they throw `"ShopService isn't constructed yet: ..."`. Only this realm's
+  modules, and per generation: after a swap they return the new generation's instance. An `import type` of the class is
+  enough (no require cycle).
+- **Cycles:** two modules that need each other take one side as `Lazy<T>`, resolved on first use:
+  `constructor(private readonly team: Lazy<TeamService>)` (needs `@typetorch/transformer` 0.2.1+) or a field,
+  `private readonly team = Lazy<TeamService>()` (any transformer). `this.team.get()` works from onInit on (in a
+  constructor it throws), and the start order ignores lazy edges. A cycle error names the cycle and suggests this.
+- **Per-player state:** `this.ctx.playerState("cooldowns.v1", (player) => init)` (or `TypeTorch.playerState`) returns
+  `{ get, set, has, delete }` keyed by UserId. It survives swaps (persist), and a player's entry goes when they really
+  leave, never on a swap. The dev menu shows it under Modules > State > persist, `__playerState`.
 - **Bad deploys roll back (kernel 0.3.2):** a server `onStart` that throws is reported to the kernel, which rolls the
   server back to its last known good artifact when it happens within 30 s of start (so do 3 errors from the new
   code's scripts in that time). On a real shutdown every module's `onStop` runs too (the kernel's BindToClose).
@@ -106,6 +124,11 @@ export class CoinService extends Module implements OnStart {
   behind. `TypeTorch.persist(key, init)` (or `this.ctx.persist`) keeps plain data across swaps.
 - **Network:** `createNetwork<C2S, S2C>()` with nested namespaces. The server checks rate limits, shape limits and the
   generated type guard on every client message. `setNetworkLimits({ "chat.say": { maxString: 200 } })` tunes a leaf.
+  Requests wait 15 s for the answer: `invokeWithTimeout(5, ...args)` sets it per call, and a leaf's `timeout`
+  (`setNetworkLimits({ "vc.spawn": { timeout: 30 } })`, read by the client, so set it in shared code) per leaf; both in
+  seconds, 0.5 to 120. `network.client.x.emit(...args)` runs this client's own `on` handlers for a server -> client
+  leaf right away, with no traffic (Flamework's `predict`); `network.server.x.emit(player, ...args)` does the same on
+  the server, for tests.
   Across a swap (0.3.0): what the server sends a player waits until that player's client runs the new generation
   (reliable messages are queued, unreliable ones dropped), and on kernel 0.3.2 a request the server can no longer
   answer fails at once ("The game is updating, try again.") instead of timing out.
@@ -182,6 +205,13 @@ this.trove.add(TypeTorch.onUpdatePending((update) => (hint.Visible = !update.can
 
 // State that survives swaps (plain data only)
 const scores = TypeTorch.persist("scores.v1", () => new Map<number, number>());
+// Per player, removed when the player really leaves (same as this.ctx.playerState)
+const cooldowns = TypeTorch.playerState("cooldowns.v1", () => ({ lastUse: 0 }));
+cooldowns.get(player).lastUse = os.clock();
+
+// The running module of a type (same as Dependency<T>()), from onInit/onStart on
+TypeTorch.module<ShopService>().open(player);
+TypeTorch.tryModule<ShopService>()?.open(player); // undefined instead of an error
 
 // Dev and roles (server: the kernel decides; client: only the local player, cosmetic)
 if (TypeTorch.isOwner(player)) showOwnerPanel(player);
@@ -418,6 +448,10 @@ bun run build   # rbxtsc --type package -> out/
   package.json.
   `scripts/test-layout.luau` checks the dev menu's pane layout core (`devtools/layout.ts`: splits and their limits,
   closing, pop out and dock, singleton pages, ratios, focus, and cleaning a remembered layout).
+  `scripts/test-modules.luau` runs the real `startServer`/`startClient` of `out/` (with RuntimeLib, Promise, trove and
+  t from node_modules) over several generations that share a persist store: `Dependency<T>()`, `TypeTorch.module` /
+  `tryModule` and their errors, `Lazy<T>` (parameters and fields, cycles, start order), network `emit` and request
+  timeouts and `playerState` (swaps, leaves).
   `scripts/test-analytics.luau` checks the analytics engine's pure parts (experiment assignment, settings, the queue
   and HTTP budget, tt-rec-1, the sink request bodies); `test-analytics-server.luau` and `test-analytics-client.luau`
   run the compiled server and client cores against mocked services (sessions, intake, retries, a swap with a request
