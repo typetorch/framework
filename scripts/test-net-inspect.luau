@@ -35,6 +35,10 @@ function Promise.new(executor)
 	end)
 	return promise
 end
+-- The server dispatcher asks whether a request handler answered with a Promise (none do here).
+function Promise.is(value)
+	return type(value) == "table" and value.status ~= nil
+end
 
 local env
 local script = {}

@@ -72,6 +72,10 @@ interfaces and `createNetwork` are the same.
 | `import { t } from "@rbxts/t"` (still fine) | also `import { t } from "@typetorch/framework"` |
 | `@metadata flamework:parameters` keys, `"flamework:parameters"` metadata | `@metadata typetorch:parameters`, `"typetorch:parameters"` |
 | `flamework.build`, `include/flamework`, the `@flamework` Rojo mapping | gone; delete them |
+| `Networking.createEvent` / `createFunction` and their call sites | `createFlameworkCompat` (below) keeps every call site; `createNetwork` is the native API |
+
+`typetorch migrate --from flamework` (CLI) does most of this, and the docs' `guides/from-flamework.md` has the whole
+mapping.
 
 ## Usage
 
@@ -128,7 +132,14 @@ export class CoinService extends Module implements OnStart {
   (`setNetworkLimits({ "vc.spawn": { timeout: 30 } })`, read by the client, so set it in shared code) per leaf; both in
   seconds, 0.5 to 120. `network.client.x.emit(...args)` runs this client's own `on` handlers for a server -> client
   leaf right away, with no traffic (Flamework's `predict`); `network.server.x.emit(player, ...args)` does the same on
-  the server, for tests.
+  the server, for tests. A request handler may return a Promise: the answer waits for it.
+- **Flamework networking names:** `createFlameworkCompat<C2SEvents, S2CEvents, C2SFunctions, S2CFunctions>()` returns
+  `{ ServerEvents, ClientEvents, ServerFunctions, ClientFunctions, GlobalEvents, GlobalFunctions }` with
+  `@flamework/networking` 1.x's methods (`connect` returning a connection, `fire(player | players)`, `broadcast`,
+  `except`, `predict`, `setCallback`, `invoke`, `invokeWithTimeout`, calling a leaf directly) on this same network:
+  same guards, limits and swap rules, so a Flamework game's call sites compile unchanged. Listeners run on their own
+  thread each, like Flamework's, and belong to the running generation (no trove needed). Not carried over: server ->
+  client requests, middleware, `Networking.Unreliable`. `typetorch build` notes a game still using it.
   Across a swap (0.3.0): what the server sends a player waits until that player's client runs the new generation
   (reliable messages are queued, unreliable ones dropped), and on kernel 0.3.2 a request the server can no longer
   answer fails at once ("The game is updating, try again.") instead of timing out.
@@ -452,6 +463,10 @@ bun run build   # rbxtsc --type package -> out/
   t from node_modules) over several generations that share a persist store: `Dependency<T>()`, `TypeTorch.module` /
   `tryModule` and their errors, `Lazy<T>` (parameters and fields, cycles, start order), network `emit` and request
   timeouts and `playerState` (swaps, leaves).
+  `scripts/test-flamework-compat.luau` (same harness) drives `createFlameworkCompat` through each generation's
+  dispatcher: connect (one thread per call, guards, Disconnect, troves), fire / except / broadcast / the call
+  shorthand, setCallback with values and Promises, predict, a swap, and the client side (invoke, invokeWithTimeout,
+  `createClient({ defaultTimeout })`).
   `scripts/test-analytics.luau` checks the analytics engine's pure parts (experiment assignment, settings, the queue
   and HTTP budget, tt-rec-1, the sink request bodies); `test-analytics-server.luau` and `test-analytics-client.luau`
   run the compiled server and client cores against mocked services (sessions, intake, retries, a swap with a request
