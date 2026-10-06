@@ -2,7 +2,7 @@ import type { AssetFacts } from "../assets/manifest";
 import type { KernelStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
-export const LATEST_KERNEL = "0.3.4";
+export const LATEST_KERNEL = "0.3.5";
 
 /** The fleet API's last error as a short fix (the dev PC's `bun run local` restarts the server and its tunnel). */
 export function fleetFix(lastError: string | undefined): string {

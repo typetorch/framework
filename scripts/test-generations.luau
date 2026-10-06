@@ -638,7 +638,7 @@ do
 		end
 		return list
 	end
-	local base = { kernelApi = 1, kernelVersion = "0.3.4", serverType = "public", generation = { name = "x#1" }, history = {}, memoryMb = 1 }
+	local base = { kernelApi = 1, kernelVersion = "0.3.5", serverType = "public", generation = { name = "x#1" }, history = {}, memoryMb = 1 }
 	local function with(fields)
 		local status = table.clone(base)
 		for key, value in fields do
@@ -646,7 +646,7 @@ do
 		end
 		return status
 	end
-	check("health: LATEST_KERNEL is 0.3.4", health.LATEST_KERNEL == "0.3.4")
+	check("health: LATEST_KERNEL is 0.3.5", health.LATEST_KERNEL == "0.3.5")
 	local old = titles(with({ kernelVersion = "0.3.1" }))
 	check("health: a 0.3.1 server: Kernel update (warn) and No deploy reports (info)", old["Kernel update"] == "warn" and old["No deploy reports"] == "info")
 	local studio = titles(with({ kernelVersion = "0.3.1", serverType = "studio" }))
