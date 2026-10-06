@@ -617,6 +617,23 @@ export interface KernelStatus {
 	messaging?: MessagingStatus;
 	/** Kernel 0.3.8 (plans/20): the signed settings record (no values: it holds tokens). */
 	settings?: SettingsStatus;
+	/** Kernel 0.3.8: detached jobs (`TypeTorch.runDetached`). */
+	detached?: DetachedStatus;
+}
+
+/** Kernel 0.3.8: detached jobs on this server (`runDetached`): counters since boot and the running ones. */
+export interface DetachedStatus {
+	running: number;
+	started: number;
+	finished: number;
+	failed: number;
+	/** Jobs that ran past 60 s (each logged once). */
+	slow: number;
+	/** The most that may run at once (256). */
+	max: number;
+	/** Seconds the longest running job has run. */
+	oldest?: number;
+	lastError?: { generation: string; error: string; at: number };
 }
 
 /**
@@ -852,6 +869,13 @@ export interface ServerKernel {
 	settingsStatus?(): SettingsStatus;
 	/** One handler per generation: a fresh copy after every new good copy (the framework installs it and fans out). */
 	onSettingsChanged?(handler: (settings: KernelSettings | undefined) => void): void;
+
+	/**
+	 * Kernel 0.3.8 (additive): runs fn() on a kernel thread that this generation's stop (and hard stop) can't kill.
+	 * done(ok, result) runs on a kernel thread, only while this generation runs. Throws past 256 running jobs. Returns
+	 * the job's id.
+	 */
+	runDetached?(fn: () => unknown, done?: (ok: boolean, result: unknown) => void): number;
 
 	/** `typetorch test --cloud`'s stub kernel: true (code that must not run in the gate checks it). */
 	readonly test?: boolean;

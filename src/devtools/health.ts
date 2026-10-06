@@ -1,5 +1,5 @@
 import type { AssetFacts } from "../assets/manifest";
-import type { HealthInfo, KernelStatus, SettingsStatus } from "../kernel";
+import type { DetachedStatus, HealthInfo, KernelStatus, SettingsStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
 export const LATEST_KERNEL = "0.3.8";
@@ -252,6 +252,33 @@ export function settingsIssues(status: KernelStatus): HealthIssue[] {
 	return issues;
 }
 
+/** Kernel 0.3.8 detached jobs, for Server > Status: "2 running (oldest 4 s), 1 failed". */
+export function detachedText(detached: DetachedStatus): string {
+	const parts = [`${detached.running} running${detached.oldest !== undefined ? ` (oldest ${detached.oldest} s)` : ""}`];
+	if (detached.failed > 0) parts.push(`${detached.failed} failed`);
+	return parts.join(", ");
+}
+
+/** A detached job slower than this (seconds) is flagged while it runs (the kernel logs it at 60 s too). */
+const DETACHED_SLOW = 60;
+
+/**
+ * Kernel 0.3.8 detached jobs (status().detached): one still running past 60 s (a stuck library call keeps an old
+ * generation alive), or the server near its cap: warn.
+ */
+export function detachedIssues(status: KernelStatus): HealthIssue[] {
+	const issues = new Array<HealthIssue>();
+	const detached = status.detached;
+	if (detached === undefined) return issues;
+	if (detached.oldest !== undefined && detached.oldest >= DETACHED_SLOW) {
+		issues.push({ level: "warn", title: "Detached job slow", detail: `${detached.running} running, the oldest for ${detached.oldest} s` });
+	}
+	if (detached.running >= detached.max * 0.8) {
+		issues.push({ level: "warn", title: "Detached jobs near the cap", detail: `${detached.running} of ${detached.max}` });
+	}
+	return issues;
+}
+
 /**
  * Kernel 0.3.8 game messaging (status().messaging): the universe's rate on the game topic at the soft limit (publishes
  * wait), dropped messages, or the topic not subscribed after failures: warn, with the numbers.
@@ -337,6 +364,7 @@ export function checkHealth(status: KernelStatus, facts?: ServerFacts): HealthIs
 	for (const issue of fallbackIssues(status)) issues.push(issue);
 	for (const issue of messagingIssues(status)) issues.push(issue);
 	for (const issue of settingsIssues(status)) issues.push(issue);
+	for (const issue of detachedIssues(status)) issues.push(issue);
 	if (status.localPayload === true) {
 		issues.push({ level: "info", title: "Studio: local payload", detail: "Edits need Stop + Play. Reload remounts it." });
 	}

@@ -31,6 +31,7 @@ import { hotAsset, type HotAsset } from "./assets/hot-asset";
 import { bindMessaging, messaging, messagingSupported, unbindMessaging, type MessagingApi } from "./messaging";
 import { bindServers, listServers, setServerInfo, unbindServers, type GameServer, type ServerListOptions } from "./servers";
 import { bindSettings, currentSettings, liveConfig, settingsSupported, unbindSettings, type LiveConfig, type LiveConfigOptions } from "./settings";
+import { bindDetached, detachedSupported, runDetached, unbindDetached } from "./detached";
 
 /**
  * `TypeTorch`: the runtime API for game code, on the server and the client. It describes the running generation
@@ -67,6 +68,8 @@ export interface TypeTorchFeatures {
 	readonly messaging: boolean;
 	/** The signed settings record (kernel 0.3.8+, a server): `settings()`, `liveConfig`, analytics settings. */
 	readonly settings: boolean;
+	/** `runDetached` runs on a kernel thread (kernel 0.3.8+, a server). */
+	readonly runDetached: boolean;
 }
 
 export interface TypeTorchApi {
@@ -237,6 +240,15 @@ export interface TypeTorchApi {
 	 * `analytics`, `fleet`, ...), or undefined. It holds tokens: never send it to a client.
 	 */
 	settings(): KernelSettings | undefined;
+
+	// Detached jobs (server only, kernel 0.3.8) ---------------------------------------------------------------------------
+	/**
+	 * Runs `fn` on a kernel thread, so a deploy's swap can't cut it off halfway (a ProfileStore load, save or release).
+	 * The Promise settles while this generation runs; after a swap the result is dropped (write it into `persist` from
+	 * inside the job). The job keeps this generation's closures alive until it ends. Errors reject and are logged; at
+	 * most 256 at once. Older kernels: throws "needs kernel 0.3.8; use the DataHost job queue". See src/detached.ts.
+	 */
+	runDetached<T>(fn: () => T): Promise<T>;
 }
 
 // State of this generation's binding ------------------------------------------------------------------------------------
@@ -275,6 +287,7 @@ const NO_FEATURES: TypeTorchFeatures = {
 	requestReload: false,
 	messaging: false,
 	settings: false,
+	runDetached: false,
 };
 
 function hasMethod(kernel: object, name: string): boolean {
@@ -516,6 +529,10 @@ class TypeTorchRuntime implements TypeTorchApi {
 		if (client) error("TypeTorch.settings() is server-only (the record holds tokens)", 2);
 		return currentSettings();
 	}
+
+	runDetached<T>(fn: () => T): Promise<T> {
+		return runDetached(fn);
+	}
 }
 
 /** The runtime API for game code (server and client). See `TypeTorchApi` and the README. */
@@ -546,6 +563,7 @@ export function bindTypeTorch(
 	// settings (liveConfig, analytics).
 	bindMessaging(realm, kernel, trove, runtime.branch, runtime.kernelVersion);
 	bindSettings(realm, kernel, trove, runtime.kernelVersion);
+	bindDetached(realm, kernel, trove, runtime.kernelVersion);
 	if (realm === "server") {
 		server = kernel as ServerKernel;
 		runtime.serverType = server.serverType;
@@ -601,6 +619,7 @@ export function bindTypeTorch(
 		requestReload: server !== undefined && hasMethod(server, "requestReload"),
 		messaging: messagingSupported(),
 		settings: settingsSupported(),
+		runDetached: detachedSupported(),
 	};
 }
 
@@ -682,6 +701,7 @@ export function unbindTypeTorch() {
 	unbindMessaging();
 	unbindServers();
 	unbindSettings();
+	unbindDetached();
 	swapOutListeners.clear();
 	closeListeners.clear();
 	pendingListeners.clear();

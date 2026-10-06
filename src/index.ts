@@ -61,6 +61,7 @@ export type {
 	BranchInfo,
 	Channel,
 	ClientKernel,
+	DetachedStatus,
 	DevInfo,
 	GameMessageMeta,
 	GenerationHistoryEntry,

@@ -59,7 +59,7 @@ import { Layout, newLayout, sanitizeLayout } from "./layout";
 import { createWindowManager, PaneHost, PaneTab, PickItem, WindowManager } from "./panes";
 import { describeState } from "./state";
 import type { ArtifactNotes } from "./artifact-notes";
-import { badgeLevel, checkHealth, HealthIssue, HealthLevel, healthLimitsText, ServerFacts, settingsText } from "./health";
+import { badgeLevel, checkHealth, detachedText, HealthIssue, HealthLevel, healthLimitsText, ServerFacts, settingsText } from "./health";
 import { NEEDS_KERNEL_AB } from "./ab";
 import {
 	addButton,
@@ -879,6 +879,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			body.field("Registry seq", str(status.appliedSeq));
 			// Kernel 0.3.8 (plans/20): the signed settings record ("#12, 3m old, sig").
 			if (status.settings !== undefined) body.field("Settings", settingsText(status.settings), status.settings.state === "ok" ? COLORS.text : COLORS.warn);
+			// Kernel 0.3.8: TypeTorch.runDetached jobs ("2 running (oldest 4 s), 1 failed").
+			if (status.detached !== undefined) body.field("Detached jobs", detachedText(status.detached), status.detached.failed > 0 ? COLORS.warn : COLORS.text);
 			body.field("Kernel", `${status.kernelVersion}${status.kernelBuild !== undefined ? `@${status.kernelBuild}` : ""} (API ${status.kernelApi})`);
 			if (status.registryError !== undefined) body.field("Registry error", status.registryError, COLORS.bad);
 

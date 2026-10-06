@@ -253,6 +253,9 @@ TypeTorch.messaging.publish("1guard", { kind: "ban", userId }, { to: "prod" });
 // The universe's live servers (the roll call; cached per server, yields up to ~3 s when stale) and this server's public fields
 TypeTorch.setServerInfo({ region: "eu", vc: true }); // JSON, at most 400 bytes, kept across swaps
 const list = TypeTorch.servers(); // [{ jobId, placeVersion, players, maxPlayers, serverType, branch, channel, uptime, here, info }]
+
+// A library call a swap must not cut off halfway (kernel 0.3.8): runs on a kernel thread; write what must survive into persist.
+TypeTorch.runDetached(() => store.StartSessionAsync(`Player_${userId}`)).then((profile) => attach(player, profile));
 ```
 
 - **`startInfo.reason`:** `boot`, `deploy`, `rollback`, `branch`, `pin`, `reload`, `server_rollback`,
@@ -280,6 +283,14 @@ const list = TypeTorch.servers(); // [{ jobId, placeVersion, players, maxPlayers
   changes; generation-scoped). The default without a record or key, when `parse` throws (warned per value), and on older
   kernels (warned once: "needs kernel 0.3.8"; no ConfigService fallback). `TypeTorch.settings()` is the whole copy
   (`seq`, `at`, `game`, `analytics`, `fleet`, ...): server only, it holds tokens.
+- **`runDetached(fn)`** (kernel 0.3.8, server only): runs `fn` on a thread the kernel owns, so a deploy's hard stop
+  (which kills this generation's threads mid-call) can't cut it off: for ProfileStore / ProfileService loads, saves and
+  releases. Returns a Promise that settles while this generation runs; after a swap the result is dropped, so a job
+  whose result must survive writes it into `persist` itself. The job keeps this generation's closures alive until it
+  ends. Errors reject it and go to the kernel's log with the generation's name (never the health window); at most 256
+  run at once per server (then it throws); one past 60 s is logged and flagged in Server > Status. Older kernels
+  throw "needs kernel 0.3.8; use the DataHost job queue (Player data guide)": the other option, which works on every
+  kernel. `features.runDetached` tells which one this server has.
 - **Edit mode** (UI Labs stories, no kernel): `running` is false, identity has defaults, `persist` keeps a local table,
   events never fire, and the server-only reads throw.
 
@@ -293,6 +304,8 @@ pieces that keep it safe across swaps:
 - **Session handles live in `persist`**, keyed by `UserId`. `onPlayerAdded` replays everyone after a swap, so it
   re-attaches to the open session instead of loading again.
 - **Release only on `Players.PlayerRemoving`**, never in `onStop` or `onSwapOut`.
+- **Library calls can't be cut off by a swap:** run them as DataHost jobs (any kernel) or with
+  `TypeTorch.runDetached` (kernel 0.3.8).
 - **Split store names by channel** (`TypeTorch.channel === "prod" ? "PlayerData" : "PlayerData_dev"`).
 
 Full example with ProfileStore: [Player data guide](https://github.com/typetorch/docs/blob/main/guides/player-data.md).
