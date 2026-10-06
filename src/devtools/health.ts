@@ -2,7 +2,7 @@ import type { AssetFacts } from "../assets/manifest";
 import type { KernelStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
-export const LATEST_KERNEL = "0.3.5";
+export const LATEST_KERNEL = "0.3.6";
 
 /** The fleet API's last error as a short fix (the dev PC's `bun run local` restarts the server and its tunnel). */
 export function fleetFix(lastError: string | undefined): string {
@@ -145,6 +145,31 @@ export function deployIssues(status: KernelStatus): HealthIssue[] {
 			detail: clients.lastFailure?.error ?? "-",
 		});
 	}
+	if (clients?.moved !== undefined && clients.moved > 0) {
+		issues.push({ level: "warn", title: `Clients moved ${clients.moved}`, detail: "Their game didn't load here." });
+	}
+	return issues;
+}
+
+/**
+ * Kernel 0.3.6 ("never an empty server"): flagged like the boot fail-safe.
+ * - the backup build baked into the place runs (nothing else could): error;
+ * - players are being moved to another server (nothing runs here): error;
+ * - the backup failed here: warn.
+ */
+export function fallbackIssues(status: KernelStatus): HealthIssue[] {
+	const issues = new Array<HealthIssue>();
+	const fallback = status.fallback;
+	if (status.backup === true) {
+		const at = fallback?.backup.at;
+		issues.push({ level: "error", title: "Running the backup build", detail: `${fallback?.backup.artifactId ?? "-"}${at !== undefined ? `, baked ${at.sub(1, 10)}` : ""}. Retrying the real one.` });
+	}
+	if (fallback?.moving.active === true) {
+		issues.push({ level: "error", title: "Moving players out", detail: "Nothing runs on this server." });
+	}
+	if (fallback?.backup.failed !== undefined) {
+		issues.push({ level: "warn", title: "Backup build failed", detail: fallback.backup.failed.error ?? "-" });
+	}
 	return issues;
 }
 
@@ -210,6 +235,7 @@ export function checkHealth(status: KernelStatus, facts?: ServerFacts): HealthIs
 	for (const issue of assetIssues(facts?.assets)) issues.push(issue);
 	for (const issue of signingIssues(status)) issues.push(issue);
 	for (const issue of deployIssues(status)) issues.push(issue);
+	for (const issue of fallbackIssues(status)) issues.push(issue);
 	if (status.localPayload === true) {
 		issues.push({ level: "info", title: "Studio: local payload", detail: "Edits need Stop + Play. Reload remounts it." });
 	}

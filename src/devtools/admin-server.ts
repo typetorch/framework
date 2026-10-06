@@ -98,7 +98,10 @@ export interface AdminServer {
 	kernel?: string;
 	/** Its kernel takes pin messages (0.2.3+); undefined when unknown. */
 	ab?: boolean;
-	/** Kernel 0.3.2+: "ok" | "failed" (nothing runs) | "unverified" | "degraded" (a deploy failed or rolled back there). */
+	/**
+	 * Kernel 0.3.2+: "ok" | "failed" (nothing runs) | "unverified" | "degraded" (a deploy failed or rolled back there);
+	 * 0.3.6: "backup" (the backup build baked into the place runs).
+	 */
 	health?: string;
 	/** Kernel 0.3.2+: its applied deploy seq. */
 	seq?: number;

@@ -367,8 +367,11 @@ export interface GenerationHistoryEntry {
 	swapSeconds?: number;
 }
 
-/** Kernel 0.3.2+: the running generation's health ("ok" | "failed": nothing runs | "unverified" | "degraded"). */
-export type HealthState = "ok" | "failed" | "unverified" | "degraded";
+/**
+ * Kernel 0.3.2+: the running generation's health ("ok" | "failed": nothing runs | "unverified" | "degraded"). Kernel
+ * 0.3.6: "backup" (the backup build baked into the place runs: nothing else could).
+ */
+export type HealthState = "ok" | "failed" | "unverified" | "degraded" | "backup";
 
 /** Kernel 0.3.2+ `status().health` (plans/12 P-F1: the health window). */
 export interface HealthInfo {
@@ -433,6 +436,10 @@ export interface FleetStatus {
 	/** The last error (<= 200 bytes), while recent or unhealthy. */
 	e?: string;
 	sv: 2;
+	/** Kernel 0.3.6: the backup build baked into the place runs (`h` is "backup" too). */
+	backup?: boolean;
+	/** Kernel 0.3.6: clients whose generation failed after their retry (only once something happened). */
+	clients?: { resent: number; moved: number };
 }
 
 /** Kernel 0.3.2+: one deploy outcome on one server (`onDeployReport`). */
@@ -484,6 +491,24 @@ export interface ClientsSummary {
 	/** Failed reports since boot. */
 	failures: number;
 	lastFailure?: { userId: number; generation: string; error?: string; at: number };
+	/** Kernel 0.3.6: clients the kernel re-sent the client code to (after their own retry failed), and moved away. */
+	resent?: number;
+	moved?: number;
+}
+
+/**
+ * Kernel 0.3.6 ("never an empty server", plans/01): the hold (no character spawns until a generation is ready), the
+ * fallbacks when the head and the last known good run nothing (a build other servers run fine, the backup baked into
+ * the place, background retries) and the moves (players go to another server when nothing runs).
+ */
+export interface FallbackStatus {
+	hold: { active: boolean; mode?: "start" | "move"; optOut?: boolean; characters?: boolean; heldMs?: number; seconds?: number; released?: number; spawned: number };
+	backup: { available: boolean; artifactId?: string; seq?: number; branch?: string; at?: string; failed?: { error?: string; stage?: string; at: number }; runs: number; since?: number };
+	peers: { asks: number; answered: number; replies: number; lastAt?: number; refused: number; chosen?: { artifactId?: string; assetId: number; seq?: number; servers: number; at: number }; error?: string };
+	chain: { runs: number; result?: "peers" | "backup" | "other" | "nothing"; why?: string; at?: number };
+	recovery: { running: boolean; attempts: number; nextIn?: number; last?: { ok: boolean; artifactId?: string; error?: string; at: number } };
+	moving: { active: boolean; since?: number; teleported: number; kicked: number; failures: number; lastError?: string; target?: string };
+	clients: { resent: number; moved: number };
 }
 
 /** Kernel 0.3.2+: a failed lifecycle hook the framework reports (`reportError`). */
@@ -558,6 +583,13 @@ export interface KernelStatus {
 	switched?: SwitchInfo;
 	/** Kernel 0.3.2+: client generation reports. */
 	clients?: ClientsSummary;
+	/**
+	 * Kernel 0.3.6: the backup build baked into the place (ServerStorage.TypeTorchBackup) runs: the head, the last known
+	 * good and the branch's other servers had nothing that ran here. The kernel retries the real build in the background.
+	 */
+	backup?: boolean;
+	/** Kernel 0.3.6: the hold, peers, backup, recovery and moves. */
+	fallback?: FallbackStatus;
 }
 
 export interface ServerKernel {

@@ -1273,6 +1273,7 @@ function renderServers(tab: AdminTab, deps: AdminDeps) {
 		if (server.health === "failed") chips.push(chip(top, "Down", COLORS.bad));
 		else if (server.health === "unverified") chips.push(chip(top, "Unverified", COLORS.bad));
 		else if (server.health === "degraded") chips.push(chip(top, "Degraded", COLORS.warn));
+		else if (server.health === "backup") chips.push(chip(top, "Backup", COLORS.bad)); // kernel 0.3.6
 		idBox.Focused.Connect(() => {
 			idBox.Text = server.jobId;
 			idBox.Size = new UDim2(1, 0, 0, 20);

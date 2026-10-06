@@ -706,7 +706,7 @@ do
 		end
 		return list
 	end
-	local base = { kernelApi = 1, kernelVersion = "0.3.5", serverType = "public", generation = { name = "x#1" }, history = {}, memoryMb = 1 }
+	local base = { kernelApi = 1, kernelVersion = "0.3.6", serverType = "public", generation = { name = "x#1" }, history = {}, memoryMb = 1 }
 	local function with(fields)
 		local status = table.clone(base)
 		for key, value in fields do
@@ -714,7 +714,7 @@ do
 		end
 		return status
 	end
-	check("health: LATEST_KERNEL is 0.3.5", health.LATEST_KERNEL == "0.3.5")
+	check("health: LATEST_KERNEL is 0.3.6", health.LATEST_KERNEL == "0.3.6")
 	local old = titles(with({ kernelVersion = "0.3.1" }))
 	check("health: a 0.3.1 server: Kernel update (warn) and No deploy reports (info)", old["Kernel update"] == "warn" and old["No deploy reports"] == "info")
 	local studio = titles(with({ kernelVersion = "0.3.1", serverType = "studio" }))
@@ -736,6 +736,15 @@ do
 	check("health: errors after the window: warn", degraded["Errors 4"] == "warn")
 	local clients = titles(with({ reports = { total = 1, kept = 1, listeners = 1 }, clients = { players = 3, reported = 3, ok = 2, failed = 1, behind = 1, failures = 1, lastFailure = { userId = 1, generation = "x#1", error = "boom", at = 0 } } }))
 	check("health: a client's failed generation: warn", clients["Clients failed 1"] == "warn")
+	-- Kernel 0.3.6 (never an empty server): the backup build and the moves are flagged like the boot fail-safe.
+	local fallback = { hold = { active = false, spawned = 0 }, backup = { available = true, artifactId = "b-1", at = "2026-10-06T10:00:00Z", runs = 1 }, peers = { asks = 1, answered = 0, replies = 0, refused = 0 }, chain = { runs = 1, result = "backup" }, recovery = { running = true, attempts = 2 }, moving = { active = false, teleported = 0, kicked = 0, failures = 0 }, clients = { resent = 0, moved = 0 } }
+	local backup = titles(with({ reports = { total = 1, kept = 1, listeners = 1 }, backup = true, fallback = fallback }))
+	check("health: the backup build runs: error", backup["Running the backup build"] == "error")
+	local movingFallback = table.clone(fallback)
+	movingFallback.moving = { active = true, teleported = 3, kicked = 0, failures = 0 }
+	movingFallback.backup = { available = false, runs = 0, failed = { error = "mount: holds a Script", stage = "mount", at = 0 } }
+	local moving = titles(with({ reports = { total = 1, kept = 1, listeners = 1 }, fallback = movingFallback, clients = { players = 1, reported = 1, ok = 1, failed = 0, behind = 0, failures = 0, moved = 2 } }))
+	check("health: moving players out: error; the backup failed: warn; clients moved: warn", moving["Moving players out"] == "error" and moving["Backup build failed"] == "warn" and moving["Clients moved 2"] == "warn")
 	check("admin: kernel 0.3.2 fleetStatus is feature-detected", admin.kernelHasFleetStatus({ fleetStatus = function() end }) == true and admin.kernelHasFleetStatus({}) == false)
 	-- Kernel 0.3.4: a switched server is an ordinary server: no Attention line, no "Back" action.
 	local switchedIssues = health.checkHealth(with({ reports = { total = 1, kept = 1, listeners = 1 }, switched = { by = 1, name = "Owner", at = 10, branch = "dev" } }))
