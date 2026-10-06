@@ -54,6 +54,9 @@ import { adminTabs, migrateControl } from "./admin-ui";
 import { renderNetworkInspector } from "./network-inspector";
 import { renderAssetsTab } from "./assets-ui";
 import { renderStateTab, StateExplorerPersist } from "./state-ui";
+import { Gate, PollFeed, TokenBucket } from "./feeds";
+import { Layout, newLayout, sanitizeLayout } from "./layout";
+import { createWindowManager, PaneHost, PaneTab, PickItem, WindowManager } from "./panes";
 import { describeState } from "./state";
 import type { ArtifactNotes } from "./artifact-notes";
 import { badgeLevel, checkHealth, HealthIssue, HealthLevel, ServerFacts } from "./health";
@@ -103,6 +106,8 @@ const HEADER = 46;
 const TAB_WIDTH = 116;
 /** Gap between the body (right of the tabs) and the window's right and bottom borders. */
 const BODY_MARGIN = 8;
+/** Gap between the window header and the first pane header. */
+const PANES_TOP = 6;
 /** Artifact rows shown per branch before "Show all". */
 const ARTIFACTS_PER_BRANCH = 6;
 /** Artifact tab: seconds between updates of its "Running", "Server up" and "Built ... ago" texts. */
@@ -154,6 +159,39 @@ type TabName = (typeof TABS)[number];
 /** Tabs with sub-tabs (a segmented bar on top of the content); the first one is the default. */
 const SUBTABS: Partial<Record<TabName, readonly string[]>> = { Modules: ["Overview", "State", "Assets"], Server: ["Status", "Branch"], Manage: ["Players", "Servers", "Bans"], Network: ["Packets", "Stats"] };
 
+/**
+ * Pages that open in one pane at most (panes.ts focuses the open one instead of opening a second):
+ * - Claude: one conversation, draft and image inbox in the persist store, and one events poll per dev; a second copy
+ *   would race the first on the same state.
+ * - Server > Branch: actions that swap the whole server (two-tap arms, one action at a time); a second copy adds nothing
+ *   and doubles three ops per load.
+ * - Manage > Players / Servers / Bans: moderation actions and their cards, the remembered build load, and the owner's
+ *   per-dev admin read budget (8 then 2/s); a second copy only doubles reads.
+ * Every other page may be open in several panes: Modules > State keeps its open nodes per pane (two modules side by
+ * side), Dex its realm and split, Logs and Packets their realm and filters; the polls they share go through one feed.
+ */
+const SINGLE_PAGES = new Set(["Claude", "Server/Branch", "Manage/Players", "Manage/Servers", "Manage/Bans"]);
+/** What a fresh pane shows. */
+const FALLBACK_PAGE = "Artifact";
+
+/** "Modules/State" -> ["Modules", "State"]; "Logs" -> ["Logs", undefined]. */
+function splitKey(key: string): [tab: string, sub: string | undefined] {
+	const [slash] = key.find("/", 1, true);
+	if (slash === undefined) return [key, undefined];
+	return [key.sub(1, slash - 1), key.sub(slash + 1)];
+}
+
+/** Every page key in sidebar order. */
+function pageKeys(): string[] {
+	const keys = new Array<string>();
+	for (const name of TABS) {
+		const children = SUBTABS[name];
+		if (children) for (const child of children) keys.push(`${name}/${child}`);
+		else keys.push(name);
+	}
+	return keys;
+}
+
 interface StatusReply {
 	server: KernelStatus;
 	artifact: ArtifactInfo;
@@ -183,13 +221,17 @@ function paintDot(parent: GuiObject, level: HealthLevel | undefined, position: U
 
 interface TabContext {
 	readonly page: Page;
-	/** Cleaned on tab switch and when the window closes. */
+	/** Cleaned when the pane closes, shows another page or hides (menu closed, window minimised). */
 	readonly trove: Trove;
 	readonly content: ScrollingFrame;
 	/** A button row pinned above the scrolling content (sticky toolbar), removed with the tab. */
 	readonly toolbar: () => Frame;
 	/** A bar pinned under the scrolling content, removed with the tab. */
 	readonly footer: () => Page;
+	/** This pane's own remembered state (kept in the layout, so it survives swaps). */
+	readonly paneState: Record<string, unknown>;
+	/** The pane's layout id (1 = the first pane of a fresh layout). */
+	readonly paneId: number;
 }
 
 interface Rect {
@@ -209,6 +251,8 @@ interface MenuState {
 	window?: Rect;
 	/** Sidebar groups left open (they stay open until their header is clicked again). */
 	openGroups?: string[];
+	/** Panes and floating windows (layout.ts); undefined = one pane on `tab`/`sub` (a fresh join). */
+	layout?: Layout;
 }
 
 // Formatting --------------------------------------------------------------------------------------------------------
@@ -335,9 +379,8 @@ interface Ui {
 	gui: ScreenGui;
 	toggle: TextButton;
 	window: Frame;
-	/** Right of the tab list: [sub-tabs] [toolbar] [content] [footer], top to bottom. */
-	body: Frame;
-	content: ScrollingFrame;
+	/** Right of the tab list: the main panel's panes. */
+	host: Frame;
 	tabButtons: Map<TabName, TextButton>;
 	/** Sidebar groups (tabs with sub-tabs): children shown indented under the tab while it is selected. */
 	groups: Map<TabName, SidebarGroup>;
@@ -476,6 +519,106 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		waiters.clear();
 	});
 
+	// Shared feeds (feeds.ts) ----------------------------------------------------------------------------------------
+	// Panes showing the same data share one poll (one request per tick, however many panes watch), and a hidden pane
+	// is unmounted, so it stops watching: a feed nobody watches sends nothing.
+	interface Reply {
+		ok: boolean;
+		reply: unknown;
+	}
+	const opFeed = (op: string, interval: number) => {
+		const feed = new PollFeed<Reply>(
+			() => {
+				const [ok, reply] = call(op);
+				return { ok, reply };
+			},
+			interval,
+			op,
+		);
+		trove.add(() => feed.destroy());
+		return feed;
+	};
+	/** Server > Status (and the health badge while it shows). */
+	const statusFeed = opFeed("status", REFRESH);
+	/** Modules > Overview, server realm. */
+	const stateFeed = opFeed("state", REFRESH);
+	/** Modules > Assets, server realm. */
+	const assetsFeed = opFeed("assets", REFRESH);
+	/** Network > Stats: both realms' lines, with the per-second rates worked out once per tick. */
+	interface NetLine {
+		path: string;
+		line: string;
+		warn: boolean;
+	}
+	const netHistory = new Map<string, [number, number, number]>();
+	const netLines = (realm: string, stats: NetStat[], now: number): NetLine[] =>
+		stats.map((stat) => {
+			const key = `${realm}:${stat.path}`;
+			const line = statLine(stat, netHistory.get(key), now);
+			netHistory.set(key, [stat.inbound, stat.outbound, now]);
+			return { path: stat.path, line, warn: stat.rejected > 0 || stat.errors > 0 };
+		});
+	const netFeed = new PollFeed<{ server?: NetLine[]; error?: string; client: NetLine[] }>(
+		() => {
+			const [ok, reply] = call("net");
+			const client = new Array<NetStat>();
+			for (const [path, stat] of dispatcher.stats) client.push({ path, ...stat });
+			client.sort((a, b) => a.inbound + a.outbound > b.inbound + b.outbound);
+			const now = os.clock();
+			return {
+				server: ok && typeIs(reply, "table") ? netLines("server", reply as NetStat[], now) : undefined,
+				error: ok && typeIs(reply, "table") ? undefined : str(reply),
+				client: netLines("client", client, now),
+			};
+		},
+		REFRESH,
+		"net",
+	);
+	trove.add(() => netFeed.destroy());
+	/** Logs > Server: one ring of this server's lines for every Logs pane (op "logs" with a cursor). */
+	const serverLogs = new Array<LogEntry>();
+	let serverLogsSince = 0;
+	const serverLogFeed = new PollFeed<{ error?: string }>(
+		() => {
+			const [ok, reply] = call("logs", serverLogsSince);
+			if (!ok || !typeIs(reply, "table")) return { error: str(reply) };
+			for (const entry of reply as LogEntry[]) {
+				if (entry.i <= serverLogsSince) continue;
+				serverLogsSince = entry.i;
+				serverLogs.push(entry);
+			}
+			while (serverLogs.size() > MAX_LOG_ROWS) serverLogs.shift();
+			return {};
+		},
+		REFRESH,
+		"server logs",
+	);
+	trove.add(() => serverLogFeed.destroy());
+	/**
+	 * Modules > State: the server allows 36 queries then 12 a second per dev (`state.inspect`); every State pane spends
+	 * this stricter copy first and waits instead of getting "Slow down".
+	 */
+	const inspectBucket = new TokenBucket(30, 10);
+	/** Logs > Others: the server allows one `logs.player` per dev every 2 s, whichever pane asks. */
+	const playerLogGate = new Gate(2.2);
+
+	/** A pane's table `key` (created on first use). The first pane of a fresh layout keeps the old shared store `legacy`. */
+	const paneTable = <T extends object>(tab: TabContext, key: string, legacy?: string): T => {
+		let value = tab.paneState[key] as T | undefined;
+		if (value === undefined) {
+			value = tab.paneId === 1 && legacy !== undefined ? kernel.persist<T>(legacy, () => ({}) as T) : ({} as T);
+			tab.paneState[key] = value;
+		}
+		return value;
+	};
+	/** The Modules group's realm (Overview, State, Assets): per pane, so one pane can show the server and another the client. */
+	const modulesRealm = (tab: TabContext) => ({
+		realm: (): "server" | "client" => (tab.paneState.realm === "client" ? "client" : "server"),
+		setRealm: (realm: "server" | "client") => {
+			tab.paneState.realm = realm;
+		},
+	});
+
 	// Reload sound --------------------------------------------------------------------------------------------------
 	const effectiveChannel = (): unknown => {
 		if (kernel.channel !== undefined) return kernel.channel;
@@ -546,33 +689,40 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	};
 
 	// Modules > Overview: one realm at a time (Server | Client toolbar, like Logs), refreshed every REFRESH s: each module
-	// in load order with its init time, lifecycle hooks and dependencies. Server data comes from the "state" op, client
-	// data from this client (describeState). Modules > State is the state explorer (state-ui.ts).
-	let modulesRealm: "server" | "client" = "server";
+	// in load order with its init time, lifecycle hooks and dependencies. Server data comes from the "state" op (one
+	// shared feed for every pane), client data from this client (describeState). Modules > State is the state explorer
+	// (state-ui.ts). The realm is the pane's own.
 	const renderModulesView = (tab: TabContext, draw: (target: Page, summary: StateSummary) => void) => {
 		const bar = tab.toolbar();
 		const buttons = new Map<string, TextButton>();
 		const body = tab.page.group();
-		const refresh = () => {
-			for (const [realm, button] of buttons) paintSelected(button, realm === modulesRealm);
-			if (modulesRealm === "client") {
-				body.clear();
-				draw(body, describeState());
+		const { realm, setRealm } = modulesRealm(tab);
+		let realmTrove: Trove | undefined;
+		const start = () => {
+			if (realmTrove) tab.trove.remove(realmTrove);
+			const mine = tab.trove.extend();
+			realmTrove = mine;
+			for (const [name, button] of buttons) paintSelected(button, name === realm());
+			if (realm() === "client") {
+				every(mine, REFRESH, () => {
+					body.clear();
+					draw(body, describeState());
+				});
 				return;
 			}
-			const [ok, reply] = call("state");
-			if (modulesRealm !== "server") return;
-			body.clear();
-			if (ok && typeIs(reply, "table")) draw(body, reply as StateSummary);
-			else body.text(`Failed: ${str(reply)}`, COLORS.bad);
+			stateFeed.watch(mine, ({ ok, reply }) => {
+				body.clear();
+				if (ok && typeIs(reply, "table")) draw(body, reply as StateSummary);
+				else body.text(`Failed: ${str(reply)}`, COLORS.bad);
+			});
 		};
-		const pick = (realm: "server" | "client") => {
-			modulesRealm = realm;
-			spawnIn(tab.trove, refresh);
+		const pick = (name: "server" | "client") => {
+			setRealm(name);
+			start();
 		};
 		buttons.set("server", addButton(bar, "Server", () => pick("server")));
 		buttons.set("client", addButton(bar, "Client", () => pick("client")));
-		every(tab.trove, REFRESH, refresh);
+		start();
 	};
 	const renderModulesOverview = (tab: TabContext) =>
 		renderModulesView(tab, (target, summary) => {
@@ -587,16 +737,14 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				target.field(mod.name, parts.join("  ·  "));
 			}
 		});
-	// Modules > State: the live state explorer (state-ui.ts); open nodes, pages, filter and Auto survive swaps.
-	const stateExplorer = kernel.persist("typetorch/state-explorer", (): StateExplorerPersist => ({}));
+	// Modules > State: the live state explorer (state-ui.ts); open nodes, pages, filter and Auto are the pane's own (two
+	// State panes can show two modules) and survive swaps. Server queries spend the shared inspect budget first.
 	const renderModulesState = (tab: TabContext) =>
 		renderStateTab(tab, {
 			call,
-			realm: () => modulesRealm,
-			setRealm: (realm) => {
-				modulesRealm = realm;
-			},
-			persist: stateExplorer,
+			...modulesRealm(tab),
+			persist: paneTable<StateExplorerPersist>(tab, "state", "typetorch/state-explorer"),
+			budget: (cost) => inspectBucket.take(cost),
 		});
 
 	const renderArtifact = ({ page, trove: tabTrove }: TabContext) => {
@@ -691,8 +839,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		const migrateButton = migrateControl(tab, { kernel, call });
 		const body = page.group();
 		body.text("Loading...", COLORS.dim);
-		every(tabTrove, REFRESH, () => {
-			const [ok, reply] = call("status");
+		statusFeed.watch(tabTrove, ({ ok, reply }) => {
 			body.clear();
 			if (!ok || !typeIs(reply, "table")) {
 				body.text(str(reply), COLORS.bad);
@@ -753,10 +900,14 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		});
 	};
 
-	let logRealm: "server" | "client" | "other" = "server";
-	/** UserId whose client logs Logs > Others shows. */
-	let logPlayer: number | undefined;
-	const renderLogs = ({ page, trove: tabTrove, content, toolbar }: TabContext) => {
+	// Logs: the realm (Server | Client | Others) and the picked player are the pane's own. Server lines come from one
+	// shared feed (every Logs pane reads the same ring); Others asks through a gate shared by every pane (the server allows
+	// one request per dev every 2 s).
+	type LogRealm = "server" | "client" | "other";
+	const renderLogs = ({ page, trove: tabTrove, content, toolbar, paneState }: TabContext) => {
+		const logRealm = (): LogRealm => (paneState.logRealm === "client" || paneState.logRealm === "other" ? paneState.logRealm : "server");
+		/** UserId whose client logs Others shows. */
+		const logPlayer = (): number | undefined => (typeIs(paneState.logPlayer, "number") ? paneState.logPlayer : undefined);
 		const bar = toolbar();
 		const heading = page.text("", COLORS.accent);
 		heading.Font = Enum.Font.BuilderSansBold;
@@ -787,6 +938,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		let epoch = 0;
 		let lastOther = -math.huge;
 		let pickerTrove: Trove | undefined;
+		let realmTrove: Trove | undefined;
 
 		const setNote = (text: string) => {
 			note.Text = text;
@@ -794,15 +946,16 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		};
 		const realmButtons = new Map<string, TextButton>();
 		const highlight = () => {
-			for (const [realm, button] of realmButtons) paintSelected(button, realm === logRealm);
+			for (const [realm, button] of realmButtons) paintSelected(button, realm === logRealm());
 		};
 		const showHeading = () => {
-			if (logRealm !== "other" || logPlayer === undefined) {
+			const player = logPlayer();
+			if (logRealm() !== "other" || player === undefined) {
 				heading.Visible = false;
 				return;
 			}
-			const target = Players.GetPlayerByUserId(logPlayer);
-			heading.Text = `Logs: ${target ? target.DisplayName : `user ${logPlayer}`}`;
+			const target = Players.GetPlayerByUserId(player);
+			heading.Text = `Logs: ${target ? target.DisplayName : `user ${player}`}`;
 			heading.Visible = true;
 		};
 		const reset = () => {
@@ -814,32 +967,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			setNote("");
 		};
 
-		const fetch = () => {
-			const realm = logRealm;
-			const myEpoch = epoch;
-			let entries: LogEntry[];
-			if (realm === "client") {
-				entries = kernel.logs(since, 200);
-			} else if (realm === "server") {
-				const [ok, reply] = call("logs", since);
-				if (myEpoch !== epoch) return;
-				if (!ok || !typeIs(reply, "table")) {
-					setNote(`Logs: ${str(reply)}`);
-					return;
-				}
-				entries = reply as LogEntry[];
-			} else {
-				if (logPlayer === undefined || os.clock() - lastOther < OTHER_LOGS_REFRESH) return;
-				lastOther = os.clock();
-				const [ok, reply] = call("logs.player", { userId: logPlayer, since });
-				if (myEpoch !== epoch) return;
-				if (!ok || !typeIs(reply, "table")) {
-					setNote(typeIs(reply, "string") ? OTHER_LOG_ERRORS[reply] ?? `Failed: ${reply}` : "Failed");
-					return;
-				}
-				entries = reply as LogEntry[];
-			}
-			setNote("");
+		/** Adds the entries this pane hasn't shown yet. */
+		const append = (entries: LogEntry[]) => {
 			for (const entry of entries) {
 				if (entry.i <= since) continue;
 				since = entry.i;
@@ -852,8 +981,51 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			while (shown.size() > MAX_LOG_ROWS) shown.shift()?.Destroy();
 		};
 
+		/** Client and Others: this pane's own poll (Others through the shared gate). */
+		const fetch = () => {
+			const myEpoch = epoch;
+			let entries: LogEntry[];
+			if (logRealm() === "client") {
+				entries = kernel.logs(since, 200);
+			} else {
+				const player = logPlayer();
+				if (player === undefined || os.clock() - lastOther < OTHER_LOGS_REFRESH) return;
+				lastOther = os.clock();
+				playerLogGate.pass();
+				if (myEpoch !== epoch) return;
+				const [ok, reply] = call("logs.player", { userId: player, since });
+				if (myEpoch !== epoch) return;
+				if (!ok || !typeIs(reply, "table")) {
+					setNote(typeIs(reply, "string") ? OTHER_LOG_ERRORS[reply] ?? `Failed: ${reply}` : "Failed");
+					return;
+				}
+				entries = reply as LogEntry[];
+			}
+			setNote("");
+			append(entries);
+		};
+
+		/** (Re)starts this pane's source for its realm. */
+		const start = () => {
+			if (realmTrove) tabTrove.remove(realmTrove);
+			const mine = tabTrove.extend();
+			realmTrove = mine;
+			if (logRealm() === "server") {
+				append(serverLogs);
+				serverLogFeed.watch(mine, (value) => {
+					if (value.error !== undefined) {
+						setNote(`Logs: ${value.error}`);
+						return;
+					}
+					setNote("");
+					append(serverLogs);
+				});
+			} else every(mine, REFRESH, fetch);
+		};
+
 		const closePicker = () => {
-			pickerTrove?.clean();
+			if (pickerTrove) tabTrove.remove(pickerTrove);
+			pickerTrove = undefined;
 			picker.clear();
 		};
 		const openPicker = () => {
@@ -862,30 +1034,30 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			picker.text("Pick a player", COLORS.dim);
 			playerSelector(picker, pickerTrove, {
 				exclude: (player) => player === Players.LocalPlayer,
-				selected: logPlayer,
+				selected: logPlayer(),
 				emptyText: "No other players",
 				onSelect: (player) => {
-					logPlayer = player.UserId;
+					paneState.logPlayer = player.UserId;
 					closePicker();
 					reset();
 					showHeading();
-					spawnIn(tabTrove, fetch);
+					start();
 				},
 			});
 		};
 
-		const selectRealm = (realm: "server" | "client" | "other") => {
-			logRealm = realm;
+		const selectRealm = (realm: LogRealm) => {
+			paneState.logRealm = realm;
 			reset();
 			closePicker();
 			if (realm === "other") {
 				// The selector opens every time "Others" is pressed; the list is empty until a player is picked.
-				logPlayer = undefined;
+				paneState.logPlayer = undefined;
 				openPicker();
 			}
 			showHeading();
 			highlight();
-			spawnIn(tabTrove, fetch);
+			start();
 		};
 		realmButtons.set("server", addButton(bar, "Server", () => selectRealm("server")));
 		realmButtons.set("client", addButton(bar, "Client", () => selectRealm("client")));
@@ -898,14 +1070,16 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		const uploadButton = addButton(bar, "Upload", () => {
 			if (uploading) return;
 			let payload: Record<string, unknown>;
-			if (logRealm === "server") payload = { kind: "server" };
-			else if (logRealm === "client") {
+			const realm = logRealm();
+			const player = logPlayer();
+			if (realm === "server") payload = { kind: "server" };
+			else if (realm === "client") {
 				payload = {
 					kind: "client",
 					text: formatLogHistory(kernel.logs(undefined, 1000), CLIENT_UPLOAD_BYTES),
 					artifact: `${kernel.artifact.id}#${kernel.generation}`,
 				};
-			} else if (logPlayer !== undefined) payload = { kind: "player", userId: logPlayer };
+			} else if (player !== undefined) payload = { kind: "player", userId: player };
 			else {
 				setUpload("Pick a player", COLORS.dim);
 				return;
@@ -927,7 +1101,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		});
 		highlight();
 		showHeading();
-		if (logRealm === "other" && logPlayer === undefined) openPicker();
+		if (logRealm() === "other" && logPlayer() === undefined) openPicker();
 
 		// Newest at the bottom: follow new lines unless the player scrolled up.
 		let follow = true;
@@ -938,13 +1112,15 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		tabTrove.connect(content.GetPropertyChangedSignal("AbsoluteCanvasSize"), () => {
 			if (follow) content.CanvasPosition = new Vector2(0, bottom());
 		});
-		every(tabTrove, REFRESH, fetch);
+		start();
 	};
 
 	// Dex = the explorer (devtools/explorer). dexSelection feeds the Claude tab's "Dex path" context.
 	let dexSelection: string | undefined;
-	const explorerState = kernel.persist("typetorch/explorer", (): ExplorerPersist => ({}));
-	const renderDex = ({ trove: tabTrove, content }: TabContext) => {
+	// Two Dex panes (a client and a server tree side by side) keep their own realm, split and Auto; the last selection
+	// in any of them is the Claude tab's "Dex path". Server searches of two panes cancel each other (one per dev).
+	const renderDex = (tab: TabContext) => {
+		const { trove: tabTrove, content } = tab;
 		// The explorer scrolls by itself (virtualized tree), so it takes the content's place for this tab.
 		const host = tabTrove.add(
 			make("Frame", { Name: "Explorer", BackgroundTransparency: 1, Size: UDim2.fromScale(1, 1), LayoutOrder: 3 }),
@@ -967,7 +1143,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 					}),
 				canEdit: (realm) => realm === "client" || kernel.channel === "dev",
 				trove: tabTrove,
-				persist: explorerState,
+				persist: paneTable<ExplorerPersist>(tab, "explorer", "typetorch/explorer"),
 				onSelect: (realm, path) => {
 					dexSelection = path !== undefined ? `${realm} ${path}` : undefined;
 				},
@@ -975,29 +1151,19 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		);
 	};
 
-	const netHistory = new Map<string, [number, number, number]>();
+	// Network > Stats: one shared feed (op "net" plus this client's counters, rates worked out once per tick).
 	const renderNetwork = ({ page, trove: tabTrove }: TabContext) => {
 		page.text("Loading...", COLORS.dim);
-		const addStats = (realm: string, stats: NetStat[]) => {
+		const addStats = (realm: string, lines: NetLine[]) => {
 			page.section(realm === "server" ? "Server" : "Client");
-			if (stats.size() === 0) page.text("No traffic yet", COLORS.dim);
-			const now = os.clock();
-			for (const stat of stats) {
-				const key = `${realm}:${stat.path}`;
-				const line = statLine(stat, netHistory.get(key), now);
-				netHistory.set(key, [stat.inbound, stat.outbound, now]);
-				page.field(stat.path, line, stat.rejected > 0 || stat.errors > 0 ? COLORS.warn : COLORS.text);
-			}
+			if (lines.size() === 0) page.text("No traffic yet", COLORS.dim);
+			for (const stat of lines) page.field(stat.path, stat.line, stat.warn ? COLORS.warn : COLORS.text);
 		};
-		every(tabTrove, REFRESH, () => {
-			const [ok, reply] = call("net");
-			const client = new Array<NetStat>();
-			for (const [path, stat] of dispatcher.stats) client.push({ path, ...stat });
-			client.sort((a, b) => a.inbound + a.outbound > b.inbound + b.outbound);
+		netFeed.watch(tabTrove, (value) => {
 			page.clear();
-			if (ok && typeIs(reply, "table")) addStats("server", reply as NetStat[]);
-			else page.text(`Server: ${str(reply)}`, COLORS.bad);
-			addStats("client", client);
+			if (value.server) addStats("server", value.server);
+			else page.text(`Server: ${value.error ?? "-"}`, COLORS.bad);
+			addStats("client", value.client);
 		});
 	};
 
@@ -1350,20 +1516,14 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		Artifact: renderArtifact,
 		"Modules/Overview": renderModulesOverview,
 		"Modules/State": renderModulesState,
-		"Modules/Assets": (tab) =>
-			renderAssetsTab(tab, {
-				call,
-				realm: () => modulesRealm,
-				setRealm: (realm) => {
-					modulesRealm = realm;
-				},
-			}),
+		"Modules/Assets": (tab) => renderAssetsTab(tab, { call, ...modulesRealm(tab), feed: assetsFeed }),
 		"Server/Status": renderServer,
 		"Server/Branch": renderBranch,
 		...adminTabs({ kernel, call }),
 		Logs: renderLogs,
 		Dex: renderDex,
-		"Network/Packets": (tab) => renderNetworkInspector(tab, { kernel, dispatcher, call }),
+		"Network/Packets": (tab) =>
+			renderNetworkInspector(tab, { kernel, dispatcher, call, persist: paneTable(tab, "packets", "typetorch/netinspect") }),
 		"Network/Stats": renderNetwork,
 		Claude: renderClaude,
 	};
@@ -1371,11 +1531,24 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	// Window ----------------------------------------------------------------------------------------------------------
 
 	let ui: Ui | undefined;
-	let tabTrove: Trove | undefined;
+	let wm: WindowManager | undefined;
 	let isOpen = false;
 	let dev = false;
 	/** This player is an owner (framework 0.3.2: the Manage group shows only for owners). */
 	let owner = false;
+
+	// Panes and windows (layout.ts, panes.ts). A fresh join gets one pane on the remembered tab: the old single-page menu.
+	const KEYS = pageKeys();
+	const knownPage = (page: string) => RENDER[page] !== undefined && KEYS.includes(page);
+	const legacyPage = (): string => {
+		const name = TABS.includes(state.tab as TabName) ? (state.tab as TabName) : "Artifact";
+		const children = SUBTABS[name];
+		if (!children) return name;
+		const sub = subs[name];
+		return `${name}/${sub !== undefined && children.includes(sub) ? sub : children[0]}`;
+	};
+	const layout = sanitizeLayout(state.layout ?? newLayout(legacyPage()), knownPage, (page) => SINGLE_PAGES.has(page), FALLBACK_PAGE);
+	state.layout = layout;
 
 	/** Group headers' expand state and the active sub-tab (from state.tab and subs). */
 	const paintGroups = () => {
@@ -1394,22 +1567,18 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		}
 	};
 
-	const selectTab = (name: TabName, sub?: string) => {
-		if (!ui || !tabTrove) return;
-		tabTrove.clean();
+	/** The sidebar shows the focused pane's page (and remembers it as the menu's tab for older generations). */
+	const paintSidebar = (key: string | undefined) => {
+		if (!ui || key === undefined) return;
+		const [name, sub] = splitKey(key);
 		state.tab = name;
-		const body = ui.body;
-		const tabSubs = SUBTABS[name];
-		let key: string = name;
-		let chosen: string | undefined;
-		if (tabSubs) {
-			chosen = sub ?? subs[name];
-			if (chosen === undefined || !tabSubs.includes(chosen)) chosen = tabSubs[0];
-			subs[name] = chosen;
-			key = `${name}/${chosen}`;
+		if (sub !== undefined) {
+			subs[name] = sub;
+			openGroups.add(name);
+			saveOpenGroups();
 		}
-		// Sidebar: plain tabs fill when selected; a group header only tints (its active child fills). Groups stay open
-		// until their own header is clicked again (paintGroups).
+		// Plain tabs fill when selected; a group header only tints (its active child fills). Groups stay open until
+		// their own header is clicked again (paintGroups).
 		for (const [tab, button] of ui.tabButtons) {
 			const selected = tab === name;
 			if (ui.groups.has(tab)) {
@@ -1420,25 +1589,40 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				button.TextColor3 = selected ? COLORS.dark : COLORS.text;
 			}
 		}
-		if (tabSubs) {
-			openGroups.add(name);
-			saveOpenGroups();
-		}
 		paintGroups();
-		ui.content.CanvasPosition = Vector2.zero;
-		const page = Page.mount(ui.content);
+	};
+
+	/** The sidebar opens a page in the focused pane (a singleton already open elsewhere is focused instead). */
+	const selectTab = (name: TabName, sub?: string) => {
+		const tabSubs = SUBTABS[name];
+		let key: string = name;
+		if (tabSubs) {
+			let chosen = sub ?? subs[name];
+			if (chosen === undefined || !tabSubs.includes(chosen)) chosen = tabSubs[0];
+			key = `${name}/${chosen}`;
+		}
+		wm?.open(key);
+	};
+
+	/** Builds a page into a pane (panes.ts): the page column in the pane's content, toolbar and footer in its body. */
+	const mountPane = (pane: PaneTab) => {
+		const leaf = pane.leaf;
+		if (leaf.data === undefined) leaf.data = {};
+		const paneState = leaf.data;
+		const key = leaf.page;
+		const page = Page.mount(pane.content);
 		pad(page.frame, 10, 10);
-		tabTrove.add(page.frame);
+		pane.trove.add(page.frame);
 		const toolbar = () => {
-			const row = tabTrove!.add(buttonRow());
+			const row = pane.trove.add(buttonRow());
 			row.Name = "Toolbar";
 			row.LayoutOrder = 2;
 			pad(row, 6, 10);
-			row.Parent = body;
+			row.Parent = pane.body;
 			return row;
 		};
 		const footer = () => {
-			const frame = tabTrove!.add(
+			const frame = pane.trove.add(
 				make("Frame", {
 					Name: "Footer",
 					BackgroundTransparency: 1,
@@ -1449,24 +1633,53 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			);
 			pad(frame, 8, 10);
 			const footerPage = Page.mount(frame, 4);
-			frame.Parent = body;
+			frame.Parent = pane.body;
 			return footerPage;
 		};
 		const render = RENDER[key];
-		const [ok, err] = pcall(() => render({ page, trove: tabTrove!, content: ui!.content, toolbar, footer }));
+		if (render === undefined) {
+			page.text("Unknown page", COLORS.dim);
+			return;
+		}
+		if (splitKey(key)[0] === "Manage" && !owner) {
+			page.text("Owners only", COLORS.dim);
+			return;
+		}
+		const [ok, err] = pcall(() => render({ page, trove: pane.trove, content: pane.content, toolbar, footer, paneState, paneId: leaf.id }));
 		if (!ok) {
 			$warn(`[devtools] ${key} tab failed: ${err}`);
 			page.text(`This tab failed: ${err}`, COLORS.bad);
 		}
 	};
 
+	const paneHost: PaneHost = {
+		mount: mountPane,
+		title: (key) => {
+			const [name, sub] = splitKey(key);
+			return sub ?? name;
+		},
+		single: (key) => SINGLE_PAGES.has(key),
+		picks: () => {
+			const items = new Array<PickItem>();
+			for (const key of KEYS) {
+				const [name, sub] = splitKey(key);
+				if (name === "Manage" && !owner) continue;
+				items.push({ key, title: sub ?? name, group: sub !== undefined ? name : undefined });
+			}
+			return items;
+		},
+		fallback: () => FALLBACK_PAGE,
+		focused: paintSidebar,
+	};
+
+	/** Closing hides the main panel and every window; once gone, every pane unmounts (their loops stop). */
 	const close = () => {
 		if (!ui || !isOpen) return;
 		isOpen = false;
 		state.open = false;
-		const closing = tabTrove;
+		wm?.fadeOut();
 		popOut(ui.window, () => {
-			if (!isOpen) closing?.clean();
+			if (!isOpen) wm?.unmount();
 		});
 	};
 
@@ -1482,8 +1695,6 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				ZIndexBehavior: Enum.ZIndexBehavior.Sibling,
 			}),
 		);
-		tabTrove = trove.extend();
-
 		const toggle = style(make("TextButton", { Name: "Toggle", AutoButtonColor: true, Visible: false }, gui), "DEV", 16);
 		toggle.Font = Enum.Font.BuilderSansBold;
 		toggle.TextXAlignment = Enum.TextXAlignment.Center;
@@ -1491,6 +1702,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		toggle.BackgroundColor3 = COLORS.accent;
 		toggle.Size = UDim2.fromOffset(60, 36);
 		toggle.Position = UDim2.fromOffset(12, 70);
+		// Above every window (their ZIndex is their stacking order), under the page picker and the copy popup.
+		toggle.ZIndex = 800;
 		corner(toggle, 8);
 		toggle.Activated.Connect(() => (isOpen ? close() : open()));
 
@@ -1628,25 +1841,20 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			groups.set(name, { frame, collapsed, expanded, children: childButtons });
 		});
 
-		// Right of the tabs: [sub-tabs] [toolbar] [content] [footer]. The bars come and go with the tab; the content
-		// takes whatever height is left (UIFlexItem Fill), so toolbars and footers stay put while it scrolls.
-		const body = make(
+		// Right of the tabs: the main panel's panes (panes.ts). Each pane is [header] then [toolbar] [content] [footer]: the
+		// bars come and go with the page; the content takes whatever height is left (UIFlexItem Fill), so toolbars and
+		// footers stay put while it scrolls. Exact offsets, no UIPadding (divider drags measure this area), with a margin
+		// so scrollbars, buttons and fields never touch the window border.
+		const host = make(
 			"Frame",
 			{
 				Name: "Body",
 				BackgroundTransparency: 1,
-				Position: UDim2.fromOffset(TAB_WIDTH, HEADER),
-				Size: new UDim2(1, -TAB_WIDTH, 1, -HEADER),
+				Position: UDim2.fromOffset(TAB_WIDTH, HEADER + PANES_TOP),
+				Size: new UDim2(1, -(TAB_WIDTH + BODY_MARGIN), 1, -(HEADER + PANES_TOP + BODY_MARGIN)),
 			},
 			window,
 		);
-		verticalList(body, 0);
-		// Right/bottom margin, so scrollbars, buttons and fields never touch the window border.
-		make("UIPadding", { PaddingRight: new UDim(0, BODY_MARGIN), PaddingBottom: new UDim(0, BODY_MARGIN) }, body);
-		// No UIPadding on the ScrollingFrame itself: it shifts scale-width children without shrinking them, so they
-		// overflow the right edge. selectTab pads the Page inside it instead.
-		const content = scrolling(body, { Name: "Content", Size: UDim2.fromScale(1, 1), LayoutOrder: 3 });
-		make("UIFlexItem", { FlexMode: Enum.UIFlexMode.Fill }, content);
 
 		// Resize grip (bottom-right, touch-sized): two diagonal strokes.
 		const grip = make(
@@ -1683,6 +1891,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		}
 
 		gui.Parent = playerGui;
+		wm = createWindowManager({ gui, mainWindow: window, mainHost: host, trove, layout: () => layout, host: paneHost });
 
 		// Placement: drag by the header, resize by the grip, double-tap the header to reset. Saved across swaps.
 		const viewport = (): Vector2 => {
@@ -1762,7 +1971,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			if (mouseUp || input === drag.input) drag = undefined;
 		});
 
-		return { gui, toggle, window, body, content, tabButtons, groups };
+		return { gui, toggle, window, host, tabButtons, groups };
 	};
 
 	open = () => {
@@ -1772,8 +1981,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		isOpen = true;
 		state.open = true;
 		popIn(ui.window);
-		const remembered = TABS.includes(state.tab as TabName) ? (state.tab as TabName) : "Artifact";
-		selectTab(remembered === "Manage" && !owner ? "Artifact" : remembered);
+		// Every pane of the main panel and of the windows that aren't minimised mounts again (layout kept across swaps).
+		wm?.show();
 	};
 
 	const setDev = (value: boolean) => {
@@ -1799,17 +2008,18 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		const button = ui.tabButtons.get("Manage");
 		if (button) button.Visible = owner;
 		paintGroups();
-		if (!owner && isOpen && state.tab === "Manage") selectTab("Artifact");
+		// Panes on Manage pages switch to the default page when this player isn't (or is no longer) an owner.
+		if (!owner) wm?.replacePages((page) => (splitKey(page)[0] === "Manage" ? FALLBACK_PAGE : undefined));
 	};
 
 	const refreshDev = () => {
 		const [ok, info] = pcall(() => kernel.devStatus());
-		setDev(ok && typeIs(info, "table") && info.dev === true);
+		// Owner first, so a menu reopened after a swap mounts an owner's Manage panes instead of "Owners only".
 		const nowOwner = viewerIsOwner(kernel);
-		if (nowOwner !== owner || (ui && ui.tabButtons.get("Manage")?.Visible !== owner)) {
-			owner = nowOwner;
-			paintOwner();
-		}
+		const ownerChanged = nowOwner !== owner;
+		owner = nowOwner;
+		setDev(ok && typeIs(info, "table") && info.dev === true);
+		if (ownerChanged || (ui && ui.tabButtons.get("Manage")?.Visible !== owner)) paintOwner();
 	};
 
 	paintBadges = () => {
@@ -1818,9 +2028,10 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		const serverTab = ui.tabButtons.get("Server");
 		if (serverTab) paintDot(serverTab, healthLevel, new UDim2(1, -18, 0.5, 0), new Vector2(1, 0.5));
 	};
-	// The Status page refreshes health while it's open; otherwise poll slowly (status is an in-memory kernel read).
+	// A Server > Status pane refreshes health while it shows (the shared status feed); otherwise poll slowly (status is
+	// an in-memory kernel read).
 	every(trove, HEALTH_INTERVAL, () => {
-		if (!dev || (isOpen && state.tab === "Server")) return;
+		if (!dev || statusFeed.active()) return;
 		const [ok, reply] = call("status");
 		if (ok && typeIs(reply, "table")) setHealth(checkHealth((reply as StatusReply).server, (reply as StatusReply).facts));
 	});

@@ -406,17 +406,22 @@ function checkbox(page: Page, label: string, get: () => boolean, set: (on: boole
  * so two cards never overlap; pops through a UIScale. Each card has its own trove inside the tab trove. A card grows
  * with its content up to the tab body's height, then scrolls (script-free: AutomaticSize + AutomaticCanvasSize), so a
  * tall card (Load a build) never runs off a phone screen.
+ *
+ * The queue is shared by every pane (the dev menu can show several pages at once): a card waits for the one open in
+ * another pane. A card whose pane closes counts as closed, so the queue never stalls.
  */
-class Cards {
-	private readonly queue = new PopupQueue();
+const cardQueue = new PopupQueue();
 
+class Cards {
 	constructor(private readonly tab: AdminTab) {}
 
 	open(build: (card: Page, close: () => void, cardTrove: Trove) => void) {
-		this.queue.enqueue((done) => {
+		cardQueue.enqueue((done) => {
 			const [host, area] = hostOf(this.tab);
 			if (!area.Parent) return done();
 			const cardTrove = this.tab.trove.extend();
+			// Deferred: the next card may belong to a pane whose trove is cleaning right now.
+			cardTrove.add(() => task.defer(done));
 			const overlay = cardTrove.add(
 				make("TextButton", {
 					Name: "ManageCard",

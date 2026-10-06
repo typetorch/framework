@@ -56,6 +56,11 @@ export interface StateTabOptions {
 	realm: () => Realm;
 	setRealm: (realm: Realm) => void;
 	persist: StateExplorerPersist;
+	/**
+	 * Spends `cost` queries of the client's copy of the server's per-dev budget, waiting until they are there (client.ts
+	 * shares one bucket between every State pane, so two auto-refreshing panes never get "Slow down").
+	 */
+	budget?: (cost: number) => void;
 }
 
 const ERRORS: Record<string, string> = {
@@ -357,6 +362,8 @@ export function renderStateTab(tab: StateTab, options: StateTabOptions) {
 		} else {
 			for (let from = 0; from < queries.size(); from += STATE_MAX_QUERIES) {
 				const batch = queries.filter((_, index) => index >= from && index < from + STATE_MAX_QUERIES);
+				options.budget?.(batch.size());
+				if (options.realm() !== realm) return;
 				const [ok, reply] = options.call("state.inspect", { queries: batch });
 				if (options.realm() !== realm) return;
 				if (!ok || !typeIs(reply, "table")) {
