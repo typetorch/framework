@@ -69,7 +69,7 @@ export interface FlameworkServerCallback<A extends unknown[], R> {
 /** Client view of a client -> server request (Flamework's functions `ClientSender`). Calling the leaf is `invoke`. */
 export interface FlameworkClientRequest<A extends unknown[], R> {
 	(...args: A): Promise<R>;
-	/** Rejects when the server doesn't answer in time: the leaf's `timeout`, else `defaultTimeout`, else 15 s. */
+	/** Rejects when the server doesn't answer in time: the leaf's `timeout`, else `defaultTimeout`, else 30 s (Flamework's). */
 	invoke(...args: A): Promise<R>;
 	/** `invoke` that gives up after `timeout` SECONDS (0.5 to 120; outside that it is clamped, with one warning). */
 	invokeWithTimeout(timeout: number, ...args: A): Promise<R>;
@@ -119,7 +119,7 @@ export interface FlameworkCompatConfig {
 	disableIncomingGuards?: boolean;
 	/** Ignored: the dev menu's Network > Packets shows every refused message. */
 	warnOnInvalidGuards?: boolean;
-	/** Functions, `createClient`: seconds an `invoke` waits when its leaf has no `timeout` (else 15). */
+	/** Functions, `createClient`: seconds an `invoke` waits when its leaf has no `timeout` (else 30, Flamework's client default). */
 	defaultTimeout?: number;
 }
 
@@ -239,6 +239,9 @@ class ServerFunctionLeaf {
 	}
 }
 
+/** Flamework's client request timeout when createClient gets none (createNetwork's own default is 15 s). */
+const FLAMEWORK_CLIENT_TIMEOUT = 30;
+
 /** Flamework `createClient({ defaultTimeout })`, shared by every request leaf of one compat network. */
 interface RequestSettings {
 	defaultTimeout?: number;
@@ -251,7 +254,7 @@ class ClientFunctionLeaf {
 		private readonly settings: RequestSettings,
 	) {}
 	invoke(...args: unknown[]): Promise<unknown> {
-		const seconds = registeredLimits.get(this.path)?.timeout === undefined ? this.settings.defaultTimeout : undefined;
+		const seconds = registeredLimits.get(this.path)?.timeout === undefined ? (this.settings.defaultTimeout ?? FLAMEWORK_CLIENT_TIMEOUT) : undefined;
 		return clientDispatcher().invoke(this.path, args, seconds);
 	}
 	invokeWithTimeout(timeout: number, ...args: unknown[]): Promise<unknown> {

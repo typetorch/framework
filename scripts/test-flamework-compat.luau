@@ -852,6 +852,19 @@ check("calling a request leaf is invoke", callRequest[1] == "r:Shop.buy" and cal
 cdispatcher.dispatch(cgen.netRuntime.RESPONSE, callRequest[2], true, { "ok" })
 check("the call's Promise resolves", called:getStatus() == "Resolved")
 
+-- Without createClient({ defaultTimeout }) a request waits Flamework's client default, 30 s (createNetwork: 15 s).
+local delays = {}
+local harnessDelay = task.delay
+task.delay = function(seconds, ...)
+	table.insert(delays, seconds)
+	return harnessDelay(seconds, ...)
+end
+local waiting = pending(ClientFunctions.Spin.requestSpin:invoke())
+task.delay = harnessDelay
+check("a request without a timeout waits Flamework's 30 s", delays[1] == 30, delays[1])
+cdispatcher.dispatch(cgen.netRuntime.RESPONSE, clientSent[#clientSent][2], true, { 1 })
+check("(and resolves when answered)", waiting:getStatus() == "Resolved")
+
 ccompat.GlobalFunctions:createClient({ defaultTimeout = 0.6 })
 cgen.fw.setNetworkLimits({ ["Shop.slow"] = { timeout = 5 } })
 local byDefault = pending(ClientFunctions.Spin.requestSpin:invoke())
