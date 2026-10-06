@@ -68,7 +68,7 @@ interfaces and `createNetwork` are the same.
 | `import type` + `Dependency<T>()` to break a cycle | the same, or `Lazy<T>` (below) |
 | `ClientEvents.x.predict(...)` | `network.client.x.emit(...)` |
 | `invokeWithTimeout(timeout, ...)` | `invokeWithTimeout(seconds, ...)` (seconds, 0.5 to 120) |
-| `Observers.observeCharacter` / `observeLocalCharacter` (@rbxts/observers) | `observeCharacters(trove, ...)` / `observeLocalCharacter(trove, ...)` |
+| `Observers.observeCharacter` / `observeLocalCharacter` (@rbxts/observers) | still fine: put the stop function in the trove, `this.trove.add(observeCharacter(...))` |
 | `import { t } from "@rbxts/t"` (still fine) | also `import { t } from "@typetorch/framework"` |
 | `@metadata flamework:parameters` keys, `"flamework:parameters"` metadata | `@metadata typetorch:parameters`, `"typetorch:parameters"` |
 | `flamework.build`, `include/flamework`, the `@flamework` Rojo mapping | gone; delete them |
@@ -117,9 +117,6 @@ export class CoinService extends Module implements OnStart {
 - **Per-player state:** `this.ctx.playerState("cooldowns.v1", (player) => init)` (or `TypeTorch.playerState`) returns
   `{ get, set, has, delete }` keyed by UserId. It survives swaps (persist), and a player's entry goes when they really
   leave, never on a swap. The dev menu shows it under Modules > State > persist, `__playerState`.
-- **Characters:** `observeCharacters(trove, (player, character, characterTrove) => ...)` and, on the client,
-  `observeLocalCharacter(trove, (character, characterTrove) => ...)`. Both replay characters that already exist (after
-  a swap too); `characterTrove` is cleaned when that character goes (respawn, removal, leave) or `trove` is cleaned.
 - **Bad deploys roll back (kernel 0.3.2):** a server `onStart` that throws is reported to the kernel, which rolls the
   server back to its last known good artifact when it happens within 30 s of start (so do 3 errors from the new
   code's scripts in that time). On a real shutdown every module's `onStop` runs too (the kernel's BindToClose).
@@ -428,7 +425,7 @@ bun run build   # rbxtsc --type package -> out/
   `scripts/test-modules.luau` runs the real `startServer`/`startClient` of `out/` (with RuntimeLib, Promise, trove and
   t from node_modules) over several generations that share a persist store: `Dependency<T>()`, `TypeTorch.module` /
   `tryModule` and their errors, `Lazy<T>` (parameters and fields, cycles, start order), network `emit` and request
-  timeouts, `playerState` (swaps, leaves) and `observeCharacters` / `observeLocalCharacter`.
+  timeouts and `playerState` (swaps, leaves).
   `scripts/test-analytics.luau` checks the analytics engine's pure parts (experiment assignment, settings, the queue
   and HTTP budget, tt-rec-1, the sink request bodies); `test-analytics-server.luau` and `test-analytics-client.luau`
   run the compiled server and client cores against mocked services (sessions, intake, retries, a swap with a request

@@ -29,7 +29,6 @@ export type { PlayerState } from "./runtime/player-state";
 export { TypeTorch } from "./typetorch";
 export type { BranchChange, TypeTorchApi, TypeTorchFeatures } from "./typetorch";
 export { observePlayers } from "./players";
-export { observeCharacters, observeLocalCharacter } from "./characters";
 export { createNetwork, setNetworkLimits } from "./net";
 export type {
 	ClientNetwork,

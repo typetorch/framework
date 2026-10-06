@@ -11,7 +11,6 @@
 --     bounds;
 --   - ctx.playerState / TypeTorch.playerState: persisted across swaps, removed on a real leave (never on a swap), pruned
 --     when a player left between generations;
---   - observeCharacters / observeLocalCharacter: replay (after a swap too), respawns, removal, leaves, trove-bound.
 -- It runs the real startServer/startClient of out/ (with real RuntimeLib, Promise, trove and t from node_modules) in an
 -- emulated tree, one fresh copy per generation (one require cache, as on Roblox), with stub kernels that share a
 -- persist store across generations. Not Roblox: mocked Players, characters and signals, inert stand-ins for the rest.
@@ -514,7 +513,7 @@ local function newGeneration(realm: string)
 		limits = TS.import(server, out, "net", "limits"),
 		Trove = TS.import(out, TS.getModule(out, "@rbxts", "trove").out).Trove,
 		modules = newNode("Folder", "modules", server),
-		record = { initOrder = {}, characters = {}, cleaned = {} },
+		record = { initOrder = {} },
 	}
 end
 
@@ -652,7 +651,6 @@ local ids = {
 	team = "server/services/team@TeamService",
 	pvp = "server/services/pvp@PvpService",
 	cooldown = "server/services/cooldown@CooldownService",
-	characters = "server/services/characters@CharacterService",
 	hud = "client/controllers/hud@HudController",
 	missingClient = "client/controllers/menu@MenuController",
 	missingServer = "server/services/vault@VaultService",
@@ -758,18 +756,6 @@ local function serverGame(gen)
 			end,
 		}
 	end)
-	addModule(gen, "CharacterService", ids.characters, {}, function()
-		return {
-			onStart = function(self)
-				fw.observeCharacters(self.trove, function(player, character, characterTrove)
-					table.insert(rec.characters, `{player.Name}:{character.Name}`)
-					characterTrove:add(function()
-						table.insert(rec.cleaned, character.Name)
-					end)
-				end)
-			end,
-		}
-	end)
 	-- A client controller that shared code loaded on the server (registered, but for the client).
 	addModule(gen, "HudController", ids.hud, {}, function()
 		return {}
@@ -816,8 +802,6 @@ if ok1 then
 	local stores = serverStore.__playerState
 	check("playerState: kept in the persist store under __playerState, by store and UserId", stores ~= nil and stores["cooldowns.v1"][alice.UserId] == first)
 	check("playerState: the dev menu's State explorer sees it (persist keys)", gen1.registry.persistKeys.__playerState == stores)
-	-- observeCharacters through a module's onStart.
-	check("observeCharacters: replays the characters already spawned", table.find(rec1.characters, "Alice:Alice#1") ~= nil and table.find(rec1.characters, "Carol:Carol#1") ~= nil and #rec1.characters == 2, table.concat(rec1.characters, ","))
 end
 check("gen 1: nothing raised in module threads", #threadErrors == 0, threadErrors[1])
 
@@ -986,7 +970,6 @@ end
 -- Generation 1 stops (a swap) ------------------------------------------------------------------------------------------
 
 do
-	local cleanedBefore = #rec1.cleaned
 	gen1.stop({ reason = "deploy" })
 	realTask.wait()
 	check("swap: onStop can still use Dependency<T>()", rec1.stopSeesData == true)
@@ -996,7 +979,6 @@ do
 		return rec1.pvpLazy:get()
 	end)
 	check("after its generation stopped, a kept Lazy<T>.get() fails clearly", has(stoppedLazy, "Lazy<ItemService>.get(): the generation that ran ItemService has stopped"), stoppedLazy)
-	check("swap: character troves are cleaned with the module trove", #rec1.cleaned - cleanedBefore == 2, #rec1.cleaned - cleanedBefore)
 	local store = serverStore.__playerState["cooldowns.v1"]
 	check("swap: playerState entries stay (no one left)", store[alice.UserId] ~= nil and store[bob.UserId] ~= nil and store[carol.UserId] ~= nil)
 end
@@ -1013,7 +995,6 @@ if ok2 then
 	check("after a swap Dependency<T>() returns the new generation's instance", rec2.helperData == data2.instance and data2.instance ~= data1.instance)
 	check("after a swap TypeTorch.module<T>() too", rec2.moduleData == data2.instance)
 	check("gen 1's framework still refuses (never the new generation's module)", catch(gen1.fw.Dependency, ids.data) ~= nil)
-	check("after a swap observeCharacters replays the existing characters", #rec2.characters == 2 and table.find(rec2.characters, "Alice:Alice#1") ~= nil, table.concat(rec2.characters, ","))
 	local cooldowns = rec2.cooldowns
 	check("after a swap playerState has the same values", cooldowns:get(alice).n == 1 and cooldowns:get(bob).n == 5)
 
@@ -1035,67 +1016,6 @@ if ok2 then
 	cooldowns:delete(bob)
 	check("delete and has", not cooldowns:has(bob) and store[bob.UserId] == nil)
 	cooldowns:set(bob, { n = 7, who = "Bob" })
-	check("gen 2: the leave cleaned Alice's character trove", table.find(rec2.cleaned, "Alice#1") ~= nil)
-end
-
--- Server emit and observeCharacters directly (generation 2) ------------------------------------------------------------
-
-do
-	local trove = gen2.Trove.new()
-	local seen, cleaned = {}, {}
-	gen2.fw.observeCharacters(trove, function(player, character, characterTrove)
-		table.insert(seen, `{player.Name}:{character.Name}`)
-		characterTrove:add(function()
-			table.insert(cleaned, character.Name)
-		end)
-	end)
-	realTask.wait()
-	check("observeCharacters: only spawned characters (Bob has none yet)", #seen == 1 and seen[1] == "Carol:Carol#1", table.concat(seen, ","))
-	respawn(bob)
-	realTask.wait()
-	check("observeCharacters: a first spawn", seen[2] == "Bob:Bob#1", seen[2])
-	respawn(carol)
-	realTask.wait()
-	check("observeCharacters: a respawn cleans the old character's trove and calls back for the new one", table.find(cleaned, "Carol#1") ~= nil and seen[3] == "Carol:Carol#2")
-	-- The model leaves the game without CharacterRemoving (game code destroyed it).
-	local carolNow = carol.Character
-	carolNow.Parent = nil
-	carolNow.AncestryChanged:Fire(carolNow, nil)
-	realTask.wait()
-	check("observeCharacters: a character removed from the game is cleaned", table.find(cleaned, "Carol#2") ~= nil)
-	local dave = newPlayer("Dave", true)
-	join(dave)
-	realTask.wait()
-	check("observeCharacters: a joining player's character", table.find(seen, "Dave:Dave#1") ~= nil)
-	leave(dave)
-	realTask.wait()
-	check("observeCharacters: a leave cleans the character", table.find(cleaned, "Dave#1") ~= nil)
-	-- A callback that yields while its character goes: what it adds afterwards is cleaned when it returns. Bob#1 is
-	-- replayed, then two respawns while every callback waits: Bob#1 and Bob#2 go, Bob#3 stays.
-	local lateTrove = gen2.Trove.new()
-	local lateCleaned = 0
-	gen2.fw.observeCharacters(lateTrove, function(player, character, characterTrove)
-		if player ~= bob then
-			return
-		end
-		realTask.wait(0.05)
-		characterTrove:add(function()
-			lateCleaned += 1
-		end)
-	end)
-	respawn(bob)
-	respawn(bob)
-	realTask.wait(0.15)
-	check("observeCharacters: a yielding callback's late additions are cleaned once its character is gone (2 of 3)", lateCleaned == 2, lateCleaned)
-	lateTrove:destroy()
-	check("observeCharacters: the live character's late addition stays until its trove is cleaned", lateCleaned == 3, lateCleaned)
-	trove:destroy()
-	local before = #seen
-	respawn(carol)
-	realTask.wait()
-	check("observeCharacters: cleaning the trove cleans every character and stops listening", #seen == before and table.find(cleaned, "Bob#3") ~= nil, table.concat(cleaned, ","))
-	local serverLocal = catch(gen2.fw.observeLocalCharacter, gen2.Trove.new(), function() end)
-	check("observeLocalCharacter on the server: a clear error", has(serverLocal, "observeLocalCharacter is client-only"), serverLocal)
 end
 
 -- Generation 3: a player left between generations (no one listened) ---------------------------------------------------
@@ -1128,7 +1048,7 @@ do
 	end
 end
 
--- Client generation: Dependency on the client, emit, invokeWithTimeout, observeLocalCharacter ------------------------
+-- Client generation: Dependency on the client, emit, invokeWithTimeout ------------------------------------------------
 
 local me = newPlayer("Me", true)
 Players.LocalPlayer = me
@@ -1214,24 +1134,6 @@ if okC then
 	check("timeout: no setting is 15 s; a leaf's setting is used", requestTimeout("lb.update") == 15 and requestTimeout("vc.spawn") == 0.6)
 	check("DEFAULT_LIMITS.timeout is 15 s", cgen.limits.DEFAULT_LIMITS.timeout == 15)
 
-	-- observeLocalCharacter.
-	local trove = cgen.Trove.new()
-	local seen, cleaned = {}, {}
-	cgen.fw.observeLocalCharacter(trove, function(character, characterTrove)
-		table.insert(seen, character.Name)
-		characterTrove:add(function()
-			table.insert(cleaned, character.Name)
-		end)
-	end)
-	realTask.wait()
-	check("observeLocalCharacter: replays the current character", seen[1] == "Me#1")
-	respawn(me)
-	realTask.wait()
-	check("observeLocalCharacter: a respawn cleans the old one and calls back for the new one", seen[2] == "Me#2" and cleaned[1] == "Me#1")
-	trove:destroy()
-	respawn(me)
-	realTask.wait()
-	check("observeLocalCharacter: trove-bound (cleaned, then silent)", cleaned[2] == "Me#2" and #seen == 2)
 	cgen.stop()
 	local stoppedClient = catch(network.client.notify.error.emit, network.client.notify.error, "x")
 	check("client emit after the generation stopped: networking is gone (clear assert)", has(stoppedClient, "only available on a running client"), stoppedClient)
