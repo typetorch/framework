@@ -120,6 +120,17 @@ export class CoinService extends Module implements OnStart {
   logs (server, own client, other players' clients), client and server dex, network stats, module state, a branch and
   build picker (Server > Branch) and a Claude prompt. Prod-channel servers are read-only. The window can be dragged by
   its header and resized from its corner (double-tap the header to reset).
+- **Panes and windows (dev menu):** every page shows in a pane with a small header: tap the title to pick another
+  page, or use Split right, Split down, Open in new window and Close. Drag the line between two panes to resize them.
+  The sidebar opens pages in the focused pane (the highlighted one; tap a pane to focus it). Floating windows move by
+  their title bar and resize from their corner (double-tap the title bar to maximise); their title bar also has
+  Minimise, Dock (back into the main panel) and Close. Windows can be split too. The layout, the windows and each
+  pane's own settings (for example the open nodes of two Modules > State panes) survive swaps; a fresh join starts
+  with one pane. Claude, Server > Branch and the Manage pages open once (picking them again focuses their pane); every
+  other page can be open several times. Panes nobody sees (menu closed, window minimised) stop refreshing, and panes
+  on the same data share one request (Status, Overview, Assets, Network > Stats, server Logs, Packets); State panes
+  share one query budget. On phones and small screens panes only stack (two at most), and windows open maximised with
+  one pane each.
 - **State explorer (Modules > State, Server | Client):** every live module of the running generation (services on the
   server, controllers on the client) and the persist store. Tap a row to open it: the module's own fields (not its
   methods), then tables, arrays, Maps and Sets, 100 entries per page (Prev / Next). Each value has a short preview:
@@ -367,6 +378,8 @@ bun run build   # rbxtsc --type package -> out/
   `scripts/test-state-inspect.luau` checks the state explorer's core (previews, raw reads only, cycles, paging,
   Maps/Sets with Instance keys, the depth limit, filters, request validation) and that `src/version.ts` matches
   package.json.
+  `scripts/test-layout.luau` checks the dev menu's pane layout core (`devtools/layout.ts`: splits and their limits,
+  closing, pop out and dock, singleton pages, ratios, focus, and cleaning a remembered layout).
   `scripts/test-analytics.luau` checks the analytics engine's pure parts (experiment assignment, settings, the queue
   and HTTP budget, tt-rec-1, the sink request bodies); `test-analytics-server.luau` and `test-analytics-client.luau`
   run the compiled server and client cores against mocked services (sessions, intake, retries, a swap with a request

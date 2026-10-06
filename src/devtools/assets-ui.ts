@@ -36,6 +36,13 @@ export interface AssetsTabOptions {
 	/** The Modules group's realm (shared with Overview and State). */
 	realm: () => "server" | "client";
 	setRealm: (realm: "server" | "client") => void;
+	/**
+	 * The "assets" op as a feed shared by every Assets pane (client.ts): one request per tick however many panes show
+	 * the server realm. Without it, the tab polls on its own.
+	 */
+	feed?: {
+		watch: (trove: Trove, listener: (value: { ok: boolean; reply: unknown }) => void) => void;
+	};
 }
 
 function statusRow(target: Page, status: AssetStatus) {
@@ -97,32 +104,46 @@ export function renderAssetsTab(tab: AssetsTab, options: AssetsTabOptions) {
 	const bar = tab.toolbar();
 	const buttons = new Map<string, TextButton>();
 	const body = tab.page.group();
-	const refresh = () => {
-		for (const [realm, button] of buttons) paintSelected(button, realm === options.realm());
-		if (options.realm() === "client") {
-			body.clear();
-			drawClient(body);
-			return;
-		}
-		const [ok, reply] = options.call("assets");
-		if (options.realm() !== "server") return;
+	const drawReply = (ok: boolean, reply: unknown) => {
 		body.clear();
 		if (ok && typeIs(reply, "table")) drawServer(body, reply as AssetSyncReport);
 		else body.text(`Failed: ${tostring(reply)}`, COLORS.bad);
 	};
+	let realmTrove: Trove | undefined;
+	/** (Re)starts the source for the pane's realm: the client's own copies, or the server's report (shared feed). */
+	const start = () => {
+		if (realmTrove) tab.trove.remove(realmTrove);
+		const mine = tab.trove.extend();
+		realmTrove = mine;
+		for (const [realm, button] of buttons) paintSelected(button, realm === options.realm());
+		const feed = options.feed;
+		if (options.realm() === "server" && feed) {
+			feed.watch(mine, ({ ok, reply }) => drawReply(ok, reply));
+			return;
+		}
+		mine.add(
+			task.spawn(() => {
+				while (true) {
+					const [ok, err] = pcall(() => {
+						if (options.realm() === "client") {
+							body.clear();
+							drawClient(body);
+							return;
+						}
+						const [fine, reply] = options.call("assets");
+						if (options.realm() === "server") drawReply(fine, reply);
+					});
+					if (!ok) $warn(`[devtools] assets refresh failed: ${err}`);
+					task.wait(REFRESH);
+				}
+			}),
+		);
+	};
 	const pick = (realm: "server" | "client") => {
 		options.setRealm(realm);
-		tab.trove.add(task.spawn(refresh));
+		start();
 	};
 	buttons.set("server", addButton(bar, "Server", () => pick("server")));
 	buttons.set("client", addButton(bar, "Client", () => pick("client")));
-	tab.trove.add(
-		task.spawn(() => {
-			while (true) {
-				const [ok, err] = pcall(refresh);
-				if (!ok) $warn(`[devtools] assets refresh failed: ${err}`);
-				task.wait(REFRESH);
-			}
-		}),
-	);
+	start();
 }

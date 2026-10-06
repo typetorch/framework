@@ -33,7 +33,12 @@ import {
  *
  * The list is virtualized (a pool of row slots over a ScrollingFrame whose CanvasSize this file sets, like the
  * explorer tree); everything else is script-free. A row opens its pretty-printed payload. "Block" (client realm,
- * dev-channel servers) drops one path's messages on this client until the tab closes.
+ * dev-channel servers) drops one path's messages on this client until the last Packets pane closes.
+ *
+ * **Several panes share one feed** (plans/10 "Panes and windows"): one client capture and one server poll (the server
+ * refuses polls closer than 0.5 s per dev, and `net.stop` ends that dev's capture for every pane), with the rows kept
+ * once per realm. Each pane has its own realm, filters, player, Pause (it freezes that pane; the feed stops when every
+ * pane is paused) and Clear (it hides older rows in that pane only). The player filter works on the client.
  */
 
 type Realm = "client" | "server";
@@ -53,6 +58,8 @@ export interface InspectorDeps {
 	readonly dispatcher: ClientDispatcher;
 	/** One dev op on the server; yields until it answers. */
 	readonly call: (op: string, payload?: unknown) => [ok: boolean, result: unknown];
+	/** This pane's remembered realm and filters (client.ts: per pane); defaults to one shared persist store. */
+	readonly persist?: object;
 }
 
 /** Remembered across swaps (kernel persist store). */
@@ -72,6 +79,8 @@ interface View {
 	session?: string;
 	skipped: number;
 	dropped: number;
+	/** Bumped when the rows start over (a new server tap): panes reset their Clear point and selection. */
+	resets: number;
 }
 
 interface Slot {
@@ -115,11 +124,177 @@ const STATUS_COLORS: Record<PacketStatus, Color3> = {
 const DIRECTION_LABELS: Record<Direction, string> = { both: "In+Out", in: "In", out: "Out" };
 const NEXT_DIRECTION: Record<Direction, Direction> = { both: "in", in: "out", out: "both" };
 
-// Per generation (this module is required fresh by every generation): the client capture and both views survive tab
-// switches, so reopening the tab shows what was there.
+// The shared feed ----------------------------------------------------------------------------------------------------
+// Per generation (this module is required fresh by every generation): the client capture and both views survive pane
+// closes, so reopening the page shows what was there.
 let clientTap: PacketTap | undefined;
-const newView = (): View => ({ rows: [], cursor: 0, skipped: 0, dropped: 0 });
+const newView = (): View => ({ rows: [], cursor: 0, skipped: 0, dropped: 0, resets: 0 });
 const views: Record<Realm, View> = { client: newView(), server: newView() };
+
+/** A Packets pane watching the feed. */
+interface Watcher {
+	realm: () => Realm;
+	paused: () => boolean;
+	/** New rows, a restart or a problem in `realm`. */
+	changed: (realm: Realm) => void;
+}
+const watchers = new Set<Watcher>();
+let feedThread: thread | undefined;
+let feedDeps: InspectorDeps | undefined;
+let serverWatching = false;
+/** Bumped when the server poll stops: a reply still on its way is dropped. */
+let pollEpoch = 0;
+let lastPoll = -math.huge;
+let lastDropped = 0;
+/** The server poll's last problem and the server's channel (every server pane shows them). */
+let serverProblem: string | undefined;
+let serverChannel: string | undefined;
+
+function notify(realm: Realm) {
+	for (const watcher of [...watchers]) {
+		if (watcher.realm() !== realm) continue;
+		const [ok, err] = pcall(() => watcher.changed(realm));
+		if (!ok) $warn(`[devtools] packets pane failed: ${err}`);
+	}
+}
+
+function anyActive(): boolean {
+	for (const watcher of watchers) if (!watcher.paused()) return true;
+	return false;
+}
+
+function wantsServer(): boolean {
+	for (const watcher of watchers) if (!watcher.paused() && watcher.realm() === "server") return true;
+	return false;
+}
+
+function appendRows(view: View, rows: Row[]) {
+	for (const row of rows) view.rows.push(row);
+	const extra = view.rows.size() - PACKET_CAPACITY;
+	if (extra <= 0) return;
+	const kept = new Array<Row>();
+	for (let index = extra; index < view.rows.size(); index++) kept.push(view.rows[index]);
+	view.rows = kept;
+}
+
+function restartServerView() {
+	const view = views.server;
+	view.rows = [];
+	view.cursor = 0;
+	view.skipped = 0;
+	view.resets += 1;
+}
+
+/** Ends this dev's server capture (no pane wants it). Not in a trove: it must still go out while the last pane closes. */
+function stopServer() {
+	if (!serverWatching) return;
+	serverWatching = false;
+	pollEpoch += 1;
+	const call = feedDeps?.call;
+	if (call) task.spawn(() => call("net.stop"));
+}
+
+function pollServer(call: InspectorDeps["call"]) {
+	const view = views.server;
+	const mine = pollEpoch;
+	serverWatching = true;
+	const [ok, reply] = call("net.packets", { since: view.cursor });
+	if (mine !== pollEpoch) return;
+	if (!ok || !typeIs(reply, "table")) {
+		if (reply !== "rate_limited") {
+			serverProblem = `Server: ${tostring(reply)}`;
+			notify("server");
+		}
+		return;
+	}
+	serverProblem = undefined;
+	const page = reply as PacketPage;
+	serverChannel = page.channel;
+	if (view.session !== page.session) {
+		const restarted = view.session !== undefined && view.cursor > 0;
+		view.session = page.session;
+		if (restarted) {
+			// The server swapped (a new ring): start over next poll.
+			restartServerView();
+			notify("server");
+			return;
+		}
+	}
+	view.cursor = page.next;
+	view.skipped += page.skipped;
+	view.dropped = page.dropped;
+	if (page.packets.size() > 0) appendRows(view, page.packets);
+	notify("server");
+}
+
+function pullLocal(tap: PacketTap) {
+	const view = views.client;
+	const [records, cursor, skipped] = tap.since(view.cursor, PACKET_CAPACITY);
+	view.cursor = cursor;
+	view.skipped += skipped;
+	if (records.size() > 0) appendRows(view, records);
+	if (records.size() > 0 || tap.dropped !== lastDropped) {
+		lastDropped = tap.dropped;
+		notify("client");
+	}
+}
+
+/** Polls the server only now and then: the next loop turn does it at once (a pane switched to the server realm). */
+function pollSoon() {
+	lastPoll = -math.huge;
+}
+
+/** One loop for every pane: this client's capture twice a second, the server once a second while a pane shows it. */
+function runFeed() {
+	if (feedThread !== undefined) return;
+	feedThread = task.spawn(() => {
+		let lastLocal = -math.huge;
+		while (watchers.size() > 0) {
+			const [ok, err] = pcall(() => {
+				const tap = clientTap;
+				const deps = feedDeps;
+				if (!tap || !deps) return;
+				const active = anyActive();
+				tap.recording = active;
+				if (active && os.clock() - lastLocal >= LOCAL_REFRESH) {
+					lastLocal = os.clock();
+					pullLocal(tap);
+				}
+				if (!wantsServer()) stopServer();
+				else if (os.clock() - lastPoll >= POLL) {
+					lastPoll = os.clock();
+					pollServer(deps.call);
+				}
+			});
+			if (!ok) $warn(`[devtools] packets refresh failed: ${err}`);
+			task.wait(0.1);
+		}
+		feedThread = undefined;
+	});
+}
+
+/** A pane starts watching: the client tap goes on the dispatcher (capture starts) and the loop runs. */
+function attach(deps: InspectorDeps, watcher: Watcher): PacketTap {
+	feedDeps = deps;
+	const tap = clientTap ?? new PacketTap();
+	clientTap = tap;
+	tap.recording = true;
+	deps.dispatcher.tap = tap;
+	watchers.add(watcher);
+	runFeed();
+	return tap;
+}
+
+/** A pane stops watching; the last one ends both captures and every block. */
+function detach(watcher: Watcher) {
+	watchers.delete(watcher);
+	if (watchers.size() > 0) return;
+	stopServer();
+	const tap = clientTap;
+	const deps = feedDeps;
+	if (tap && deps && deps.dispatcher.tap === tap) deps.dispatcher.tap = undefined;
+	tap?.blocked.clear();
+}
 
 function clock(t: number): string {
 	return `${os.date("%H:%M:%S", math.floor(t / 1000))}.${"%03d".format(t % 1000)}`;
@@ -166,8 +341,8 @@ function arrow(parent: Instance, right: boolean, color: Color3): Frame {
 
 export function renderNetworkInspector(tab: InspectorTab, deps: InspectorDeps) {
 	const { trove, content } = tab;
-	const { kernel, dispatcher, call } = deps;
-	const persist = kernel.persist<InspectorPersist>("typetorch/netinspect", () => ({}));
+	const { kernel, call } = deps;
+	const persist = (deps.persist as InspectorPersist | undefined) ?? kernel.persist<InspectorPersist>("typetorch/netinspect", () => ({}));
 	let realm: Realm = persist.realm === "server" ? "server" : "client";
 	let direction: Direction = persist.dir === "in" || persist.dir === "out" ? persist.dir : "both";
 	let rejectedOnly = persist.rejected === true;
@@ -175,27 +350,24 @@ export function renderNetworkInspector(tab: InspectorTab, deps: InspectorDeps) {
 	let paused = false;
 	let playerFilter: number | undefined;
 	let selected: Row | undefined;
-	/** Bumped when the server view restarts (realm switch, player filter, pause): late replies are dropped. */
-	let epoch = 0;
 	let detailEpoch = 0;
-	let serverWatching = false;
-	let serverChannel: string | undefined;
-	let problem: string | undefined;
 	let follow = true;
 	let alive = true;
 	trove.add(() => {
 		alive = false;
 	});
-
-	// Capture: this client records while the tab is open; blocks last only that long too.
-	const tap = clientTap ?? new PacketTap();
-	clientTap = tap;
-	tap.recording = true;
-	dispatcher.tap = tap;
-	trove.add(() => {
-		if (dispatcher.tap === tap) dispatcher.tap = undefined;
-		tap.blocked.clear();
-	});
+	/** Clear in this pane only: rows up to this sequence number stay hidden (per realm, until the rows start over). */
+	const floor: Record<Realm, number> = { client: 0, server: 0 };
+	const seenResets: Record<Realm, number> = { client: views.client.resets, server: views.server.resets };
+	let onChanged: (realm: Realm) => void = () => {};
+	const watcher: Watcher = {
+		realm: () => realm,
+		paused: () => paused,
+		changed: (changed) => onChanged(changed),
+	};
+	// Capture: this client records while any Packets pane is open; blocks last only that long too.
+	const tap = attach(deps, watcher);
+	trove.add(() => detach(watcher));
 
 	// Layout ------------------------------------------------------------------------------------------------------
 
@@ -424,6 +596,7 @@ export function renderNetworkInspector(tab: InspectorTab, deps: InspectorDeps) {
 	// Filtering -----------------------------------------------------------------------------------------------------
 
 	const matches = (row: Row) => {
+		if (row.i <= floor[realm]) return false;
 		if (direction !== "both" && row.dir !== direction) return false;
 		if (rejectedOnly && row.status !== "rejected" && row.status !== "limited") return false;
 		if (realm === "server" && playerFilter !== undefined && row.userId !== playerFilter && row.player !== "all") return false;
@@ -441,6 +614,7 @@ export function renderNetworkInspector(tab: InspectorTab, deps: InspectorDeps) {
 		const dropped = realm === "client" ? tap.dropped : view.dropped;
 		if (dropped > 0) parts.push(`${dropped} over the rate cap`);
 		if (tap.blocked.size() > 0) parts.push(`${tap.blocked.size()} blocked`);
+		const problem = realm === "server" ? serverProblem : undefined;
 		if (problem !== undefined) parts.push(problem);
 		status.Text = parts.join("   ");
 		status.TextColor3 = problem !== undefined ? COLORS.bad : paused || tap.blocked.size() > 0 ? COLORS.warn : COLORS.dim;
@@ -459,15 +633,6 @@ export function renderNetworkInspector(tab: InspectorTab, deps: InspectorDeps) {
 			if (index >= 0) list.CanvasPosition = new Vector2(0, math.min(bottom(), TOP + index * ROW + offset));
 		}
 		updateStatus();
-	};
-
-	const append = (view: View, rows: Row[]) => {
-		for (const row of rows) view.rows.push(row);
-		const extra = view.rows.size() - PACKET_CAPACITY;
-		if (extra <= 0) return;
-		const kept = new Array<Row>();
-		for (let index = extra; index < view.rows.size(); index++) kept.push(view.rows[index]);
-		view.rows = kept;
 	};
 
 	// Detail ------------------------------------------------------------------------------------------------------
@@ -536,96 +701,25 @@ export function renderNetworkInspector(tab: InspectorTab, deps: InspectorDeps) {
 		);
 	};
 
-	// Server capture --------------------------------------------------------------------------------------------------
+	// The feed's news ---------------------------------------------------------------------------------------------------
 
 	const showNote = () => {
 		note.Visible = realm === "server" && (serverChannel ?? kernel.channel) === "prod";
 	};
 
-	const stopServer = () => {
-		if (!serverWatching) return;
-		serverWatching = false;
-		epoch += 1;
-		// Not in the trove: it must still go out while the tab closes.
-		task.spawn(() => call("net.stop"));
-	};
-	trove.add(stopServer);
-
-	const restartServerView = () => {
-		const view = views.server;
-		view.rows = [];
-		view.cursor = 0;
-		view.skipped = 0;
-		epoch += 1;
-	};
-
-	const pollServer = () => {
-		const view = views.server;
-		const mine = epoch;
-		serverWatching = true;
-		const [ok, reply] = call("net.packets", { since: view.cursor, userId: playerFilter });
-		if (!alive || mine !== epoch) return;
-		if (!ok || !typeIs(reply, "table")) {
-			if (reply !== "rate_limited") {
-				problem = `Server: ${tostring(reply)}`;
-				updateStatus();
-			}
-			return;
+	onChanged = (changed) => {
+		if (!alive || changed !== realm) return;
+		const view = views[changed];
+		if (view.resets !== seenResets[changed]) {
+			// The rows started over (a new server tap): this pane's Clear point and selection go with them.
+			seenResets[changed] = view.resets;
+			floor[changed] = 0;
+			if (selected !== undefined) choose(undefined);
 		}
-		problem = undefined;
-		const page = reply as PacketPage;
-		serverChannel = page.channel;
 		showNote();
-		if (view.session !== page.session) {
-			const restarted = view.session !== undefined && view.cursor > 0;
-			view.session = page.session;
-			if (restarted) {
-				// The server swapped (a new ring): start over next poll.
-				restartServerView();
-				if (realm === "server") refresh();
-				return;
-			}
-		}
-		view.cursor = page.next;
-		view.skipped += page.skipped;
-		view.dropped = page.dropped;
-		if (page.packets.size() > 0) append(view, page.packets);
-		if (realm === "server") refresh();
+		if (paused) updateStatus();
+		else refresh();
 	};
-
-	const pullLocal = () => {
-		const view = views.client;
-		const [records, cursor, skipped] = tap.since(view.cursor, PACKET_CAPACITY);
-		view.cursor = cursor;
-		view.skipped += skipped;
-		if (records.size() > 0) append(view, records);
-		if (realm === "client") {
-			if (records.size() > 0) refresh();
-			else updateStatus();
-		}
-	};
-
-	let lastPoll = -math.huge;
-	trove.add(
-		task.spawn(() => {
-			let lastLocal = -math.huge;
-			while (alive) {
-				const [ok, err] = pcall(() => {
-					if (paused) return;
-					if (os.clock() - lastLocal >= LOCAL_REFRESH) {
-						lastLocal = os.clock();
-						pullLocal();
-					}
-					if (realm === "server" && os.clock() - lastPoll >= POLL) {
-						lastPoll = os.clock();
-						pollServer();
-					}
-				});
-				if (!ok) $warn(`[devtools] packets refresh failed: ${err}`);
-				task.wait(0.1);
-			}
-		}),
-	);
 
 	// Player filter (server realm): a panel over the list, one at a time ---------------------------------------------
 
@@ -640,9 +734,6 @@ export function renderNetworkInspector(tab: InspectorTab, deps: InspectorDeps) {
 		playerButton.Text = player ? `@${player.Name.sub(1, 16)}` : "Player";
 		paintSelected(playerButton, player !== undefined);
 		closePicker();
-		// The server filters, so start over to get this player's recent packets.
-		restartServerView();
-		lastPoll = -math.huge;
 		follow = true;
 		choose(undefined);
 		refresh();
@@ -688,8 +779,7 @@ export function renderNetworkInspector(tab: InspectorTab, deps: InspectorDeps) {
 		if (realm === value) return;
 		realm = value;
 		persist.realm = value;
-		if (realm === "client") stopServer();
-		lastPoll = -math.huge;
+		if (realm === "server") pollSoon();
 		follow = true;
 		closePicker();
 		choose(undefined);
@@ -701,21 +791,21 @@ export function renderNetworkInspector(tab: InspectorTab, deps: InspectorDeps) {
 
 	realmButtons.set("client", addButton(bar, "Client", () => setRealm("client")));
 	realmButtons.set("server", addButton(bar, "Server", () => setRealm("server")));
+	// Pause freezes this pane; the feed keeps running for the others (and stops when every pane is paused).
 	pauseButton = addButton(bar, "Pause", () => {
 		paused = !paused;
-		tap.recording = !paused;
-		if (paused) stopServer();
-		else lastPoll = -math.huge;
+		if (!paused) {
+			pollSoon();
+			refresh();
+		}
 		paintToolbar();
 		render();
 		updateStatus();
 	});
+	// Clear hides what this pane shows so far; the rows stay for other panes.
 	addButton(bar, "Clear", () => {
-		const view = views[realm];
-		view.rows = [];
-		view.skipped = 0;
-		// The client ring is this player's own; the server ring is shared with other devs, so only the view clears.
-		if (realm === "client") tap.clear();
+		const rows = views[realm].rows;
+		floor[realm] = rows.size() > 0 ? rows[rows.size() - 1].i : floor[realm];
 		follow = true;
 		choose(undefined);
 		refresh();
