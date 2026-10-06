@@ -35,6 +35,7 @@ import type {
 import { CLAUDE_IMAGE_CHUNK, MAX_STROKES_JSON, cleanAttachmentIds, cleanCrop, cleanImageMeta, cleanStrokes, decodeImageChunk } from "./claude-images";
 import { ToolboxGate, cleanTiles, insertsFor, newToolboxStore, removeToolboxInsert, toolboxInsert, type ToolboxAsk, type ToolboxStore } from "./toolbox-server";
 import { CODE_ALPHABET, CODE_LENGTH, CODE_SECRET_LENGTH, codeFingerprint, sha256 } from "./sha256";
+import { FRAMEWORK_VERSION } from "../version";
 
 /**
  * Game side of `typetorch remote-claude` (plans/11). A dev's machine announces a session over MessagingService; this
@@ -137,6 +138,13 @@ const CONVERSATION_TEXT_BUDGET = 120_000;
 const MAX_MESSAGES = 30;
 const MAX_CONVERSATIONS = 20;
 const TOOL_TOPIC = "TypeTorch/tool";
+/** Logs > Upload: per dev, 3 uploads a minute; server logs: the kernel's whole ring (500 lines). */
+const UPLOAD_MAX = 3;
+const UPLOAD_WINDOW = 60;
+const SERVER_UPLOAD_LINES = 500;
+/** Log text per upload (the dev-server takes up to 2 MB of JSON); the client's own text, capped again here. */
+const UPLOAD_BYTES = 900 * 1024;
+const CLIENT_UPLOAD_BYTES = 256 * 1024;
 /** A dev's chat counts as open this long after its last claude.* op. */
 const CHAT_OPEN_WINDOW = 20;
 /** Runs older than this don't keep the poll going. */
@@ -1565,6 +1573,62 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		}
 		polling.delete(userId);
 	};
+
+	// Logs > Upload (no Claude, no prompt quota): the logs a dev sees go to the paired dev PC, which saves them as
+	// <repo>/.typetorch/logs/<time>-<branch>-<job8>-<kind>.log (POST /v1/logs). The chat's pairing, so dev-channel
+	// servers only. Server: this server's log ring; client: the dev's own client logs (sent by that client, capped again
+	// here); player: another player's client logs through the Logs > Others path. Log text is untrusted (names, chat):
+	// never printed here; the dev machine writes it to the file only.
+	const uploads = new Map<number, number[]>();
+	ops.set("logs.upload", (player, payload) => {
+		if (kernel.channel !== "dev") return fail("prod_channel");
+		const session = activeSession();
+		if (!session) return fail("not_connected");
+		if (!session.users.includes(player.UserId)) return fail("not_allowed");
+		if (!isPaired(session, player.UserId)) return fail("needs_pairing");
+		const request = (typeIs(payload, "table") ? payload : {}) as { kind?: unknown; text?: unknown; userId?: unknown; artifact?: unknown };
+		const kind = request.kind;
+		if (kind !== "server" && kind !== "client" && kind !== "player") return fail("bad_request");
+		if (!allow(uploads, player.UserId, UPLOAD_MAX, UPLOAD_WINDOW)) return fail("rate_limited");
+		let artifact = `${kernel.artifact.id}#${kernel.generation}`;
+		let target: Player | undefined;
+		let text: string;
+		if (kind === "server") {
+			text = formatLogHistory(kernel.logs(undefined, SERVER_UPLOAD_LINES), UPLOAD_BYTES);
+		} else if (kind === "client") {
+			if (!typeIs(request.text, "string")) return fail("bad_request");
+			text = capLogText(request.text, CLIENT_UPLOAD_BYTES);
+			// The client's own generation (it can lag the server's for a moment after a swap).
+			if (typeIs(request.artifact, "string") && request.artifact.size() <= 128 && matches(request.artifact, "^[%w%-_.#]+$")) {
+				artifact = request.artifact;
+			}
+		} else {
+			target = typeIs(request.userId, "number") ? Players.GetPlayerByUserId(request.userId) : undefined;
+			if (!target) return fail("player_gone");
+			if (!deps) return fail("player_logs_failed");
+			const [logsOk, entries] = deps.clientLogs(target, 0);
+			if (!logsOk || !typeIs(entries, "table")) return fail(entries === "no_reply" ? "no_reply" : "player_logs_failed");
+			text = formatLogHistory(entries as LogEntry[], UPLOAD_BYTES);
+		}
+		const body: Record<string, unknown> = {
+			kind,
+			uploader: player.Name,
+			artifact,
+			kernel: kernel.kernelVersion,
+			framework: FRAMEWORK_VERSION,
+			time: os.time(),
+			text,
+		};
+		if (target) body.player = target.Name;
+		const result = authed(session, player.UserId, "POST", "/v1/logs", body);
+		if (!result.ok) {
+			// A dev-server before log uploads has no such route.
+			if (result.error === "not_found" || result.error === "remote_error") return fail(result.error === "not_found" ? "disabled" : result.error);
+			return result;
+		}
+		const reply = (typeIs(result.data, "table") ? result.data : {}) as { lines?: unknown };
+		return { ok: true, lines: shortNumber(reply.lines) };
+	});
 
 	if (kernel.channel === "dev") {
 		let stopped = false;

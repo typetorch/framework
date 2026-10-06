@@ -120,6 +120,17 @@ export class CoinService extends Module implements OnStart {
   logs (server, own client, other players' clients), client and server dex, network stats, module state, a branch and
   build picker (Server > Branch) and a Claude prompt. Prod-channel servers are read-only. The window can be dragged by
   its header and resized from its corner (double-tap the header to reset).
+- **State explorer (Modules > State, Server | Client):** every live module of the running generation (services on the
+  server, controllers on the client) and the persist store. Tap a row to open it: the module's own fields (not its
+  methods), then tables, arrays, Maps and Sets, 100 entries per page (Prev / Next). Each value has a short preview:
+  strings (cut), numbers, booleans, nil, datatypes through `tostring`, an Instance as its full path, a Player as its
+  name, `function`, `thread`, buffer sizes. Nothing is ever called (raw reads only: no metamethods, no getters); a
+  value that is its own ancestor shows as a cycle. A key filter (open nodes stay listed), Refresh and Auto (every 2 s).
+  Server state comes from the op `state.inspect` (rate-limited, size-capped): devs on dev-channel servers, owners only
+  on prod-effective servers, since server state can hold player data.
+- **Logs > Upload:** sends the logs shown (Server: this server's log ring; Client: your own client's; Others: the
+  picked player's client) to the dev PC paired in the Claude tab, which saves them under `<repo>/.typetorch/logs/`.
+  No Claude run, no prompt quota. Not paired: "Pair in the Claude tab first".
 - **Switch a live server (kernel 0.3.4):** owners switch any server and load builds on it, public and prod ones too:
   Server > Branch, "Switch" on a branch or "Load here" on a build, then the green Confirm. Everyone stays. These are
   ordinary switches and pins: Reload and Rollback keep working, and going back to prod is Switch on the prod row (its
@@ -347,6 +358,9 @@ bun run build   # rbxtsc --type package -> out/
   the Branch tab / "Load a build" rules (`devtools/build-actions.ts`).
   To test framework changes before the template takes them, build the payload from a copy of the template whose
   `node_modules/@typetorch/framework/out` is this repo's `out/`.
+  `scripts/test-state-inspect.luau` checks the state explorer's core (previews, raw reads only, cycles, paging,
+  Maps/Sets with Instance keys, the depth limit, filters, request validation) and that `src/version.ts` matches
+  package.json.
   `scripts/test-analytics.luau` checks the analytics engine's pure parts (experiment assignment, settings, the queue
   and HTTP budget, tt-rec-1, the sink request bodies); `test-analytics-server.luau` and `test-analytics-client.luau`
   run the compiled server and client cores against mocked services (sessions, intake, retries, a swap with a request

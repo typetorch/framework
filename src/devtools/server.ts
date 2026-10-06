@@ -21,7 +21,8 @@ import {
 	NetStat,
 } from "./protocol";
 import type { LogEntry } from "../kernel";
-import { describeState } from "./state";
+import { describeState, stateRoots } from "./state";
+import { inspectState, parseStateRequest } from "./state-inspect";
 import type { ServerFacts } from "./health";
 import { ArtifactNotes, notesFromAttribute, parseArtifactNotes } from "./artifact-notes";
 import { loadstringAvailable } from "./claude-tools";
@@ -78,6 +79,10 @@ function cleanLogs(value: unknown): LogEntry[] | undefined {
 	entries.sort((a, b) => a.i < b.i);
 	return entries;
 }
+
+/** Modules > State queries per dev: a burst, then this many per second (a refresh sends one per open node). */
+const INSPECT_BURST = 36;
+const INSPECT_RATE = 12;
 
 /** Seconds between two swaps (reload, switch, rollback, pin) of one server through the dev menu. */
 const SWAP_INTERVAL = 2;
@@ -255,6 +260,30 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 	});
 	// The legacy dex.children/props/set/destroy ops are gone: the explorer (explorer.* ops) replaced them.
 	ops.set("state", () => describeState());
+	// Modules > State (state-inspect.ts): the live state of this generation's services and the persist store, read-only
+	// (no function is ever called). Server state can hold player data, so devs on dev-channel servers and owners only on
+	// prod-effective ones. One query or {queries} (at most 12); every query costs one token of a per-dev bucket.
+	const inspectBudget = new Map<Player, { tokens: number; at: number }>();
+	trove.connect(Players.PlayerRemoving, (player) => inspectBudget.delete(player));
+	const takeInspect = (player: Player, cost: number): boolean => {
+		const now = os.clock();
+		const budget = inspectBudget.get(player) ?? { tokens: INSPECT_BURST, at: now };
+		budget.tokens = math.min(INSPECT_BURST, budget.tokens + (now - budget.at) * INSPECT_RATE);
+		budget.at = now;
+		inspectBudget.set(player, budget);
+		if (budget.tokens < cost) return false;
+		budget.tokens -= cost;
+		return true;
+	};
+	ops.set("state.inspect", (player, payload) => {
+		if (kernel.channel !== "dev" && !isOwner(player)) error("owners_only", 0);
+		const queries = parseStateRequest(payload);
+		if (typeIs(queries, "string")) error(queries, 0);
+		for (const query of queries) if (query.side !== "server") error("bad_side", 0);
+		if (!takeInspect(player, queries.size())) error("rate_limited", 0);
+		const roots = stateRoots();
+		return queries.map((query) => inspectState(roots, query));
+	});
 	// Modules > Assets: the last AssetSync of this generation (hot assets, plans/13), read-only.
 	ops.set("assets", () => assetReport());
 

@@ -48,17 +48,19 @@ import {
 	StateSummary,
 } from "./protocol";
 import { CLAUDE_IMAGE_CHUNK, ImageInbox, takeScreenshot } from "./claude-images";
-import { CLAUDE_TOOL_REQUEST, CLAUDE_TOOL_RESPONSE, findTool, inspectTool } from "./claude-tools";
+import { CLAUDE_TOOL_REQUEST, CLAUDE_TOOL_RESPONSE, findTool, formatLogHistory, inspectTool } from "./claude-tools";
 import { renderClaudeChat } from "./claude-ui";
 import { adminTabs, migrateControl } from "./admin-ui";
 import { renderNetworkInspector } from "./network-inspector";
 import { renderAssetsTab } from "./assets-ui";
+import { renderStateTab, StateExplorerPersist } from "./state-ui";
 import { describeState } from "./state";
 import type { ArtifactNotes } from "./artifact-notes";
 import { badgeLevel, checkHealth, HealthIssue, HealthLevel, ServerFacts } from "./health";
 import { NEEDS_KERNEL_AB } from "./ab";
 import {
 	addButton,
+	spacer,
 	ArmState,
 	armLock,
 	newArmState,
@@ -129,6 +131,23 @@ const OTHER_LOG_ERRORS: Record<string, string> = {
 	not_in_server: "That player left",
 	rate_limited: "Slow down",
 };
+
+/** Logs > Upload ("logs.upload", claude.ts): one short line per error code. */
+const UPLOAD_ERRORS: Record<string, string> = {
+	needs_pairing: "Pair in the Claude tab first",
+	not_connected: "Pair in the Claude tab first",
+	not_allowed: "Pair in the Claude tab first",
+	prod_channel: "Dev servers only",
+	rate_limited: "Slow down",
+	player_gone: "That player left",
+	no_reply: "No reply from that player",
+	player_logs_failed: "No reply from that player",
+	too_large: "Too large",
+	unreachable: "Dev PC unreachable",
+	disabled: "Dev-server too old",
+};
+/** The client's own logs for Logs > Upload: about 256 KB, newest kept (the server caps it again). */
+const CLIENT_UPLOAD_BYTES = 256 * 1024;
 
 const TABS = ["Artifact", "Modules", "Server", "Manage", "Logs", "Dex", "Network", "Claude"] as const;
 type TabName = (typeof TABS)[number];
@@ -526,9 +545,9 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		else if (keys.noTrustedHead === true) target.field("Head", "No trusted prod head", COLORS.bad);
 	};
 
-	// Modules > Overview / State: one realm at a time (Server | Client toolbar, like Logs), refreshed every REFRESH s.
-	// Overview: each module in load order with its init time, lifecycle hooks and dependencies. State: the persist store
-	// (what survives swaps). Server data comes from the "state" op, client data from this client (describeState).
+	// Modules > Overview: one realm at a time (Server | Client toolbar, like Logs), refreshed every REFRESH s: each module
+	// in load order with its init time, lifecycle hooks and dependencies. Server data comes from the "state" op, client
+	// data from this client (describeState). Modules > State is the state explorer (state-ui.ts).
 	let modulesRealm: "server" | "client" = "server";
 	const renderModulesView = (tab: TabContext, draw: (target: Page, summary: StateSummary) => void) => {
 		const bar = tab.toolbar();
@@ -568,10 +587,16 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				target.field(mod.name, parts.join("  ·  "));
 			}
 		});
+	// Modules > State: the live state explorer (state-ui.ts); open nodes, pages, filter and Auto survive swaps.
+	const stateExplorer = kernel.persist("typetorch/state-explorer", (): StateExplorerPersist => ({}));
 	const renderModulesState = (tab: TabContext) =>
-		renderModulesView(tab, (target, summary) => {
-			if (summary.persist.size() === 0) target.text("Nothing persisted", COLORS.dim);
-			for (const entry of summary.persist) target.field(entry.key, `${entry.entries} entries  ${entry.preview}`);
+		renderStateTab(tab, {
+			call,
+			realm: () => modulesRealm,
+			setRealm: (realm) => {
+				modulesRealm = realm;
+			},
+			persist: stateExplorer,
 		});
 
 	const renderArtifact = ({ page, trove: tabTrove }: TabContext) => {
@@ -738,6 +763,23 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		heading.Visible = false;
 		const note = page.text("", COLORS.bad);
 		note.Visible = false;
+		// Upload: one line with the outcome, until the next upload or 10 s.
+		const uploadNote = page.text("", COLORS.good);
+		uploadNote.Visible = false;
+		let uploadShown = 0;
+		const setUpload = (text: string, color: Color3) => {
+			uploadShown += 1;
+			const mine = uploadShown;
+			uploadNote.Text = text;
+			uploadNote.TextColor3 = color;
+			uploadNote.Visible = true;
+			bump(uploadNote);
+			tabTrove.add(
+				task.delay(10, () => {
+					if (mine === uploadShown) uploadNote.Visible = false;
+				}),
+			);
+		};
 		const picker = page.group(4);
 		const rows = page.group(2);
 		const shown = new Array<TextLabel>();
@@ -802,7 +844,10 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				if (entry.i <= since) continue;
 				since = entry.i;
 				const line = `${os.date("%H:%M:%S", entry.t)}  ${entry.text.sub(1, 600)}`;
-				shown.push(rows.text(line, LOG_COLORS[entry.kind] ?? COLORS.text, true));
+				// The kernel's own notes (info lines starting "[TypeTorch] ", e.g. kernel 0.3.5's "no ConfigService registry
+				// (optional)") are dim: nothing to act on.
+				const kernelNote = entry.kind === "info" && entry.text.sub(1, 12) === "[TypeTorch] ";
+				shown.push(rows.text(line, kernelNote ? COLORS.dim : LOG_COLORS[entry.kind] ?? COLORS.text, true));
 			}
 			while (shown.size() > MAX_LOG_ROWS) shown.shift()?.Destroy();
 		};
@@ -845,6 +890,41 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		realmButtons.set("server", addButton(bar, "Server", () => selectRealm("server")));
 		realmButtons.set("client", addButton(bar, "Client", () => selectRealm("client")));
 		realmButtons.set("other", addButton(bar, "Others", () => selectRealm("other")));
+		// Upload the shown logs to the paired dev PC (<repo>/.typetorch/logs/), no Claude involved: the Claude tab's
+		// pairing, op "logs.upload" (claude.ts). Server: this server's log ring; Client: this client's; Others: the
+		// picked player's client logs (the Logs > Others path).
+		spacer(bar);
+		let uploading = false;
+		const uploadButton = addButton(bar, "Upload", () => {
+			if (uploading) return;
+			let payload: Record<string, unknown>;
+			if (logRealm === "server") payload = { kind: "server" };
+			else if (logRealm === "client") {
+				payload = {
+					kind: "client",
+					text: formatLogHistory(kernel.logs(undefined, 1000), CLIENT_UPLOAD_BYTES),
+					artifact: `${kernel.artifact.id}#${kernel.generation}`,
+				};
+			} else if (logPlayer !== undefined) payload = { kind: "player", userId: logPlayer };
+			else {
+				setUpload("Pick a player", COLORS.dim);
+				return;
+			}
+			uploading = true;
+			uploadButton.Text = "Uploading...";
+			spawnIn(tabTrove, () => {
+				const [ok, reply] = call("logs.upload", payload);
+				uploading = false;
+				uploadButton.Text = "Upload";
+				const answer = (typeIs(reply, "table") ? reply : {}) as { ok?: boolean; error?: unknown; lines?: unknown };
+				if (ok && answer.ok === true) {
+					setUpload(`Saved on the dev PC (${typeIs(answer.lines, "number") ? answer.lines : "?"} lines)`, COLORS.good);
+					return;
+				}
+				const code = ok ? answer.error : reply;
+				setUpload(typeIs(code, "string") ? UPLOAD_ERRORS[code] ?? `Failed: ${code}` : "Failed", COLORS.bad);
+			});
+		});
 		highlight();
 		showHeading();
 		if (logRealm === "other" && logPlayer === undefined) openPicker();
