@@ -5,6 +5,11 @@
 -- Run after building a game's payload, e.g. the template (Lune is pinned in template/rokit.toml):
 --   cd ../template && bun run payload && lune run ../framework/scripts/test-generations.luau build/payload.rbxm
 --
+-- The payload must carry THIS framework's build (out/, from `bun run build`). The script compares the payload's copy
+-- of the framework with out/ file by file before any check, and stops on a stale fixture with the commands that
+-- rebuild it (template: `bun run packages`, which builds and packs this checkout, then `bun run payload`).
+-- `--any-framework` runs the checks on another game's payload anyway.
+--
 -- What it does, for each generation: mounts a fresh copy of the payload into ONE emulated VM (one require cache keyed
 -- by ModuleScript and one shared _G, as on a Roblox server, where each swap mounts a new copy), imports the framework
 -- through roblox-ts' RuntimeLib, requires every ModuleScript under Server/services and Client/controllers (as
@@ -287,8 +292,71 @@ end
 
 -- One generation -----------------------------------------------------------------------------------------------------
 
-local path = process.args[1] or "build/payload.rbxm"
+local path = "build/payload.rbxm"
+local anyFramework = false
+for _, arg in process.args do
+	if arg == "--any-framework" then
+		anyFramework = true
+	elseif string.sub(arg, 1, 2) ~= "--" then
+		path = arg
+	end
+end
 local bytes = fs.readFile(path)
+
+-- A stale fixture fails these checks for the wrong reason, or passes them by luck (2026-10-06: "LATEST_KERNEL is
+-- 0.3.5" failed against a template payload built before framework 0139b44). So first: the payload's framework copy
+-- (include/node_modules/@typetorch/framework/out) must equal this checkout's out/, file by file.
+do
+	local scriptDir = string.match(debug.info(1, "s"), "^(.*)[/\\][^/\\]+$") or "."
+	local outDir = `{scriptDir}/../out`
+	local copy = roblox.deserializeModel(bytes)[1]
+	for _, name in { "include", "node_modules", "@typetorch", "framework", "out" } do
+		copy = if copy then copy:FindFirstChild(name) else nil
+	end
+	local problem, files = nil, 0
+	if not fs.isDir(outDir) then
+		problem = `{outDir} doesn't exist (run \`bun run build\` in the framework)`
+	elseif not copy then
+		problem = "it has no include/node_modules/@typetorch/framework/out"
+	else
+		local function walk(dir: string, node, relative: string)
+			for _, name in fs.readDir(dir) do
+				local full = `{dir}/{name}`
+				if problem then
+					return
+				elseif fs.isDir(full) then
+					walk(full, if node then node:FindFirstChild(name) else nil, `{relative}{name}/`)
+				elseif string.sub(name, -5) == ".luau" then
+					files += 1
+					local module = if node == nil then nil elseif name == "init.luau" then node else node:FindFirstChild(string.sub(name, 1, -6))
+					if module == nil or module.ClassName ~= "ModuleScript" then
+						problem = `out/{relative}{name} is missing from it`
+					elseif module.Source ~= fs.readFile(full) then
+						problem = `out/{relative}{name} differs`
+					end
+				end
+			end
+		end
+		walk(outDir, copy, "")
+		local modules = if copy.ClassName == "ModuleScript" then 1 else 0
+		for _, descendant in copy:GetDescendants() do
+			if descendant.ClassName == "ModuleScript" then
+				modules += 1
+			end
+		end
+		if not problem and modules ~= files then
+			problem = `it has {modules} framework modules, out/ has {files}`
+		end
+	end
+	if problem then
+		local message = `{path} doesn't carry this framework's build: {problem}.\n      Rebuild it: in the template, \`bun run packages\` (builds and packs this checkout), then \`bun run payload\`.`
+		if not anyFramework then
+			print(`FAIL  stale fixture: {message}\n      (--any-framework runs the checks on another game's payload anyway)`)
+			process.exit(1)
+		end
+		print(`WARN  --any-framework: {message}`)
+	end
+end
 
 --- Decorated classes in the emitted code of a realm's folder, by decorator.
 local function countDecorated(folder, decorator: string)
