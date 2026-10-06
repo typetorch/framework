@@ -1,5 +1,5 @@
 import type { AssetFacts } from "../assets/manifest";
-import type { HealthInfo, KernelStatus } from "../kernel";
+import type { HealthInfo, KernelStatus, SettingsStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
 export const LATEST_KERNEL = "0.3.8";
@@ -135,7 +135,7 @@ export function signingIssues(status: KernelStatus): HealthIssue[] {
  * - the live health window while it is open ("1/3 errors, 24 s left"): info, warn once an error counted; payload
  *   health settings out of bounds (kernel 0.3.7 used the defaults) or the kernel's Health module not mapped: warn;
  * - no deploy reports: info on kernels before 0.3.2 (live servers only); the kernel's own fleet API sender failing
- *   (the `TypeTorchFleet` setting), invalid, or its module not mapped in the place: warn;
+ *   (the settings' `fleet`), invalid, or its module not mapped in the place: warn;
  * - clients whose generation failed to start: warn.
  */
 export function deployIssues(status: KernelStatus): HealthIssue[] {
@@ -167,7 +167,7 @@ export function deployIssues(status: KernelStatus): HealthIssue[] {
 	if (fleet?.missing === true) {
 		issues.push({ level: "warn", title: "No fleet API", detail: "Map the kernel's Fleet module." });
 	} else if (fleet?.settings === "invalid") {
-		issues.push({ level: "warn", title: "Fleet settings", detail: fleet.settingsError ?? "TypeTorchFleet is invalid." });
+		issues.push({ level: "warn", title: "Fleet settings", detail: fleet.settingsError ?? "settings.fleet is invalid." });
 	} else if (fleet?.enabled === true && fleet.lastErrorAt !== undefined && (fleet.lastOkAt === undefined || fleet.lastErrorAt > fleet.lastOkAt)) {
 		issues.push({ level: "warn", title: "Fleet API failing", detail: fleetFix(fleet.lastError) });
 	}
@@ -203,6 +203,51 @@ export function fallbackIssues(status: KernelStatus): HealthIssue[] {
 	}
 	if (fallback?.backup.failed !== undefined) {
 		issues.push({ level: "warn", title: "Backup build failed", detail: fallback.backup.failed.error ?? "-" });
+	}
+	return issues;
+}
+
+/** How old, in a few words: "45 s", "3m", "2h", "4d". */
+function ageText(seconds: number): string {
+	if (seconds < 60) return `${math.floor(seconds)} s`;
+	if (seconds < 3600) return `${math.floor(seconds / 60)}m`;
+	if (seconds < 86400) return `${math.floor(seconds / 3600)}h`;
+	return `${math.floor(seconds / 86400)}d`;
+}
+
+/** The Status page's Settings line: "#12, 3m old (sig)", "none (run typetorch settings push)", "refused: ...". */
+export function settingsText(settings: SettingsStatus): string {
+	if (settings.state === "ok") {
+		return `#${settings.seq ?? "?"}${settings.age !== undefined ? `, ${ageText(settings.age)} old` : ""}${settings.verifiedBy !== undefined ? ` (${settings.verifiedBy})` : ""}`;
+	}
+	if (settings.state === "missing") return "none: run typetorch settings push";
+	if (settings.state === "unknown") return "not read yet";
+	return `${settings.state}: ${settings.error ?? "-"}`;
+}
+
+/** A refused copy this recent is reported even while a good one is held. */
+const RECENT_REFUSAL = 15 * 60;
+
+/**
+ * Kernel 0.3.8 (plans/20) signed settings (status().settings):
+ * - no record: warn ("typetorch settings push"); unsigned or invalid with nothing held: error; the read failing with
+ *   nothing held: warn;
+ * - a copy refused in the last 15 minutes while a good one is held (game code wrote it, or a replay): warn.
+ */
+export function settingsIssues(status: KernelStatus): HealthIssue[] {
+	const issues = new Array<HealthIssue>();
+	const settings = status.settings;
+	if (settings === undefined) return issues;
+	if (settings.state === "missing") {
+		issues.push({ level: "warn", title: "No settings", detail: "Run typetorch settings push." });
+	} else if (settings.state === "unsigned" || settings.state === "invalid") {
+		issues.push({ level: "error", title: "Settings refused", detail: settings.error ?? settings.state });
+	} else if (settings.state === "error") {
+		issues.push({ level: "warn", title: "Settings unreadable", detail: settings.error ?? "-" });
+	}
+	const refused = settings.refused;
+	if (settings.state === "ok" && refused !== undefined && os.time() - refused.at <= RECENT_REFUSAL) {
+		issues.push({ level: "warn", title: "Settings copy refused", detail: `${refused.why}; kept #${settings.seq ?? "?"}` });
 	}
 	return issues;
 }
@@ -291,6 +336,7 @@ export function checkHealth(status: KernelStatus, facts?: ServerFacts): HealthIs
 	for (const issue of deployIssues(status)) issues.push(issue);
 	for (const issue of fallbackIssues(status)) issues.push(issue);
 	for (const issue of messagingIssues(status)) issues.push(issue);
+	for (const issue of settingsIssues(status)) issues.push(issue);
 	if (status.localPayload === true) {
 		issues.push({ level: "info", title: "Studio: local payload", detail: "Edits need Stop + Play. Reload remounts it." });
 	}

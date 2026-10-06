@@ -277,7 +277,26 @@ local kernel = {
 	end,
 }
 
+-- 0.3.8: the signed settings (src/settings.ts) as the kernel would hand them over; off unless a check turns it on.
+local settingsMock = { supported = false, current = nil, listeners = {} }
 local internals = {
+	settings = {
+		settingsSupported = function()
+			return settingsMock.supported
+		end,
+		currentSettings = function()
+			return settingsMock.current
+		end,
+		onSettings = function(fn)
+			table.insert(settingsMock.listeners, fn)
+			return function()
+				local index = table.find(settingsMock.listeners, fn)
+				if index then
+					table.remove(settingsMock.listeners, index)
+				end
+			end
+		end,
+	},
 	["net/runtime"] = {
 		maybeServerDispatcher = function()
 			return dispatcher
@@ -685,6 +704,34 @@ check("shutdown flush", #requests > requestsBefore and #store().events.rows == 0
 check("shutdown leave sent", shutdownLeave)
 check("shutdown writes last", records["p/1"].pid == newbiePid and records["p/1"].last ~= nil)
 trove2:clean()
+
+-- 0.3.8 (plans/20): without options.settings the sink comes from the signed settings record (`analytics`, `fleet`),
+-- live through the kernel's change hook; on an older kernel there is none, with one warning.
+do
+	local troveOld = Trove.new()
+	local warnedBefore = #warnings
+	local coreOld = ServerAnalytics.new({ zones = false }, { trove = troveOld, server = kernel }, troveOld)
+	task.wait(0.1)
+	local said = false
+	for index = warnedBefore + 1, #warnings do
+		said = said or string.find(warnings[index], "no sink settings", 1, true) ~= nil
+	end
+	check("settings: an older kernel: no sink settings, one warning", coreOld.settings == nil and said)
+	troveOld:clean()
+	settingsMock.supported = true
+	settingsMock.current = { seq = 1, at = "2026-10-06T12:00:00.000Z", analytics = { backend = "duckdb", events = "https://s.example.com/ingest", token = "TKN-settings", flushSeconds = 5 } }
+	local troveNew = Trove.new()
+	local coreNew = ServerAnalytics.new({ zones = false }, { trove = troveNew, server = kernel }, troveNew)
+	task.wait(0.1)
+	check("settings: kernel 0.3.8: the sink comes from the signed settings", coreNew.settings ~= nil and coreNew.settings.events == "https://s.example.com/ingest")
+	for _, listener in table.clone(settingsMock.listeners) do
+		listener({ seq = 2, at = "2026-10-06T12:01:00.000Z", analytics = { backend = "duckdb", events = "https://t.example.com/ingest", token = "TKN-settings-2", flushSeconds = 5 }, fleet = { url = "https://fleet.example.com", token = "F" } })
+	end
+	task.wait(0.05)
+	check("settings: a new copy applies live (and the fleet value comes with it)", coreNew.settings.events == "https://t.example.com/ingest" and coreNew.fleetSettings ~= nil and coreNew.fleetSettings.url == "https://fleet.example.com")
+	troveNew:clean()
+	check("settings: the engine's listener goes with its trove", #settingsMock.listeners == 0)
+end
 
 print(`analytics server: {passed} passed, {failed} failed`)
 if failed > 0 then

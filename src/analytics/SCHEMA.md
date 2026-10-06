@@ -128,8 +128,10 @@ start, i.e. the row's `t`). Time is the running sum of `dt`.
 
 ## Sink settings
 
-ConfigService key `TypeTorchAnalytics` (server-only), a JSON object (or a JSON string of one). Re-read on
-`UpdateAvailable` and every 3 minutes, so dials change live. `new AnalyticsEngine({ settings })` replaces the key.
+The signed settings record's `analytics` field (kernel 0.3.8, plans/20; server-only; before 0.3.8 the ConfigService key
+`TypeTorchAnalytics`), a JSON object, written with `typetorch settings set analytics -` (JSON on stdin; the analytics
+repo's `bun run local` does it). Every new signed copy applies at once, so dials change live (the CLI pings servers).
+`new AnalyticsEngine({ settings })` replaces it (tests, Studio, kernels before 0.3.8).
 
 ```json
 {
@@ -154,8 +156,8 @@ ConfigService key `TypeTorchAnalytics` (server-only), a JSON object (or a JSON s
 | `recordShare` | 1 | 0..1, share of new players recorded (stable per pid) |
 | `techEvery` | 60 | 15..3600 seconds between tech samples |
 | `experiments` | none | Per experiment: `active: false` (everyone gets the first variant, not stamped), `weights` (per variant, in the game's order), `variant` (force one) |
-| `identity` | `TypeTorchFleet` url + `/v1/identity` | basin: where identity rows go (below); none and no readable `TypeTorchFleet`: not sent. duckdb: unused |
-| `identityToken` | the `TypeTorchFleet` token | basin: the token for `identity`. Never logged |
+| `identity` | the settings' `fleet` url + `/v1/identity` | basin: where identity rows go (below); none and no `fleet` in the settings: not sent. duckdb: unused |
+| `identityToken` | the settings' `fleet` token | basin: the token for `identity`. Never logged |
 
 Unknown fields are ignored. Settings errors are warned once (never with the token).
 

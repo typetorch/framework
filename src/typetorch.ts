@@ -6,6 +6,7 @@ import type {
 	ArtifactInfo,
 	BranchInfo,
 	Channel,
+	KernelSettings,
 	ClientKernel,
 	DevInfo,
 	GenerationStart,
@@ -26,6 +27,7 @@ import { persistKeys } from "./runtime/registry";
 import { hotAsset, type HotAsset } from "./assets/hot-asset";
 import { bindMessaging, messaging, messagingSupported, unbindMessaging, type MessagingApi } from "./messaging";
 import { bindServers, listServers, setServerInfo, unbindServers, type GameServer, type ServerListOptions } from "./servers";
+import { bindSettings, currentSettings, liveConfig, settingsSupported, unbindSettings, type LiveConfig, type LiveConfigOptions } from "./settings";
 
 /**
  * `TypeTorch`: the runtime API for game code, on the server and the client. It describes the running generation
@@ -60,6 +62,8 @@ export interface TypeTorchFeatures {
 	readonly requestReload: boolean;
 	/** `TypeTorch.messaging` reaches other servers (a server on kernel 0.3.8+ whose place maps its Messaging module). */
 	readonly messaging: boolean;
+	/** The signed settings record (kernel 0.3.8+, a server): `settings()`, `liveConfig`, analytics settings. */
+	readonly settings: boolean;
 }
 
 export interface TypeTorchApi {
@@ -193,6 +197,19 @@ export interface TypeTorchApi {
 	 * at most 400 bytes, kept across swaps; `undefined` clears them. Never put secrets here.
 	 */
 	setServerInfo(info: Record<string, unknown> | undefined): void;
+
+	// Signed settings (server only, kernel 0.3.8) -----------------------------------------------------------------------
+	/**
+	 * A live value from the signed settings record's `game` field (`typetorch settings set game.<key> <json>`): `get()`
+	 * and `onChanged(fn)` (generation-scoped, a disconnect for the trove). The default without a record or key, on older
+	 * kernels (warned once) or when `parse` throws. See src/settings.ts.
+	 */
+	liveConfig<T>(key: string, options: LiveConfigOptions<T>): LiveConfig<T>;
+	/**
+	 * Server only, kernel 0.3.8: this generation's copy of the whole verified settings record (`seq`, `at`, `game`,
+	 * `analytics`, `fleet`, ...), or undefined. It holds tokens: never send it to a client.
+	 */
+	settings(): KernelSettings | undefined;
 }
 
 // State of this generation's binding ------------------------------------------------------------------------------------
@@ -230,6 +247,7 @@ const NO_FEATURES: TypeTorchFeatures = {
 	artifacts: false,
 	requestReload: false,
 	messaging: false,
+	settings: false,
 };
 
 function hasMethod(kernel: object, name: string): boolean {
@@ -450,6 +468,15 @@ class TypeTorchRuntime implements TypeTorchApi {
 		if (client) error("TypeTorch.setServerInfo() is server-only", 2);
 		setServerInfo(info);
 	}
+
+	liveConfig<T>(key: string, options: LiveConfigOptions<T>): LiveConfig<T> {
+		return liveConfig(key, options);
+	}
+
+	settings(): KernelSettings | undefined {
+		if (client) error("TypeTorch.settings() is server-only (the record holds tokens)", 2);
+		return currentSettings();
+	}
 }
 
 /** The runtime API for game code (server and client). See `TypeTorchApi` and the README. */
@@ -476,8 +503,10 @@ export function bindTypeTorch(
 	runtime.branch = kernel.branch ?? build.branch ?? "unknown";
 	// A client that doesn't know the channel assumes the strictest.
 	runtime.channel = kernel.channel ?? "prod";
-	// Kernel 0.3.8: game messaging; the roll call behind servers() and Manage > Servers (one per generation).
+	// Kernel 0.3.8: game messaging; the roll call behind servers() and Manage > Servers (one per generation); the signed
+	// settings (liveConfig, analytics).
 	bindMessaging(realm, kernel, trove, runtime.branch, runtime.kernelVersion);
+	bindSettings(realm, kernel, trove, runtime.kernelVersion);
 	if (realm === "server") {
 		server = kernel as ServerKernel;
 		runtime.serverType = server.serverType;
@@ -532,6 +561,7 @@ export function bindTypeTorch(
 		artifacts: server !== undefined && hasMethod(server, "artifacts"),
 		requestReload: server !== undefined && hasMethod(server, "requestReload"),
 		messaging: messagingSupported(),
+		settings: settingsSupported(),
 	};
 }
 
@@ -612,6 +642,7 @@ export function closeTypeTorch() {
 export function unbindTypeTorch() {
 	unbindMessaging();
 	unbindServers();
+	unbindSettings();
 	swapOutListeners.clear();
 	closeListeners.clear();
 	pendingListeners.clear();

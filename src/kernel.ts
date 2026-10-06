@@ -421,7 +421,8 @@ export interface FailedArtifact {
 /**
  * Kernel 0.3.2+ `fleetStatus()`: this server's heartbeat (plans/01 "Fleet status and deploy reports"). The kernel
  * writes it nowhere; the analytics engine sends it, the Manage > Servers roll call answers with it, and with the
- * `TypeTorchFleet` setting the kernel posts it to the fleet API itself (without `k`).
+ * settings' `fleet` (kernel 0.3.8; the `TypeTorchFleet` key before) the kernel posts it to the fleet API itself
+ * (without `k`).
  */
 export interface FleetStatus {
 	/** Server type. */
@@ -599,7 +600,7 @@ export interface KernelStatus {
 	failed?: FailedArtifact[];
 	/** Kernel 0.3.2+: deploy reports given out (`deployReports()` has the last 20). */
 	reports?: { total: number; kept: number; listeners: number };
-	/** Kernel 0.3.2+: the kernel's own fleet API sender (the `TypeTorchFleet` setting). */
+	/** Kernel 0.3.2+: the kernel's own fleet API sender (the settings' `fleet`; the `TypeTorchFleet` key before 0.3.8). */
 	fleet?: FleetSenderInfo;
 	/** Kernel 0.3.4+: the last branch switch or build load here ("switched by <name> 3m ago"). */
 	switched?: SwitchInfo;
@@ -614,6 +615,48 @@ export interface KernelStatus {
 	fallback?: FallbackStatus;
 	/** Kernel 0.3.8: game messaging on the kernel-held topic, and the held roll call topic (`TypeTorch.messaging`). */
 	messaging?: MessagingStatus;
+	/** Kernel 0.3.8 (plans/20): the signed settings record (no values: it holds tokens). */
+	settings?: SettingsStatus;
+}
+
+/**
+ * Kernel 0.3.8 (plans/20): the signed settings record's state. "ok": a verified copy is held; "missing": no record (the
+ * defaults); "unsigned" / "invalid": the stored copy was refused and none was held before; "error": the read failed and
+ * none is held; "unknown": not read yet. A copy refused while a good one is held shows in `refused`.
+ */
+export interface SettingsStatus {
+	state: "ok" | "missing" | "unsigned" | "invalid" | "error" | "unknown";
+	seq?: number;
+	/** ISO time of the write. */
+	at?: string;
+	/** Seconds since `at`. */
+	age?: number;
+	/** Which signature verified it: the main key's `sig`, or the fallback key's `sigF`. */
+	verifiedBy?: "sig" | "sigF";
+	/** The fields present: defaultBranch, channels, access, fleet, analytics, game. */
+	fields: string[];
+	reads: number;
+	error?: string;
+	errorAt?: number;
+	/** The last copy refused while a good one is held (unix seconds `at`). */
+	refused?: { why: string; seq?: number; at: number };
+}
+
+/**
+ * Kernel 0.3.8 (plans/20): a copy of the verified settings (`api:settings()`). SERVER ONLY: `fleet.token` and
+ * `analytics.token` are secrets; never send any of it to a client.
+ */
+export interface KernelSettings {
+	seq: number;
+	at: string;
+	defaultBranch?: string;
+	channels?: Record<string, Channel>;
+	access?: { members?: Record<string, string>; revoked?: Record<string, boolean>; devBadgeId?: number };
+	fleet?: { url: string; token: string };
+	/** The analytics sink settings (`typetorch settings set analytics -`). */
+	analytics?: unknown;
+	/** The game's own live values (`typetorch settings set game.<key> <json>`; `TypeTorch.liveConfig`). */
+	game?: Record<string, unknown>;
 }
 
 /**
@@ -802,6 +845,13 @@ export interface ServerKernel {
 	messagingStatus?(): MessagingStatus;
 	/** fn(data) for every roll call ask on `TypeTorch/rollcall` while this generation runs (one per generation). */
 	onRollCall?(handler: (data: unknown) => void): void;
+
+	// Kernel 0.3.8 (additive): the signed settings record (plans/20). `settings` doubles as the feature test.
+	/** A copy of the verified settings, or undefined (none held yet). Server only: it holds tokens. */
+	settings?(): KernelSettings | undefined;
+	settingsStatus?(): SettingsStatus;
+	/** One handler per generation: a fresh copy after every new good copy (the framework installs it and fans out). */
+	onSettingsChanged?(handler: (settings: KernelSettings | undefined) => void): void;
 
 	/** `typetorch test --cloud`'s stub kernel: true (code that must not run in the gate checks it). */
 	readonly test?: boolean;

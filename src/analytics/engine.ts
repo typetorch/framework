@@ -10,7 +10,7 @@ import { ServerAnalytics } from "./server";
  * client. Nothing runs until one is created. Every engine created in a generation shares one core, which stops with
  * the generation; its unsent rows survive a hot swap in `persist`.
  *
- * The server sends rows to the sink in the settings (ConfigService key `TypeTorchAnalytics`, or `options.settings`).
+ * The server sends rows to the sink in the settings (the signed settings' `analytics`, kernel 0.3.8; or `options.settings`).
  * The client sends everything through the server, never to the internet. See the README "Analytics" section and
  * src/analytics/SCHEMA.md.
  */

@@ -6,10 +6,6 @@
 
 /** Row format version (column `v`). */
 export const SCHEMA_VERSION = 1;
-/** The ConfigService key (server-only) that holds the sink settings. */
-export const SETTINGS_KEY = "TypeTorchAnalytics";
-/** The kernel's fleet API settings `{ url, token }` (server-only ConfigService key); identities can go there. */
-export const FLEET_SETTINGS_KEY = "TypeTorchFleet";
 /** The first-session recording codec (column `codec`). */
 export const RECORDING_CODEC = "tt-rec-1";
 /** Most bytes of the `props` JSON text. Larger props become `{"_trunc":<bytes>}`. */
@@ -110,7 +106,7 @@ export interface ExperimentOverride {
 	variant?: string;
 }
 
-/** The sink settings: ConfigService key `TypeTorchAnalytics` (server-only), or `new AnalyticsEngine({ settings })`. */
+/** The sink settings: the signed settings' `analytics` (kernel 0.3.8, server-only), or `new AnalyticsEngine({ settings })`. */
 export interface AnalyticsSettings {
 	backend: "basin" | "duckdb";
 	/** basin: the events stream's ingest URL; duckdb: the analytics server's ingest URL. */
@@ -128,12 +124,12 @@ export interface AnalyticsSettings {
 	/** Live experiment overrides by experiment name. */
 	experiments?: Record<string, ExperimentOverride>;
 	/**
-	 * basin: where identity rows go (the fleet API's `POST /v1/identity` URL). Default: the `TypeTorchFleet` key's url
+	 * basin: where identity rows go (the fleet API's `POST /v1/identity` URL). Default: the settings' `fleet` url
 	 * + /v1/identity when the server can read it; without either, identities aren't sent. duckdb: unused (they go in
 	 * the batch body).
 	 */
 	identity?: string;
-	/** basin: the token for `identity` (default: the `TypeTorchFleet` token). Never logged. */
+	/** basin: the token for `identity` (default: the settings' `fleet` token). Never logged. */
 	identityToken?: string;
 }
 
@@ -168,7 +164,7 @@ export interface AnalyticsPurchase {
 
 /** What the automatic collectors do. Everything is on by default. */
 export interface AnalyticsOptions {
-	/** Server only: the sink settings. When set, the ConfigService key isn't read (tests, Studio). */
+	/** Server only: the sink settings. When set, the signed settings aren't read (tests, Studio, kernels before 0.3.8). */
 	settings?: AnalyticsSettings;
 	/** Server: joins, leaves, device, join source, first-ever vs returning. Default true. */
 	sessions?: boolean;

@@ -27,6 +27,7 @@ export { TypeTorch } from "./typetorch";
 export type { BranchChange, TypeTorchApi, TypeTorchFeatures } from "./typetorch";
 export type { MessageSource, MessagingApi, MessagingSubscribeOptions } from "./messaging";
 export type { GameServer, ServerListOptions } from "./servers";
+export type { LiveConfig, LiveConfigOptions } from "./settings";
 export { observePlayers } from "./players";
 export { createNetwork, setNetworkLimits } from "./net";
 export type {
@@ -52,6 +53,7 @@ export type {
 	GenerationHistoryEntry,
 	GenerationStart,
 	Kernel,
+	KernelSettings,
 	KernelStatus,
 	LogEntry,
 	MessageTarget,
@@ -62,6 +64,7 @@ export type {
 	PendingUpdate,
 	PreviousGeneration,
 	Role,
+	SettingsStatus,
 	ServerKernel,
 	ServerType,
 	StartReason,

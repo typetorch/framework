@@ -199,6 +199,11 @@ TypeTorch.onLog((entry) => errors.push(entry)); // don't print from inside it
 // Hot assets (below): same as hotAsset(...)
 const shop = TypeTorch.asset("ui/shop");
 
+// Live values, server only (kernel 0.3.8): the signed settings record's `game` field (`typetorch settings set game.<key> <json>`).
+const price = TypeTorch.liveConfig("shop.price", { default: 50, parse: (raw) => (typeIs(raw, "number") ? raw : 50) });
+price.get();
+this.trove.add(price.onChanged((value) => this.reprice(value)));
+
 // Cross-server, server only. Kernel 0.3.8: game topics over ONE kernel-held MessagingService topic; listeners hear
 // prod servers and this branch by default (dev branches never reach prod); publish queues and retries, max 1 KiB.
 this.trove.add(TypeTorch.messaging.subscribe<Ban>("1guard", (ban, meta) => applyBan(ban, meta.jobId)));
@@ -229,6 +234,11 @@ const list = TypeTorch.servers(); // [{ jobId, placeVersion, players, maxPlayers
   size), returns false when dropped at once (queue full). Studio loops back; the cloud test publishes nothing; older
   kernels throw "needs kernel 0.3.8". `servers()` works on every kernel (0.3.8 holds the roll call topic, so a swap
   doesn't subscribe again).
+- **`liveConfig(key, { default, parse? })`** (kernel 0.3.8, plans/20): reads `game[key]` of the signed settings record the
+  kernel verified (signed by both prod keys, so game code can't forge it); `get()` and `onChanged(fn)` (only on real
+  changes; generation-scoped). The default without a record or key, when `parse` throws (warned per value), and on older
+  kernels (warned once: "needs kernel 0.3.8"; no ConfigService fallback). `TypeTorch.settings()` is the whole copy
+  (`seq`, `at`, `game`, `analytics`, `fleet`, ...): server only, it holds tokens.
 - **Edit mode** (UI Labs stories, no kernel): `running` is false, identity has defaults, `persist` keeps a local table,
   events never fire, and the server-only reads throw.
 
@@ -302,7 +312,7 @@ self-hosted DuckDB analytics server). Nothing runs until an engine is created: n
 ```ts
 import { AnalyticsEngine } from "@typetorch/framework";
 
-// A server module (onInit): reads the ConfigService key TypeTorchAnalytics.
+// A server module (onInit): the sink comes from the signed settings' `analytics` (kernel 0.3.8).
 const analytics = new AnalyticsEngine();
 analytics.track(player, "quest_done", { quest: "tutorial" }); // custom
 analytics.step(player, "onboarding", 3, "opened_shop"); // funnels
@@ -332,13 +342,13 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   `TTZone`, named by a `Name` attribute or the instance name), `screens` (ScreenGuis in PlayerGui, GuiObjects tagged
   `TTScreen`), `recording` (the first-ever session in detail), `fleet` (kernel 0.3.2 heartbeats and deploy reports),
   `identity` (one `{ pid, uid }` row per session to the dev's own server, below). `settings` (server only) replaces the
-  ConfigService key, for tests.
+  signed settings' `analytics`, for tests, Studio and kernels before 0.3.8.
 - **Every row** carries the time (server clock), a random player id (never the UserId), the session, the server
   (JobId, type, place), the artifact (id, seq, branch, channel), the device, new vs returning, the player's state
   (`zone:Lobby|screen:Shop|activity:round`) and experiment variants. The exact rows: `src/analytics/SCHEMA.md`.
 - **Experiments:** `experiment(...)` is deterministic per player and name (they keep their variant in every session),
   may yield briefly the first time (until the player's id loads), and stamps the variant on the player's later events.
-  The settings key turns one off (`active: false`: everyone gets the first variant), sets `weights` or forces a
+  The settings turn one off (`active: false`: everyone gets the first variant), sets `weights` or forces a
   `variant`, live.
 - **First-ever session:** for new players (a share of them, `recordShare`), the client records character and camera
   about 10 times a second, every input (never while a TextBox or the chat has focus; text boxes only say which box was
@@ -348,7 +358,7 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   row carries a UserId.
 - **Identities** (option `identity`, default on): once the pid is known, one row `{ pid, uid, t }` (the UserId, nothing
   else) per session goes to the dev's own server only, never into the events: duckdb games in the batch body, Basin
-  games to the fleet API (`TypeTorchFleet` url + `/v1/identity`, or the `identity` / `identityToken` settings). The
+  games to the fleet API (the settings' `fleet` url + `/v1/identity`, or the `identity` / `identityToken` settings). The
   analytics server keeps pid -> UserId in a deletable table (support lookups, Right to Erasure).
 - **Player ids:** DataStore `TypeTorchAnalytics`, key `p/<UserId>` -> `{ pid, first, last }`: one read per join, a
   write on the first join and at leave. Deleting the key (Right to Erasure) leaves that player's rows anonymous.
@@ -367,9 +377,10 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
 - **Friends in the server** (the join's `friends`): one `Players:GetFriendsAsync` per join (at most 10 pages, none
   when the player is alone) intersected with the players there, not a web call per player.
 
-**Settings** (server only, never sent to clients): the ConfigService key `TypeTorchAnalytics`, written with
-`writeSettings()` from `@typetorch/analytics` (Open Cloud, universe:write) or in Creator Hub (Configs); no CLI command
-writes it. Re-read live every few minutes:
+**Settings** (server only, never sent to clients): the signed settings record's `analytics` field (kernel 0.3.8,
+plans/20), written with `typetorch settings set analytics -` (JSON on stdin; `@typetorch/analytics`' `writeSettings()`
+and `bun run local` call it). Every new copy applies live within seconds (the CLI pings servers). Before kernel 0.3.8
+there are no settings unless the game passes `new AnalyticsEngine({ settings })`:
 
 ```json
 { "backend": "basin", "events": "https://<stream-id>.ingest.cloudflare.com",

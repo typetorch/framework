@@ -1,6 +1,5 @@
 import {
 	CollectionService,
-	ConfigService,
 	DataStoreService,
 	HttpService,
 	LocalizationService,
@@ -11,9 +10,10 @@ import {
 } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
-import type { ServerKernel } from "../kernel";
+import type { KernelSettings, ServerKernel } from "../kernel";
 import { maybeServerDispatcher } from "../net/runtime";
 import { observePlayers } from "../players";
+import { currentSettings, onSettings, settingsSupported } from "../settings";
 import { closeHooksSupported, onGenerationClose, TypeTorch, type GenerationScope } from "../typetorch";
 import { toBase64 } from "./codec";
 import { encodeProps, scrubNames } from "./props";
@@ -30,10 +30,8 @@ import {
 } from "./protocol";
 import { backoffSeconds, classifyStatus, newQueueState, RowQueue, takeToken, type BucketState, type QueueState } from "./queue";
 import {
-	FLEET_SETTINGS_KEY,
 	RECORDING_CODEC,
 	SCHEMA_VERSION,
-	SETTINGS_KEY,
 	type AnalyticsOptions,
 	type AnalyticsProps,
 	type AnalyticsStats,
@@ -100,7 +98,6 @@ const RECORDING_MAX_CHUNKS = 80;
 const RECORDING_MAX_SECONDS = 900;
 /** The join event waits this long for the client's device info. */
 const DEVICE_WAIT = 8;
-const SETTINGS_REFRESH = 180;
 const ZONE_INTERVAL = 0.5;
 const ZONE_TAG = "TTZone";
 
@@ -286,7 +283,7 @@ export class ServerAnalytics {
 	private settingsErrors = new Array<string>();
 	/** The first settings read finished (found or not), so experiment overrides are as known as they get. */
 	private settingsTried = false;
-	/** The `TypeTorchFleet` value (Basin games send identities to the fleet API). */
+	/** The settings' `fleet` value (Basin games send identities to the fleet API). */
 	private fleetSettings?: unknown;
 	private nextFlushAt = 0;
 	private backoffUntil = 0;
@@ -541,7 +538,7 @@ export class ServerAnalytics {
 	private applySettings(parsed: ParsedSettings) {
 		const errorsText = parsed.errors.join("; ");
 		if (errorsText !== this.settingsErrors.join("; ") && errorsText !== "") {
-			$warn(`[analytics] ${SETTINGS_KEY}: ${errorsText}`);
+			$warn(`[analytics] settings.analytics: ${errorsText}`);
 		}
 		this.settingsErrors = parsed.errors;
 		const hadSettings = this.settings !== undefined;
@@ -563,54 +560,32 @@ export class ServerAnalytics {
 			this.settingsTried = true;
 			return;
 		}
+		// Kernel 0.3.8 (plans/20): the signed settings record's `analytics` (the sink) and `fleet` (identities on Basin),
+		// live through the kernel's change hook. Older kernels have no settings (no ConfigService fallback): pass
+		// `new AnalyticsEngine({ settings })`.
+		if (!settingsSupported()) {
+			if (this.kernel !== undefined && this.kernel.test !== true) {
+				$warn(
+					`[analytics] no sink settings: they come from the signed settings record (kernel 0.3.8+, "typetorch settings set analytics -"); this server runs kernel ${this.kernel.kernelVersion}. Or pass new AnalyticsEngine({ settings })`,
+				);
+			}
+			this.settingsTried = true;
+			return;
+		}
 		let lastRaw: string | undefined;
-		let missing = false;
-		let snapshot: ConfigSnapshot | undefined;
-		const read = (force: boolean) => {
-			if (!snapshot || (missing && !force)) return;
-			const [fleetOk, fleetValue] = pcall(() => snapshot!.GetValue(FLEET_SETTINGS_KEY));
-			if (fleetOk) this.fleetSettings = fleetValue;
-			const [ok, value] = pcall(() => snapshot!.GetValue(SETTINGS_KEY));
-			if (!ok) return;
-			missing = value === undefined;
+		const apply = (settings: KernelSettings | undefined) => {
+			this.fleetSettings = settings?.fleet;
+			const value = settings?.analytics;
 			// Compare without decoding twice; the text never reaches a log.
-			const [encodedOk, raw] = pcall(() => (typeIs(value, "string") ? value : HttpService.JSONEncode(value)));
-			const text = value === undefined ? "" : encodedOk ? raw : tostring(os.clock());
+			const [encodedOk, raw] = pcall(() => (value === undefined ? "" : HttpService.JSONEncode(value)));
+			const text = encodedOk ? raw : tostring(os.clock());
 			if (text === lastRaw) return;
 			lastRaw = text;
 			this.applySettings(parseSettings(value, decode));
 		};
-		this.trove.add(
-			task.spawn(() => {
-				let delay = 2;
-				for (let attempt = 1; attempt <= 6 && !snapshot; attempt++) {
-					const [ok, result] = pcall(() => ConfigService.GetConfigAsync());
-					if (ok) snapshot = result;
-					else {
-						if (attempt === 1) $warn(`[analytics] ConfigService unavailable: ${tostring(result).sub(1, 120)}`);
-						task.wait(delay);
-						delay = math.min(delay * 2, 30);
-					}
-				}
-				if (!snapshot) {
-					this.settingsTried = true;
-					return;
-				}
-				const current = snapshot;
-				this.trove.connect(current.UpdateAvailable, () => {
-					pcall(() => current.Refresh());
-					read(true);
-				});
-				pcall(() => this.trove.connect(current.GetValueChangedSignal(SETTINGS_KEY), () => read(true)));
-				read(true);
-				this.settingsTried = true;
-				while (true) {
-					task.wait(SETTINGS_REFRESH);
-					pcall(() => current.Refresh());
-					read(false);
-				}
-			}),
-		);
+		apply(currentSettings());
+		this.settingsTried = true;
+		this.trove.add(onSettings(apply));
 	}
 
 	// Sessions ---------------------------------------------------------------------------------------------------------
@@ -1350,7 +1325,7 @@ export class ServerAnalytics {
 				const fix = status === 530 ? ": the tunnel is down, run bun run local on the dev PC" : "";
 				this.warn(
 					outcome === "config"
-						? `${what} got HTTP ${status}: check the URL and token in ${SETTINGS_KEY}; retrying in ${math.floor(wait)} s`
+						? `${what} got HTTP ${status}: check the URL and token in settings.analytics (typetorch settings set analytics -); retrying in ${math.floor(wait)} s`
 						: `${what} failed (${reason}${fix}); retrying in ${math.floor(wait)} s`,
 				);
 			}

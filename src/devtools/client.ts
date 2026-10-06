@@ -59,7 +59,7 @@ import { Layout, newLayout, sanitizeLayout } from "./layout";
 import { createWindowManager, PaneHost, PaneTab, PickItem, WindowManager } from "./panes";
 import { describeState } from "./state";
 import type { ArtifactNotes } from "./artifact-notes";
-import { badgeLevel, checkHealth, HealthIssue, HealthLevel, healthLimitsText, ServerFacts } from "./health";
+import { badgeLevel, checkHealth, HealthIssue, HealthLevel, healthLimitsText, ServerFacts, settingsText } from "./health";
 import { NEEDS_KERNEL_AB } from "./ab";
 import {
 	addButton,
@@ -877,6 +877,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			body.field("Memory", typeIs(status.memoryMb, "number") ? "%.0f MB".format(status.memoryMb) : "-");
 			body.field("Lua heap", typeIs(status.luaHeapKb, "number") ? "%.1f MB".format(status.luaHeapKb / 1024) : "-");
 			body.field("Registry seq", str(status.appliedSeq));
+			// Kernel 0.3.8 (plans/20): the signed settings record ("#12, 3m old, sig").
+			if (status.settings !== undefined) body.field("Settings", settingsText(status.settings), status.settings.state === "ok" ? COLORS.text : COLORS.warn);
 			body.field("Kernel", `${status.kernelVersion}${status.kernelBuild !== undefined ? `@${status.kernelBuild}` : ""} (API ${status.kernelApi})`);
 			if (status.registryError !== undefined) body.field("Registry error", status.registryError, COLORS.bad);
 
@@ -977,8 +979,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				if (entry.i <= since) continue;
 				since = entry.i;
 				const line = `${os.date("%H:%M:%S", entry.t)}  ${entry.text.sub(1, 600)}`;
-				// The kernel's own notes (info lines starting "[TypeTorch] ", e.g. kernel 0.3.5's "no ConfigService registry
-				// (optional)") are dim: nothing to act on.
+				// The kernel's own notes (info lines starting "[TypeTorch] ") are dim: nothing to act on.
 				const kernelNote = entry.kind === "info" && entry.text.sub(1, 12) === "[TypeTorch] ";
 				shown.push(rows.text(line, kernelNote ? COLORS.dim : LOG_COLORS[entry.kind] ?? COLORS.text, true));
 			}

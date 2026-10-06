@@ -1,5 +1,5 @@
 /**
- * The sink settings (ConfigService key `TypeTorchAnalytics`, or `new AnalyticsEngine({ settings })`): parsing with
+ * The sink settings (the signed settings' `analytics`, kernel 0.3.8, or `new AnalyticsEngine({ settings })`): parsing with
  * defaults and clamps. Errors never repeat the token.
  *
  * Pure: no imports and no services, so it also runs offline under Lune (scripts/test-analytics.luau). The JSON
@@ -126,7 +126,7 @@ export function parseSettings(raw: unknown, decode: (text: string) => unknown): 
 	};
 }
 
-/** Where identity rows go on a Basin game: the fleet API (`TypeTorchFleet` = { url, token }) at /v1/identity. */
+/** Where identity rows go on a Basin game: the fleet API (the settings' `fleet` = { url, token }) at /v1/identity. */
 export interface IdentityTarget {
 	url: string;
 	token?: string;
@@ -134,7 +134,7 @@ export interface IdentityTarget {
 
 /**
  * The identity target for these settings: duckdb none (identities ride in the batch body); basin the `identity` URL,
- * else the fleet API's /v1/identity from the `TypeTorchFleet` value (a table or JSON `{ url, token }`), else none.
+ * else the fleet API's /v1/identity from the settings' `fleet` value (a table or JSON `{ url, token }`), else none.
  */
 export function identityTarget(settings: ResolvedSettings, fleetRaw: unknown, decode: (text: string) => unknown): IdentityTarget | undefined {
 	if (settings.backend === "duckdb") return undefined;
