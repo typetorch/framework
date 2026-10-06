@@ -21,6 +21,8 @@ import { ClientDispatcher, ServerDispatcher, setClientDispatcher, setServerDispa
 import { observePlayers } from "../players";
 import { Reflect } from "../reflection/reflect";
 import { bindTypeTorch, closeTypeTorch, startedTypeTorch, swapOutTypeTorch, TypeTorch, unbindTypeTorch } from "../typetorch";
+import { addModuleInstance, createLazy, isLazyTypeId, LAZY_PARAMETER, nameOfId, setModulePhase } from "./dependency";
+import { bindPlayerStates, playerState as openPlayerState } from "./player-state";
 import { persistKeys, RegisteredModule, registered, runningModules } from "./registry";
 
 export interface StartOptions {
@@ -45,17 +47,50 @@ function requireAll(folders: Instance[]) {
 	}
 }
 
-function dependenciesOf(ctor: object): object[] {
-	// Written by @typetorch/transformer on classes decorated with @Service / @Controller (constructor parameter ids).
+/** One constructor parameter: a module injected now, or a `Lazy<T>` resolved on first use (no start-order edge). */
+type Parameter =
+	| { readonly kind: "module"; readonly ctor: object }
+	| { readonly kind: "lazy"; readonly ctor: object; readonly id: string };
+
+function parametersOf(ctor: object): Parameter[] {
+	// Written by @typetorch/transformer on classes decorated with @Service / @Controller (constructor parameter ids);
+	// 0.2.1+ writes `lazy:<id>` for a parameter typed Lazy<T>.
 	const ids = Reflect.getOwnMetadata<string[]>(ctor, "typetorch:parameters") ?? [];
-	return ids.map((id) => {
+	return ids.map((id, index): Parameter => {
+		if (id.sub(1, LAZY_PARAMETER.size()) === LAZY_PARAMETER) {
+			const target = id.sub(LAZY_PARAMETER.size() + 1);
+			const dependency = Reflect.idToObj.get(target);
+			assert(dependency, `${tostring(ctor)} takes Lazy<${nameOfId(target)}> (${target}), which is not a loaded @Service/@Controller`);
+			return { kind: "lazy", ctor: dependency, id: target };
+		}
+		if (isLazyTypeId(id)) {
+			error(
+				`${tostring(ctor)}: constructor parameter ${index + 1} is a Lazy<T>, but this build's @typetorch/transformer doesn't record T (Lazy constructor parameters need 0.2.1 or later). Use a field instead: \`private readonly team = Lazy<TeamService>()\``,
+				0,
+			);
+		}
 		const dependency = Reflect.idToObj.get(id);
 		assert(dependency, `${tostring(ctor)} needs ${id}, which is not a loaded @Service/@Controller`);
-		return dependency;
+		return { kind: "module", ctor: dependency };
 	});
 }
 
-/** Dependencies first; ties broken by loadOrder, then name. A cycle is a startup error that names it. */
+/** "dependency cycle: A -> B -> A. Break it: ..." (only the cycle, not the path that led to it). */
+function cycleError(path: string[], name: string): never {
+	const from = path.indexOf(name);
+	const cycle = path.filter((_, index) => index >= from);
+	cycle.push(name);
+	const closer = cycle[cycle.size() - 2];
+	error(
+		`dependency cycle: ${cycle.join(" -> ")}. Break it: ${closer} can take ${name} as Lazy<${name}> (a constructor parameter, or a field \`= Lazy<${name}>()\`; resolved on first use, so the start order ignores it), or call Dependency<${name}>() inside a method`,
+		0,
+	);
+}
+
+/**
+ * Dependencies first; ties broken by loadOrder, then name. Lazy parameters add no edge. A cycle is a startup error that
+ * names it and says how to break it.
+ */
 function order(modules: RegisteredModule[]): RegisteredModule[] {
 	const byCtor = new Map<object, RegisteredModule>();
 	for (const mod of modules) byCtor.set(mod.ctor, mod);
@@ -69,12 +104,13 @@ function order(modules: RegisteredModule[]): RegisteredModule[] {
 	const visit = (mod: RegisteredModule, path: string[]) => {
 		const current = state.get(mod.ctor);
 		if (current === "done") return;
-		if (current === "visiting") error(`dependency cycle: ${[...path, tostring(mod.ctor)].join(" -> ")}`);
+		if (current === "visiting") cycleError(path, tostring(mod.ctor));
 		state.set(mod.ctor, "visiting");
-		for (const dependency of dependenciesOf(mod.ctor)) {
-			const dependencyModule = byCtor.get(dependency);
-			assert(dependencyModule, `${tostring(mod.ctor)} needs ${tostring(dependency)}, which runs on the other realm`);
-			visit(dependencyModule, [...path, tostring(mod.ctor)]);
+		for (const parameter of parametersOf(mod.ctor)) {
+			const dependencyModule = byCtor.get(parameter.ctor);
+			const what = parameter.kind === "lazy" ? `Lazy<${tostring(parameter.ctor)}>` : tostring(parameter.ctor);
+			assert(dependencyModule, `${tostring(mod.ctor)} needs ${what}, which runs on the other realm`);
+			if (parameter.kind === "module") visit(dependencyModule, [...path, tostring(mod.ctor)]);
 		}
 		state.set(mod.ctor, "done");
 		result.push(mod);
@@ -101,9 +137,12 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 	const startedAt = os.clock();
 	const root = new Trove();
 	persistKeys.clear();
+	// Dependency<T>() / Lazy<T> fail with "isn't constructed yet" until every module is constructed.
+	setModulePhase("loading", realm);
 	// Before anything else, so module top-level code, devtools and modules can use TypeTorch.
 	bindTypeTorch(realm, kernel, options.build ?? {}, root);
 	bindHotAssets(root);
+	bindPlayerStates(root, <T extends object>(key: string, init: () => T) => TypeTorch.persist(key, init));
 	const context: ModuleContext = {
 		realm,
 		artifact: kernel.artifact,
@@ -114,6 +153,9 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 		kernel,
 		persist<T extends object>(key: string, init: () => T): T {
 			return TypeTorch.persist(key, init);
+		},
+		playerState<T>(key: string, init: (player: Player) => T) {
+			return openPlayerState(key, init);
 		},
 	};
 
@@ -165,25 +207,34 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 			root.remove(running.trove);
 		}
 		runningModules.clear();
+		setModulePhase("stopped");
 	};
 
+	setModulePhase("constructing");
 	const [initialized, initError] = pcall(() => {
 		for (const mod of ordered) {
-			const dependencies = dependenciesOf(mod.ctor);
+			const parameters = parametersOf(mod.ctor);
 			const ctor = mod.ctor as new (...args: unknown[]) => object;
-			const instance = new ctor(...dependencies.map((dependency) => instances.get(dependency)!));
+			const instance = new ctor(
+				...parameters.map((parameter) => (parameter.kind === "lazy" ? createLazy(parameter.id) : instances.get(parameter.ctor)!)),
+			);
 			const trove = root.extend();
 			(instance as { trove: Trove }).trove = trove;
 			(instance as { ctx: ModuleContext }).ctx = context;
 			instances.set(mod.ctor, instance);
+			addModuleInstance(mod.ctor, instance);
 			runningModules.push({
 				name: tostring(mod.ctor),
 				instance,
 				trove,
-				dependencies: dependencies.map((dependency) => tostring(dependency)),
+				dependencies: parameters.map((parameter) =>
+					parameter.kind === "lazy" ? `${tostring(parameter.ctor)} (lazy)` : tostring(parameter.ctor),
+				),
 				loadOrder: mod.config.loadOrder ?? 0,
 			});
 		}
+		// Every module exists: Dependency<T>(), TypeTorch.module<T>() and Lazy<T>.get() work from here (onInit on).
+		setModulePhase("ready");
 		for (const running of runningModules) {
 			if (!has(running.instance, "onInit")) continue;
 			const initStarted = os.clock();

@@ -22,6 +22,9 @@ import type {
 } from "./kernel";
 import { normalRole } from "./kernel";
 import type { BuildInfo } from "./module";
+import type { Modding } from "./reflection/modding";
+import { resolveModule, tryResolveModule } from "./runtime/dependency";
+import { playerState, type PlayerState } from "./runtime/player-state";
 import { persistKeys } from "./runtime/registry";
 import { hotAsset, type HotAsset } from "./assets/hot-asset";
 
@@ -96,6 +99,30 @@ export interface TypeTorchApi {
 	 * its trove. Version the key (`"shop.v2"`) when the shape changes. Keys starting with `__` are reserved.
 	 */
 	persist<T extends object>(key: string, init: () => T): T;
+	/**
+	 * Per-player state that survives swaps, keyed by UserId (same as `ctx.playerState`): `get(player)` stores
+	 * `init(player)` the first time, then `set`, `has`, `delete`. A player's entry is removed when they really leave,
+	 * never on a swap. Plain data only (the `persist` rules). The dev menu shows it under persist, `__playerState`.
+	 */
+	playerState<T>(key: string, init: (player: Player) => T): PlayerState<T>;
+
+	// Modules ----------------------------------------------------------------------------------------------------------
+	/**
+	 * The running module of type T (a @Service on the server, a @Controller on the client), for code that isn't a
+	 * constructor: methods, plain classes, command handlers. Same as `Dependency<T>()`. Works from onInit/onStart on;
+	 * throws a clear error before every module is constructed (a constructor, a field initializer, module top-level
+	 * code), for the other realm's modules, and once this generation stopped.
+	 *
+	 * @metadata macro
+	 */
+	module<T>(id?: Modding.Generic<T, "id">): T;
+	/**
+	 * Like `module`, but undefined instead of an error (not constructed yet, other realm, not a module, stopped, edit
+	 * mode).
+	 *
+	 * @metadata macro
+	 */
+	tryModule<T>(id?: Modding.Generic<T, "id">): T | undefined;
 
 	// Dev and roles ----------------------------------------------------------------------------------------------------
 	/**
@@ -328,6 +355,18 @@ class TypeTorchRuntime implements TypeTorchApi {
 		}
 		persistKeys.set(key, value);
 		return value;
+	}
+
+	playerState<T>(key: string, init: (player: Player) => T): PlayerState<T> {
+		return playerState(key, init);
+	}
+
+	module<T>(id?: Modding.Generic<T, "id">): T {
+		return resolveModule(id, (name) => `TypeTorch.module<${name}>()`) as T;
+	}
+
+	tryModule<T>(id?: Modding.Generic<T, "id">): T | undefined {
+		return tryResolveModule(id, (name) => `TypeTorch.tryModule<${name}>()`) as T | undefined;
 	}
 
 	devInfo(player: Player): DevInfo {

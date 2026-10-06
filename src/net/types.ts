@@ -14,6 +14,11 @@ type Disconnect = () => void;
 export interface ServerReceiver<A extends unknown[], R> {
 	on(handler: (player: Player, ...args: A) => void): Disconnect;
 	handle(handler: (player: Player, ...args: A) => R): Disconnect;
+	/**
+	 * Runs this generation's `on` handlers now, as if `player` had sent it: no network, no limits, no guard. For tests
+	 * and server-side reuse of a handler.
+	 */
+	emit(player: Player, ...args: A): void;
 }
 /** Server view of a server → client leaf. */
 export interface ServerSender<A extends unknown[]> {
@@ -28,11 +33,19 @@ export interface ServerSender<A extends unknown[]> {
 export interface ClientSender<A extends unknown[], R> {
 	fire(...args: A): void;
 	fireUnreliable(...args: A): void;
+	/** Rejects when the server doesn't answer in time: the leaf's `timeout` (setNetworkLimits), else 15 s. */
 	invoke(...args: A): Promise<R>;
+	/** `invoke` that gives up after `seconds` (0.5 to 120; outside that it is clamped, with one warning). */
+	invokeWithTimeout(seconds: number, ...args: A): Promise<R>;
 }
 /** Client view of a server → client leaf. */
 export interface ClientReceiver<A extends unknown[]> {
 	on(handler: (...args: A) => void): Disconnect;
+	/**
+	 * Runs this generation's `on` handlers now, as if the server had sent it (Flamework's `predict`): no network
+	 * traffic, no guard. Handlers run in order on the calling thread; one that throws is warned and the rest still run.
+	 */
+	emit(...args: A): void;
 }
 
 type C2SOnServer<T> = {
@@ -65,4 +78,9 @@ export interface LeafLimits {
 	maxString?: number;
 	maxEntries?: number;
 	maxDepth?: number;
+	/**
+	 * Requests: seconds the client's `invoke` waits for the answer (default 15, 0.5 to 120). The client reads it, so
+	 * set it in code both realms load (e.g. next to createNetwork). `invokeWithTimeout` overrides it per call.
+	 */
+	timeout?: number;
 }

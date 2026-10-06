@@ -29,6 +29,9 @@ class ServerLeaf {
 	handle(handler: (player: Player, ...args: unknown[]) => unknown): Disconnect {
 		return serverDispatcher().setHandler(this.path, handler);
 	}
+	emit(player: Player, ...args: unknown[]) {
+		serverDispatcher().emit(player, this.path, args);
+	}
 	fire(player: Player, ...args: unknown[]) {
 		serverDispatcher().send(player, this.path, args);
 	}
@@ -65,8 +68,14 @@ class ClientLeaf {
 	invoke(...args: unknown[]): Promise<unknown> {
 		return clientDispatcher().invoke(this.path, args);
 	}
+	invokeWithTimeout(seconds: number, ...args: unknown[]): Promise<unknown> {
+		return clientDispatcher().invoke(this.path, args, seconds);
+	}
 	on(handler: (...args: unknown[]) => void): Disconnect {
 		return clientDispatcher().addListener(this.path, handler);
+	}
+	emit(...args: unknown[]) {
+		clientDispatcher().emit(this.path, args);
 	}
 }
 
@@ -103,7 +112,9 @@ function place<T extends object>(root: Record<string, unknown>, path: string, cr
  * //         network.server.coins.changed.fire(player, 42)
  * // client: network.client.coins.collect.fire("coin-3")
  * //         network.client.coins.balance.invoke().then(...)
+ * //         network.client.coins.balance.invokeWithTimeout(5).then(...)
  * //         network.client.coins.changed.on((total) => ...)
+ * //         network.client.coins.changed.emit(42) // runs the local `on` handlers, no traffic (Flamework's predict)
  * ```
  *
  * `@typetorch/transformer` fills in a runtime type guard for every leaf (both directions, nested namespaces
@@ -141,7 +152,11 @@ export function createNetwork<ClientToServer extends object, ServerToClient exte
 	};
 }
 
-/** Overrides rate/shape limits for client -> server leaves by dotted path, e.g. `{ "chat.say": { maxString: 200 } }`. */
+/**
+ * Overrides limits for client -> server leaves by dotted path, e.g. `{ "chat.say": { maxString: 200 } }`. The server
+ * reads rate and shape limits; the client reads a request's `timeout` (`{ "vc.spawn": { timeout: 30 } }`), so call it
+ * where both realms load it (next to createNetwork) when you set one.
+ */
 export function setNetworkLimits(limits: Record<string, LeafLimits>) {
 	for (const [path, value] of pairs(limits)) registeredLimits.set(path as string, value);
 }
