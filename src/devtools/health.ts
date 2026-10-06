@@ -3,6 +3,17 @@ import type { KernelStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
 export const LATEST_KERNEL = "0.3.4";
+
+/** The fleet API's last error as a short fix (the dev PC's `bun run local` restarts the server and its tunnel). */
+export function fleetFix(lastError: string | undefined): string {
+	if (lastError === undefined) return "-";
+	if (lastError === "HTTP 530") return "HTTP 530: tunnel down. Run bun run local";
+	if (lastError === "HTTP 502" || lastError === "HTTP 504") return `${lastError}: server down. Run bun run local`;
+	if (lastError === "HTTP 401" || lastError === "HTTP 403") return `${lastError}: token mismatch. Run fleet setup`;
+	if (lastError === "HTTP 404") return "HTTP 404: wrong URL. Run bun run local";
+	if (lastError === "HTTP 429") return "HTTP 429: rate limited";
+	return lastError;
+}
 /** The oldest kernel API this framework runs on. */
 export const REQUIRED_KERNEL_API = 1;
 /** The first kernel that writes the heartbeat and deploy reports itself. */
@@ -124,7 +135,7 @@ export function deployIssues(status: KernelStatus): HealthIssue[] {
 	} else if (fleet?.settings === "invalid") {
 		issues.push({ level: "warn", title: "Fleet settings", detail: fleet.settingsError ?? "TypeTorchFleet is invalid." });
 	} else if (fleet?.enabled === true && fleet.lastErrorAt !== undefined && (fleet.lastOkAt === undefined || fleet.lastErrorAt > fleet.lastOkAt)) {
-		issues.push({ level: "warn", title: "Fleet API failing", detail: fleet.lastError ?? "-" });
+		issues.push({ level: "warn", title: "Fleet API failing", detail: fleetFix(fleet.lastError) });
 	}
 	const clients = status.clients;
 	if (clients !== undefined && clients.failed > 0) {
