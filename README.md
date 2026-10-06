@@ -198,6 +198,15 @@ TypeTorch.onLog((entry) => errors.push(entry)); // don't print from inside it
 
 // Hot assets (below): same as hotAsset(...)
 const shop = TypeTorch.asset("ui/shop");
+
+// Cross-server, server only. Kernel 0.3.8: game topics over ONE kernel-held MessagingService topic; listeners hear
+// prod servers and this branch by default (dev branches never reach prod); publish queues and retries, max 1 KiB.
+this.trove.add(TypeTorch.messaging.subscribe<Ban>("1guard", (ban, meta) => applyBan(ban, meta.jobId)));
+TypeTorch.messaging.publish("1guard", { kind: "ban", userId }, { to: "prod" });
+
+// The universe's live servers (the roll call; cached per server, yields up to ~3 s when stale) and this server's public fields
+TypeTorch.setServerInfo({ region: "eu", vc: true }); // JSON, at most 400 bytes, kept across swaps
+const list = TypeTorch.servers(); // [{ jobId, placeVersion, players, maxPlayers, serverType, branch, channel, uptime, here, info }]
 ```
 
 - **`startInfo.reason`:** `boot`, `deploy`, `rollback`, `branch`, `pin`, `reload`, `server_rollback`,
@@ -214,6 +223,12 @@ const shop = TypeTorch.asset("ui/shop");
   reason and timings, the next artifact in `onSwapOut`, `onUpdatePending`, server-side `onPlayerDevChanged` and
   `requestReload`. On older kernels `startInfo` still knows boot vs swap, the previous artifact and branch (the
   framework records them), `onBranchChanged` still fires, and the reason of a swap is `unknown`.
+- **`messaging`** (kernel 0.3.8): `subscribe(topic, (data, meta) => ...)` returns a disconnect; `meta` = `{ channel,
+  branch, jobId, serverType, placeVersion, sentAt, self, replayed? }`; `{ from: "all" | "prod" | "branch" }` changes
+  who it hears. `publish(topic, data, { to })` throws on a bad topic, non-JSON data or a message over 1 KiB (with its
+  size), returns false when dropped at once (queue full). Studio loops back; the cloud test publishes nothing; older
+  kernels throw "needs kernel 0.3.8". `servers()` works on every kernel (0.3.8 holds the roll call topic, so a swap
+  doesn't subscribe again).
 - **Edit mode** (UI Labs stories, no kernel): `running` is false, identity has defaults, `persist` keeps a local table,
   events never fire, and the server-only reads throw.
 

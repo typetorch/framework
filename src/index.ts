@@ -25,6 +25,8 @@ export { startClient, startServer } from "./runtime/start";
 export type { StartOptions, StopGeneration } from "./runtime/start";
 export { TypeTorch } from "./typetorch";
 export type { BranchChange, TypeTorchApi, TypeTorchFeatures } from "./typetorch";
+export type { MessageSource, MessagingApi, MessagingSubscribeOptions } from "./messaging";
+export type { GameServer, ServerListOptions } from "./servers";
 export { observePlayers } from "./players";
 export { createNetwork, setNetworkLimits } from "./net";
 export type {
@@ -46,11 +48,16 @@ export type {
 	Channel,
 	ClientKernel,
 	DevInfo,
+	GameMessageMeta,
 	GenerationHistoryEntry,
 	GenerationStart,
 	Kernel,
 	KernelStatus,
 	LogEntry,
+	MessageTarget,
+	MessagingPublishOptions,
+	MessagingPublishReport,
+	MessagingStatus,
 	NewServerReport,
 	PendingUpdate,
 	PreviousGeneration,

@@ -24,6 +24,8 @@ import { normalRole } from "./kernel";
 import type { BuildInfo } from "./module";
 import { persistKeys } from "./runtime/registry";
 import { hotAsset, type HotAsset } from "./assets/hot-asset";
+import { bindMessaging, messaging, messagingSupported, unbindMessaging, type MessagingApi } from "./messaging";
+import { bindServers, listServers, setServerInfo, unbindServers, type GameServer, type ServerListOptions } from "./servers";
 
 /**
  * `TypeTorch`: the runtime API for game code, on the server and the client. It describes the running generation
@@ -56,6 +58,8 @@ export interface TypeTorchFeatures {
 	readonly artifacts: boolean;
 	/** `requestReload` works (0.2.2+). */
 	readonly requestReload: boolean;
+	/** `TypeTorch.messaging` reaches other servers (a server on kernel 0.3.8+ whose place maps its Messaging module). */
+	readonly messaging: boolean;
 }
 
 export interface TypeTorchApi {
@@ -169,6 +173,26 @@ export interface TypeTorchApi {
 	 * version and a `changed` event, on the server and the client. Same as `hotAsset(keyOrId, fallback)`.
 	 */
 	asset(keyOrId: string | number, fallback?: Instance): HotAsset;
+
+	// Cross-server (server only) ----------------------------------------------------------------------------------------
+	/**
+	 * Kernel 0.3.8: cross-server messages over one MessagingService topic the kernel holds (no subscription per game
+	 * topic, none again on a swap). `subscribe(topic, (data, meta) => ...)` returns a disconnect for the trove;
+	 * `publish(topic, data, { to })` queues and retries. Listeners hear prod servers and this branch by default, so dev
+	 * branches never reach prod. Older kernels: throws "needs kernel 0.3.8". See src/messaging.ts.
+	 */
+	readonly messaging: MessagingApi;
+	/**
+	 * Server only. The universe's live servers from the roll call (JobId, place version, players, server type, branch,
+	 * channel, uptime, and each server's `setServerInfo` fields). Cached per server for clamp(3 s x servers, 30 s,
+	 * 10 min); yields up to ~3 s when stale. Default: prod servers and this branch's (`includeDev` for all).
+	 */
+	servers(options?: ServerListOptions): GameServer[];
+	/**
+	 * Server only. Public fields of this server for every server's `servers()` (e.g. `{ region: "eu", vc: true }`): JSON,
+	 * at most 400 bytes, kept across swaps; `undefined` clears them. Never put secrets here.
+	 */
+	setServerInfo(info: Record<string, unknown> | undefined): void;
 }
 
 // State of this generation's binding ------------------------------------------------------------------------------------
@@ -205,6 +229,7 @@ const NO_FEATURES: TypeTorchFeatures = {
 	devChanged: false,
 	artifacts: false,
 	requestReload: false,
+	messaging: false,
 };
 
 function hasMethod(kernel: object, name: string): boolean {
@@ -413,6 +438,18 @@ class TypeTorchRuntime implements TypeTorchApi {
 	asset(keyOrId: string | number, fallback?: Instance): HotAsset {
 		return hotAsset(keyOrId, fallback);
 	}
+
+	messaging: MessagingApi = messaging;
+
+	servers(options?: ServerListOptions): GameServer[] {
+		if (client) error("TypeTorch.servers() is server-only", 2);
+		return listServers(options);
+	}
+
+	setServerInfo(info: Record<string, unknown> | undefined) {
+		if (client) error("TypeTorch.setServerInfo() is server-only", 2);
+		setServerInfo(info);
+	}
 }
 
 /** The runtime API for game code (server and client). See `TypeTorchApi` and the README. */
@@ -439,9 +476,12 @@ export function bindTypeTorch(
 	runtime.branch = kernel.branch ?? build.branch ?? "unknown";
 	// A client that doesn't know the channel assumes the strictest.
 	runtime.channel = kernel.channel ?? "prod";
+	// Kernel 0.3.8: game messaging; the roll call behind servers() and Manage > Servers (one per generation).
+	bindMessaging(realm, kernel, trove, runtime.branch, runtime.kernelVersion);
 	if (realm === "server") {
 		server = kernel as ServerKernel;
 		runtime.serverType = server.serverType;
+		bindServers(server, trove, runtime.branch);
 	} else {
 		client = kernel as ClientKernel;
 		runtime.serverType = client.serverType ?? guessServerType();
@@ -491,6 +531,7 @@ export function bindTypeTorch(
 		devChanged,
 		artifacts: server !== undefined && hasMethod(server, "artifacts"),
 		requestReload: server !== undefined && hasMethod(server, "requestReload"),
+		messaging: messagingSupported(),
 	};
 }
 
@@ -569,6 +610,8 @@ export function closeTypeTorch() {
 
 /** The generation stopped (or failed to start): drop every listener and the kernel. */
 export function unbindTypeTorch() {
+	unbindMessaging();
+	unbindServers();
 	swapOutListeners.clear();
 	closeListeners.clear();
 	pendingListeners.clear();

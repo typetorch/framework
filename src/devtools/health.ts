@@ -2,7 +2,7 @@ import type { AssetFacts } from "../assets/manifest";
 import type { HealthInfo, KernelStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
-export const LATEST_KERNEL = "0.3.7";
+export const LATEST_KERNEL = "0.3.8";
 
 /** Kernels before 0.3.7 use fixed thresholds: 3 errors within 30 s of ready roll back. */
 const OLD_HEALTH_ERRORS = 3;
@@ -208,6 +208,26 @@ export function fallbackIssues(status: KernelStatus): HealthIssue[] {
 }
 
 /**
+ * Kernel 0.3.8 game messaging (status().messaging): the universe's rate on the game topic at the soft limit (publishes
+ * wait), dropped messages, or the topic not subscribed after failures: warn, with the numbers.
+ */
+export function messagingIssues(status: KernelStatus): HealthIssue[] {
+	const issues = new Array<HealthIssue>();
+	const messaging = status.messaging;
+	if (messaging === undefined) return issues;
+	if (messaging.state === "subscribing" && messaging.lastError !== undefined) {
+		issues.push({ level: "warn", title: "Messaging offline", detail: messaging.lastError });
+	}
+	if (messaging.rate >= messaging.softLimit && messaging.queued > 0) {
+		issues.push({ level: "warn", title: "Messaging busy", detail: `${messaging.rate}/min on ${messaging.topic}; ${messaging.queued} waiting` });
+	}
+	if (messaging.dropped > 0) {
+		issues.push({ level: "warn", title: `Messages dropped ${messaging.dropped}`, detail: messaging.lastError ?? "Queue full or too slow." });
+	}
+	return issues;
+}
+
+/**
  * Hot assets (plans/13): a failed load keeps the old copy (warn); a failure with nothing live for the key is an
  * error; an unusable manifest is a warning.
  */
@@ -270,6 +290,7 @@ export function checkHealth(status: KernelStatus, facts?: ServerFacts): HealthIs
 	for (const issue of signingIssues(status)) issues.push(issue);
 	for (const issue of deployIssues(status)) issues.push(issue);
 	for (const issue of fallbackIssues(status)) issues.push(issue);
+	for (const issue of messagingIssues(status)) issues.push(issue);
 	if (status.localPayload === true) {
 		issues.push({ level: "info", title: "Studio: local payload", detail: "Edits need Stop + Play. Reload remounts it." });
 	}

@@ -5,7 +5,7 @@ import { normalRole, type Channel, type NewServerReport, type Role, type ServerK
 import { RateLimiter } from "../net/limits";
 import { AB_KERNEL, AbReply, kernelHasExperiments, NEEDS_KERNEL_AB, PIN_JOBS_PER_MESSAGE, PIN_TOPIC, PinMessage } from "./ab";
 import { versionLess } from "./health";
-import { RollCall } from "./roll-call";
+import { setRollCallEntry, sharedRollCall } from "../servers";
 
 /**
  * Server half of the dev menu's Manage group (plans/10; "Admin" before framework 0.3.2): players (teleport to, bring,
@@ -611,30 +611,15 @@ export function registerAdminOps(
 		};
 	};
 
-	// The roll call: this server answers others (silent while it shuts down or migrates) and asks when a dev opens the
-	// list. Studio (no JobId) lists only itself.
-	const rollCall = new RollCall({
-		jobId: game.JobId,
-		subscribe: (topic, handler) => MessagingService.SubscribeAsync(topic, (message) => handler(message.Data)),
-		publish: (topic, data) => MessagingService.PublishAsync(topic, data),
-		entry: () => (shuttingDown || saved.migration ? undefined : (ownEntry() as Record<string, unknown>)),
-		encode: (value) => HttpService.JSONEncode(value),
-		decode: (value) => HttpService.JSONDecode(value),
-		clock: () => os.clock(),
-		unixMs: () => DateTime.now().UnixTimestampMillis,
-		wait: (seconds) => task.wait(seconds),
-		spawn: (callback) => {
-			trove.add(task.spawn(callback));
-		},
-		random: () => math.random(),
-		warn: (message) => $warn(message),
-	});
-	if (kernel.serverType !== "studio") rollCall.listen();
-	trove.add(() => rollCall.stop());
+	// The roll call (framework 0.3.5: the generation's one, servers.ts, shared with TypeTorch.servers(); kernel 0.3.8
+	// holds its ask topic): this server answers others with its own row (silent while it shuts down or migrates) and asks
+	// when a dev opens the list. Studio (no JobId) lists only itself.
+	const rollCall = sharedRollCall();
+	trove.add(setRollCallEntry(() => (shuttingDown || saved.migration ? undefined : (ownEntry() as Record<string, unknown>))));
 
 	/** The universe's servers (not this one): a roll call, cached 15 s (errors 5 s), one at a time. */
 	const readServers = (): ListCache => {
-		const list = rollCall.ask();
+		const list = rollCall?.ask() ?? { at: os.clock(), rows: [], truncated: false };
 		return {
 			at: list.at,
 			rows: list.rows.map((row) => ({ key: row.key, value: row.value as StoredServer })),
@@ -794,7 +779,7 @@ export function registerAdminOps(
 		// The pinned servers swap within seconds: call the roll again then.
 		trove.add(
 			task.delay(AB_REFRESH, () => {
-				rollCall.invalidate();
+				rollCall?.invalidate();
 			}),
 		);
 		if (failed === messages) error("publish_failed", 0);

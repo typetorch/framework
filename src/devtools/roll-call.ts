@@ -8,20 +8,25 @@
  *   on the asker's reply topic, after a random wait of up to REPLY_JITTER seconds: at most REPLIES_PER_MINUTE per
  *   minute and one per asker every REPLY_GAP seconds, never to an ask older than ASK_MAX_AGE seconds. The row is the
  *   kernel's `fleetStatus()` on kernel 0.3.2+ (else the framework's own fields), cut to fit one message (`e`, then `k`, dropped).
- * - MessagingService limits (Roblox docs; conservative figures): a server publishes 150 + 60 x players messages a minute,
- *   a topic takes 10 + 20 x servers messages a minute, the whole game 100 + 50 x servers. One roll call costs the asker
- *   1 publish and each server 1 (so 100 servers: 101 messages, against 2,010 a minute on the reply topic and 5,100 a
- *   minute for the game); answering stays under REPLIES_PER_MINUTE per server whatever askers do, and an asker asks at
- *   most once per CACHE_SECONDS. Subscriptions: one permanent (the ask topic) and one while asking.
+ * - MessagingService limits (create.roblox.com MessagingService "Limitations", checked 2026-10-06): a server publishes
+ *   600 + 240 x players messages a minute, a topic receives 40 + 80 x servers a minute (each server that gets a message
+ *   counts), the whole game 400 + 200 x servers; a server holds 20 + 8 x players subscriptions. One roll call with N
+ *   servers is N receives of the ask (every server listens) plus N replies (one receiver each), so the universe can run
+ *   about 80 roll calls a minute on the ask topic. Answering stays under REPLIES_PER_MINUTE per server whatever askers do;
+ *   the dev menu asks at most once per CACHE_SECONDS, TypeTorch.servers() far less (servers.ts). Subscriptions: one
+ *   permanent (the ask topic; kernel 0.3.8 holds it for the running generation) and one while asking.
  * - Trust: like the MemoryStore list it replaces, any server of the universe can answer, so rows are hints for the dev
  *   menu (the kernels re-check every action they lead to). `k` (a reserved server's access code) stays server-side.
+ * - Framework 0.3.5: one roll call per generation (servers.ts), shared by Manage > Servers and TypeTorch.servers(); rows
+ *   also carry `pv` (place version) and `i` (the game's TypeTorch.setServerInfo fields, at most 400 bytes).
  */
 
 export const ROLL_CALL_TOPIC = "TypeTorch/rollcall";
 export const COLLECT_SECONDS = 3;
 export const CACHE_SECONDS = 15;
 export const ERROR_CACHE_SECONDS = 5;
-export const REPLIES_PER_MINUTE = 12;
+/** Framework 0.3.5: 30 (was 12, under the old 150 + 60 x players send limit); game lists ask too. */
+export const REPLIES_PER_MINUTE = 30;
 export const REPLY_GAP = 5;
 export const REPLY_JITTER = 1;
 export const ASK_MAX_AGE = 30;

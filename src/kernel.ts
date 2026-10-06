@@ -520,7 +520,11 @@ export interface ClientsSummary {
  * the place, background retries) and the moves (players go to another server when nothing runs).
  */
 export interface FallbackStatus {
-	hold: { active: boolean; mode?: "start" | "move"; optOut?: boolean; characters?: boolean; heldMs?: number; seconds?: number; released?: number; spawned: number };
+	/**
+	 * Kernel 0.3.8: `bootScreen` / `kernelScreen` are the game's loading screen settings the clients got (ReplicatedFirst
+	 * TypeTorchBootScreen / TypeTorchKernelScreen, or the kernel folder's BootScreen / KernelScreen).
+	 */
+	hold: { active: boolean; mode?: "start" | "move"; optOut?: boolean; characters?: boolean; heldMs?: number; seconds?: number; released?: number; spawned: number; bootScreen?: string; kernelScreen?: false };
 	backup: { available: boolean; artifactId?: string; seq?: number; branch?: string; at?: string; failed?: { error?: string; stage?: string; at: number }; runs: number; since?: number };
 	peers: { asks: number; answered: number; replies: number; lastAt?: number; refused: number; chosen?: { artifactId?: string; assetId: number; seq?: number; servers: number; at: number }; error?: string };
 	chain: { runs: number; result?: "peers" | "backup" | "other" | "nothing"; why?: string; at?: number };
@@ -608,6 +612,90 @@ export interface KernelStatus {
 	backup?: boolean;
 	/** Kernel 0.3.6: the hold, peers, backup, recovery and moves. */
 	fallback?: FallbackStatus;
+	/** Kernel 0.3.8: game messaging on the kernel-held topic, and the held roll call topic (`TypeTorch.messaging`). */
+	messaging?: MessagingStatus;
+}
+
+/**
+ * Kernel 0.3.8: who sent a game message (`TypeTorch.messaging.subscribe`). The sender's kernel writes these tags; any
+ * code that can publish to the universe's MessagingService could forge them, so they are for routing (ignore dev
+ * servers), not authentication.
+ */
+export interface GameMessageMeta {
+	/** The sender's effective channel ("prod" on every public server). */
+	readonly channel: Channel;
+	/** The sender's branch. */
+	readonly branch?: string;
+	/** The sender's JobId ("" in Studio). */
+	readonly jobId: string;
+	readonly serverType: ServerType;
+	readonly placeVersion?: number;
+	/** Unix seconds when it was sent (Roblox's `Sent`). */
+	readonly sentAt: number;
+	/** This server sent it (every server hears its own messages, like MessagingService). */
+	readonly self: boolean;
+	/** It arrived while this generation was starting, and was kept for it (the swap didn't lose it). */
+	readonly replayed?: boolean;
+}
+
+/** Kernel 0.3.8: who a game message is for. "all" (default), "prod" (prod-channel servers), "branch" (the sender's). */
+export type MessageTarget = "all" | "prod" | "branch";
+
+export interface MessagingPublishOptions {
+	to?: MessageTarget;
+}
+
+/** Kernel 0.3.8: `messagingPublish`'s answer. It never yields: `queued` means it goes out in order, within the budget. */
+export interface MessagingPublishReport {
+	ok: boolean;
+	queued?: boolean;
+	/** Studio: delivered to this session only (Studio never reaches live servers). */
+	loopback?: boolean;
+	/** Bytes on the wire (the envelope, counted JSON-escaped). */
+	size?: number;
+	error?: "bad_topic" | "bad_options" | "bad_data" | "too_big" | "queue_full" | "closing" | "stopping";
+	detail?: string;
+	limit?: number;
+	/** The envelope's own bytes (what is left for data: limit - overhead). */
+	overhead?: number;
+}
+
+/** Kernel 0.3.8 `status().messaging` / `messagingStatus()`. */
+export interface MessagingStatus {
+	/** The Roblox topic every game topic rides ("TypeTorch/game"). */
+	topic: string;
+	/** "off" (no listener yet), "subscribing", "on", "local" (Studio: this session only). */
+	state: "off" | "subscribing" | "on" | "local";
+	subscribedAt?: number;
+	/** Game topics and listeners of the running generation. */
+	topics: number;
+	listeners: number;
+	received: number;
+	delivered: number;
+	/** Not a valid envelope. */
+	ignored: number;
+	/** `to` excluded this server. */
+	filtered: number;
+	/** Kept during a swap and handed to the next generation. */
+	replayed: number;
+	held: number;
+	published: number;
+	/** Failed PublishAsync attempts (each retry counts). */
+	failed: number;
+	/** Given up: retries out, waited too long, queue full. */
+	dropped: number;
+	/** Publishes that waited because the universe's rate on the topic was at the soft limit. */
+	throttled: number;
+	queued: number;
+	/** Messages on the game topic in the last 60 s, from every server (each server sees every one). */
+	rate: number;
+	/** At this rate publishes wait (Roblox delivers about 80 a minute on one topic for the whole universe). */
+	softLimit: number;
+	/** This server's publishes a minute (150 + 60 x players). */
+	budget: number;
+	lastError?: string;
+	lastErrorAt?: number;
+	rollCall: { state: "off" | "subscribing" | "on" | "local"; asks: number; handled: number };
 }
 
 export interface ServerKernel {
@@ -701,6 +789,22 @@ export interface ServerKernel {
 	deployReports?(): DeployReport[];
 	/** A reserved server's own access code (server-only data: never send it to a client). */
 	accessCode?(): string | undefined;
+
+	// Kernel 0.3.8 (additive): game messaging and the held roll call topic. `messagingPublish` doubles as the feature
+	// test; a place that doesn't map the kernel's Messaging module has none of them. Game code uses `TypeTorch.messaging`.
+	/**
+	 * fn(data, meta) for every message on game topic `topic` while this generation runs (dropped when it stops; the
+	 * kernel's one subscription stays). Each call runs on a kernel thread. Errors on a bad topic. Returns a disconnect.
+	 */
+	messagingSubscribe?(topic: string, handler: (data: unknown, meta: GameMessageMeta) => void): () => void;
+	/** One message to every server's listeners of `topic`, this one's too. Doesn't yield. */
+	messagingPublish?(topic: string, data: unknown, options?: MessagingPublishOptions): MessagingPublishReport;
+	messagingStatus?(): MessagingStatus;
+	/** fn(data) for every roll call ask on `TypeTorch/rollcall` while this generation runs (one per generation). */
+	onRollCall?(handler: (data: unknown) => void): void;
+
+	/** `typetorch test --cloud`'s stub kernel: true (code that must not run in the gate checks it). */
+	readonly test?: boolean;
 }
 
 export interface ClientKernel {
