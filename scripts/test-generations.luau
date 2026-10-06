@@ -706,7 +706,7 @@ do
 		end
 		return list
 	end
-	local base = { kernelApi = 1, kernelVersion = "0.3.6", serverType = "public", generation = { name = "x#1" }, history = {}, memoryMb = 1 }
+	local base = { kernelApi = 1, kernelVersion = "0.3.7", serverType = "public", generation = { name = "x#1" }, history = {}, memoryMb = 1 }
 	local function with(fields)
 		local status = table.clone(base)
 		for key, value in fields do
@@ -714,7 +714,7 @@ do
 		end
 		return status
 	end
-	check("health: LATEST_KERNEL is 0.3.6", health.LATEST_KERNEL == "0.3.6")
+	check("health: LATEST_KERNEL is 0.3.7", health.LATEST_KERNEL == "0.3.7")
 	local old = titles(with({ kernelVersion = "0.3.1" }))
 	check("health: a 0.3.1 server: Kernel update (warn) and No deploy reports (info)", old["Kernel update"] == "warn" and old["No deploy reports"] == "info")
 	local studio = titles(with({ kernelVersion = "0.3.1", serverType = "studio" }))
@@ -745,6 +745,30 @@ do
 	movingFallback.backup = { available = false, runs = 0, failed = { error = "mount: holds a Script", stage = "mount", at = 0 } }
 	local moving = titles(with({ reports = { total = 1, kept = 1, listeners = 1 }, fallback = movingFallback, clients = { players = 1, reported = 1, ok = 1, failed = 0, behind = 0, failures = 0, moved = 2 } }))
 	check("health: moving players out: error; the backup failed: warn; clients moved: warn", moving["Moving players out"] == "error" and moving["Backup build failed"] == "warn" and moving["Clients moved 2"] == "warn")
+	-- Kernel 0.3.7: the live health window (the build's own thresholds) while it is open, and the thresholds line.
+	local reports = { total = 1, kept = 1, listeners = 1 }
+	local open = health.checkHealth(with({ reports = reports, health = { state = "ok", errors = 0, limit = 5, window = 60, rollback = true, source = "payload", windowLeft = 42 } }))
+	check("health: the open window is one info line: errors against the build's limit, time left", #open == 1 and open[1].title == "Health window" and open[1].level == "info" and open[1].detail == "0/5 errors, 42 s left", open[1] and open[1].detail)
+	local counting = health.checkHealth(with({ reports = reports, health = { state = "ok", errors = 2, limit = 5, window = 60, rollback = true, windowLeft = 10 } }))
+	check("health: an error inside the window turns it into a warning", #counting == 1 and counting[1].level == "warn" and counting[1].detail == "2/5 errors, 10 s left", counting[1] and counting[1].detail)
+	local keptStatus = with({ reports = reports, health = { state = "degraded", errors = 4, limit = 3, window = 30, rollback = false, windowLeft = 12, kept = "4 errors" } })
+	local kept = titles(keptStatus)
+	local keptIssue = health.checkHealth(keptStatus)[1]
+	check("health: rollback off: the window line says so, no separate Errors line while it is open", kept["Health window"] == "warn" and kept["Errors 4"] == nil and keptIssue.detail == "4/3 errors, 12 s left, no rollback", keptIssue and keptIssue.detail)
+	local olderKernel = health.checkHealth(with({ reports = reports, health = { state = "ok", errors = 1, windowLeft = 20 } }))
+	check("health: no thresholds in status (kernels before 0.3.7): their fixed limit of 3", #olderKernel == 1 and olderKernel[1].detail == "1/3 errors, 20 s left", olderKernel[1] and olderKernel[1].detail)
+	local closed = titles(with({ reports = reports, health = { state = "ok", errors = 0, limit = 5, window = 60, rollback = true } }))
+	check("health: no line once the window closed", next(closed) == nil, next(closed))
+	local badSettings = titles(with({ reports = reports, health = { state = "ok", errors = 0, limit = 3, window = 30, rollback = true, source = "default", invalid = { "HealthErrors 500 (a whole number 1-100)" } } }))
+	check("health: payload settings out of bounds: warn", badSettings["Health settings"] == "warn")
+	local noModule = titles(with({ reports = reports, health = { state = "ok", errors = 0, missing = true } }))
+	check("health: the kernel's Health module not mapped: warn", noModule["No health window"] == "warn")
+	check(
+		"health: the Status block's thresholds line",
+		health.healthLimitsText({ state = "ok", errors = 0, limit = 5, window = 60, rollback = true }) == "5 errors / 60 s"
+			and health.healthLimitsText({ state = "ok", errors = 0, limit = 3, window = 30, rollback = false }) == "3 errors / 30 s, no rollback"
+			and health.healthLimitsText({ state = "ok", errors = 0 }) == "3 errors / 30 s"
+	)
 	check("admin: kernel 0.3.2 fleetStatus is feature-detected", admin.kernelHasFleetStatus({ fleetStatus = function() end }) == true and admin.kernelHasFleetStatus({}) == false)
 	-- Kernel 0.3.4: a switched server is an ordinary server: no Attention line, no "Back" action.
 	local switchedIssues = health.checkHealth(with({ reports = { total = 1, kept = 1, listeners = 1 }, switched = { by = 1, name = "Owner", at = 10, branch = "dev" } }))

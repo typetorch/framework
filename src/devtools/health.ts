@@ -1,8 +1,29 @@
 import type { AssetFacts } from "../assets/manifest";
-import type { KernelStatus } from "../kernel";
+import type { HealthInfo, KernelStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
-export const LATEST_KERNEL = "0.3.6";
+export const LATEST_KERNEL = "0.3.7";
+
+/** Kernels before 0.3.7 use fixed thresholds: 3 errors within 30 s of ready roll back. */
+const OLD_HEALTH_ERRORS = 3;
+const OLD_HEALTH_WINDOW = 30;
+
+/**
+ * The live health window while it is open (kernel 0.3.7 thresholds; older kernels: 3): "1/3 errors, 24 s left", plus
+ * ", no rollback" when a failure would only mark the server degraded. Undefined once the window closed.
+ */
+export function healthWindowText(health: HealthInfo): string | undefined {
+	if (health.windowLeft === undefined) return undefined;
+	const limit = health.limit ?? OLD_HEALTH_ERRORS;
+	return `${health.errors}/${limit} errors, ${health.windowLeft} s left${health.rollback === false ? ", no rollback" : ""}`;
+}
+
+/** The running build's thresholds for the Status block: "3 errors / 30 s", or "3 errors / 30 s, no rollback". */
+export function healthLimitsText(health: HealthInfo): string {
+	const limit = health.limit ?? OLD_HEALTH_ERRORS;
+	const seconds = health.window ?? OLD_HEALTH_WINDOW;
+	return `${limit} errors / ${seconds} s${health.rollback === false ? ", no rollback" : ""}`;
+}
 
 /** The fleet API's last error as a short fix (the dev PC's `bun run local` restarts the server and its tunnel). */
 export function fleetFix(lastError: string | undefined): string {
@@ -111,6 +132,8 @@ export function signingIssues(status: KernelStatus): HealthIssue[] {
  * Kernel 0.3.2 (plans/12 P-F1, P-O1, P-K7): the health window, the kernel's heartbeat and deploy reports, and client
  * generation reports.
  * - a health-window rollback in the last 15 min: error; errors after the window (degraded): warn;
+ * - the live health window while it is open ("1/3 errors, 24 s left"): info, warn once an error counted; payload
+ *   health settings out of bounds (kernel 0.3.7 used the defaults) or the kernel's Health module not mapped: warn;
  * - no deploy reports: info on kernels before 0.3.2 (live servers only); the kernel's own fleet API sender failing
  *   (the `TypeTorchFleet` setting), invalid, or its module not mapped in the place: warn;
  * - clients whose generation failed to start: warn.
@@ -119,10 +142,21 @@ export function deployIssues(status: KernelStatus): HealthIssue[] {
 	const issues = new Array<HealthIssue>();
 	const health = status.health;
 	const rollback = health?.lastRollback;
+	const windowLine = health !== undefined ? healthWindowText(health) : undefined;
 	if (rollback !== undefined && os.time() - rollback.at <= RECENT_ROLLBACK) {
 		issues.push({ level: "error", title: "Failed health check", detail: `${rollback.from}: ${rollback.why}` });
-	} else if (health?.state === "degraded" && health.errors > 0) {
+	} else if (health?.state === "degraded" && health.errors > 0 && windowLine === undefined) {
 		issues.push({ level: "warn", title: `Errors ${health.errors}`, detail: health.lastError ?? "-" });
+	}
+	// Kernel 0.3.7: the live window (the new build's own errors against its limit, the time left).
+	if (health !== undefined && windowLine !== undefined) {
+		issues.push({ level: health.errors > 0 ? "warn" : "info", title: "Health window", detail: windowLine });
+	}
+	if (health?.invalid !== undefined && health.invalid.size() > 0) {
+		issues.push({ level: "warn", title: "Health settings", detail: `Defaults used: ${health.invalid[0]}` });
+	}
+	if (health?.missing === true) {
+		issues.push({ level: "warn", title: "No health window", detail: "Map the kernel's Health module." });
 	}
 	if (status.reports === undefined) {
 		if (status.serverType !== "studio" && versionLess(status.kernelVersion, REPORTS_KERNEL)) {

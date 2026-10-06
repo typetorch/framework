@@ -384,10 +384,28 @@ export interface HealthInfo {
 	startFailed?: string;
 	/** Why this generation failed its health check (it is being, or couldn't be, rolled back). */
 	failed?: string;
-	/** Seconds of the health window left (30 s from ready). */
+	/** Seconds of the health window left (`window` s from ready; 30 s before kernel 0.3.7). */
 	windowLeft?: number;
 	/** The last health-window rollback on this server: from, to (the last known good it ran), why, unix seconds. */
 	lastRollback?: { from: string; to?: string; why: string; at: number };
+	/**
+	 * Kernel 0.3.7+: the running build's thresholds (typetorch.json "health", stamped on the payload as HealthErrors,
+	 * HealthWindow, HealthRollback). Older kernels: undefined (3 errors, 30 s, rollback on).
+	 */
+	limit?: number;
+	/** Kernel 0.3.7+: the window's length in seconds after ready. */
+	window?: number;
+	/** Kernel 0.3.7+: whether a failed check rolls back here (false: the build turned it off, a Studio local payload,
+	 * or a build restarted after nothing else could run). */
+	rollback?: boolean;
+	/** Kernel 0.3.7+: "payload" (the build carries settings) or "default". */
+	source?: "payload" | "default";
+	/** Kernel 0.3.7+: payload values that were out of bounds or of the wrong type (the defaults were used). */
+	invalid?: string[];
+	/** Kernel 0.3.7+: why the build failed its check while its rollback is off (it keeps running, degraded). */
+	kept?: string;
+	/** Kernel 0.3.7+: the place doesn't map the kernel's Health module (no health window on this server). */
+	missing?: boolean;
 }
 
 /** Kernel 0.3.2+: an artifact that failed on this server (start, mount or the health window); never run again

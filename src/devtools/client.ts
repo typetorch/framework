@@ -59,7 +59,7 @@ import { Layout, newLayout, sanitizeLayout } from "./layout";
 import { createWindowManager, PaneHost, PaneTab, PickItem, WindowManager } from "./panes";
 import { describeState } from "./state";
 import type { ArtifactNotes } from "./artifact-notes";
-import { badgeLevel, checkHealth, HealthIssue, HealthLevel, ServerFacts } from "./health";
+import { badgeLevel, checkHealth, HealthIssue, HealthLevel, healthLimitsText, ServerFacts } from "./health";
 import { NEEDS_KERNEL_AB } from "./ab";
 import {
 	addButton,
@@ -868,6 +868,10 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			if (status.generation) {
 				body.field("Generation", status.generation.name);
 				body.field("Generation uptime", duration(status.generation.uptime));
+				// Kernel 0.3.2+: the health window's thresholds (kernel 0.3.7: the build's own, typetorch.json "health").
+				if (status.health !== undefined && status.health.missing !== true) {
+					body.field("Health window", healthLimitsText(status.health), status.health.rollback === false ? COLORS.warn : COLORS.text);
+				}
 			}
 			body.field("Players", `${status.players}/${status.maxPlayers}`);
 			body.field("Memory", typeIs(status.memoryMb, "number") ? "%.0f MB".format(status.memoryMb) : "-");
