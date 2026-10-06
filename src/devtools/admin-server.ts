@@ -310,7 +310,7 @@ export function registerAdminOps(
 
 	/** Framework 0.3.2: every Manage op is for owners only. */
 	const ownerOf = (player: Player): Actor => {
-		const actor = ownerOf(player);
+		const actor = actorOf(player);
 		if (!actor.owner) error("owners_only", 0);
 		return actor;
 	};
