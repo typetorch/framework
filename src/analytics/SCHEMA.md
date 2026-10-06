@@ -31,7 +31,7 @@ Integers are written with every digit (never exponent notation).
 | `state` | string | The player's state **after** this event: `zone:<z>\|screen:<s>\|activity:<a>`, empty parts left out (`""` when nothing is known). Server-only events: `activity:<server activity>` or `""` |
 | `exp` | string | JSON object of the player's active experiments, `{"onboarding":"short"}`; `{}` when none |
 | `sexp` | string | The server's experiment: the artifact id of a kernel A/B experiment pin, or `""` |
-| `src` | string | `server`, or `client` (sent by a client: it can lie; the server checked shapes and rate) |
+| `src` | string | `server`, or `client` (sent by a client: it can lie; the server checked shapes and rate). Never `client` on `purchase` or `currency` rows |
 | `props` | string | JSON object text, at most 4096 bytes. Too large: `{"_trunc":<bytes>}`; not encodable: `{"_err":"encode"}`; a non-object value `x`: `{"value":x}` |
 
 ### recordings
@@ -57,7 +57,7 @@ First-ever-session detail, one row per packed chunk.
 
 | kind | name | props |
 |---|---|---|
-| session | `join` | `from`: `direct` (Home, search, sorts: Roblox doesn't say), `teleport` (same game), `teleport_game` (another game), `referral` (invite/referral link), `share` (launch data), `follow` (followed someone); `ctx?` (GameJoinContext.JoinSource name); `tp?` (had teleport data); `party?` (players teleported along); `age` (account age: `<1d`, `1-7d`, `7-30d`, `30-90d`, `90-365d`, `1-3y`, `3y+`); `prem` (Premium); `country?` (ISO code); `friends` (friends in the server, at most 30 checked); `ret` (days since the last visit, `-1` first visit or unknown); `late?` (the engine started over 60 s after the join). `t` is the join time |
+| session | `join` | `from`: `direct` (Home, search, sorts: Roblox doesn't say), `teleport` (same game), `teleport_game` (another game), `referral` (invite/referral link), `share` (launch data), `follow` (followed someone); `ctx?` (GameJoinContext.JoinSource name); `tp?` (had teleport data); `party?` (players teleported along); `age` (account age: `<1d`, `1-7d`, `7-30d`, `30-90d`, `90-365d`, `1-3y`, `3y+`); `prem` (Premium); `country?` (ISO code); `friends` (how many of the player's friends are in the server: one friend-list lookup per join, at most 10 pages, `0` when it fails); `ret` (days since the last visit, `-1` first visit or unknown); `late?` (the engine started over 60 s after the join). `t` is the join time |
 | session | `device` (src client) | `input` (`kbm`, `touch`, `gamepad`, `vr`, `unknown`), `w`, `h` (viewport points), `touch`, `kb`, `mouse`, `pad`, `vr`. Once per session |
 | session | `leave` | `secs` (session length), `why`: `left`, `shutdown`, `gone` (left while no generation ran the engine), `swap60?` (left within 60 s of a hot swap) |
 | tech | `server` | Every `techEvery` s: `fps` (physics), `hb` (Heartbeat rate), `mem` (MB, 10s), `players`, `ping50?`, `ping90?` (ms), `q`, `qr` (queued events, recordings), `dropped`, `sent`, `fails`, `health?`, `errors?` (kernel 0.3.2 health) |
@@ -71,17 +71,21 @@ First-ever-session detail, one row per packed chunk.
 | zone | `leave` | `zone`, `to?`, `secs` |
 | state | `activity` | `to`, `from` (server or client src) |
 | state | `screen` | `to`, `from` (`""` = none). Client: ScreenGuis in PlayerGui (Enabled), GuiObjects tagged `TTScreen` (Visible), `screen()` |
-| experiment | `<experiment>` | `variant`, `variants` (count), `forced?`. Once per session when assigned or changed |
+| experiment | `<experiment>` | `variant`, `variants` (count), `forced?`. Once per session when assigned or changed. At most 32 experiments per session: a 33rd `experiment()` returns the control (the first variant) and warns. A client's experiment calls count against its event budget (below) |
 | recording_meta | `start` | `share` (the recorded share then) |
 | recording_meta | `end` | `chunks`, `bytes`, `why`: `window` (60 s after the first input), `cap` (10 min, or the server's 256 KB / 80 chunks), `left`, `end` |
 | fleet | `heartbeat` | The kernel's `fleetStatus()` (kernel 0.3.2+), every 60 ± 10 s and once at each generation start. pid `""` |
 | fleet | `deploy_report` | One kernel deploy report `{s, b, a, j, r, e?, d?, t, g, k, p}` (r: `swapped`, `failed`, `rolled_back`, `skipped`, `booted`), once per (s, j, r) per server, across generations. pid `""` |
 | custom | `<name>` | `track(name, props)`: the game's props |
 | funnel | `<funnel>` | `step(funnel, index, name?)`: `i`, `step?` |
-| purchase | `<kind>` | `purchase({product, robux, where?, kind?})`: name = `kind` (default `product`); `product`, `robux`, `where?` |
-| currency | `<currency>` | `currency(name, delta, reason)`: `delta`, `reason` |
+| purchase | `<kind>` | Server only. `purchase(player?, {product, robux, where?, kind?})`: name = `kind` (default `product`); `product`, `robux`, `where?` |
+| currency | `<currency>` | Server only. `currency(player?, name, delta, reason)`: `delta`, `reason` |
 
-Client-sent kinds are limited to `custom`, `funnel`, `purchase`, `currency`, `state`, `tech`.
+Client-sent kinds are limited to `custom`, `funnel`, `state`, `tech`, within a budget of 120 a minute and 5,000 a
+session per player. `purchase` and `currency` are server-only (revenue and the economy are server-authoritative): on
+the client `purchase()` and `currency()` warn once and send nothing, the server refuses those kinds from clients, and
+the analytics server's ingest refuses such rows marked `src = client` (older engines let clients send them). Revenue
+counts only server-sent `purchase` rows; rows from before `src` existed (no `src`) still count.
 
 ## tt-rec-1
 
@@ -174,6 +178,9 @@ Unknown fields are ignored. Settings errors are warned once (never with the toke
   other 4xx drop the batch (counted as rejected).
 - **Delivery is at least once:** a hot swap during a request sends its rows again. Readers may drop exact duplicate
   rows.
+- **The cloud test sends nothing:** inside `typetorch test --cloud` (the stub kernel's `test = true`, or the workspace
+  attribute `TypeTorchTest`) rows are collected as usual but dropped at each flush: no event, recording or identity
+  rows and no HTTP request, so a deploy never puts a fake server session into the analytics.
 - **Queue:** 10,000 events (1,000 while no settings are known), 2,000 fleet rows, 300 recording chunks; over a cap the
   oldest are dropped and counted (`tech/server` `dropped`). The queue lives in the kernel's persist store across hot
   swaps and is flushed on shutdown (kernel 0.3.2 onClose; older kernels: one BindToClose relay).

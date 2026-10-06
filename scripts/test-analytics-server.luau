@@ -92,6 +92,34 @@ local PlayersService = { PlayerAdded = Signal(), PlayerRemoving = Signal(), list
 function PlayersService:GetPlayers()
 	return table.clone(self.list)
 end
+-- Friend lists by UserId as pages of UserIds (FriendPages); a string makes GetFriendsAsync error with it.
+local friendLists = {}
+local friendCalls = { lists = 0, advances = 0 }
+local onAdvance = nil
+function PlayersService:GetFriendsAsync(userId)
+	friendCalls.lists += 1
+	local list = friendLists[userId] or { {} }
+	if type(list) == "string" then
+		error(list)
+	end
+	local pages = { index = 1, IsFinished = #list <= 1 }
+	function pages:GetCurrentPage()
+		local entries = {}
+		for _, id in list[self.index] do
+			table.insert(entries, { Id = id, Username = "user" .. id, AvatarUri = "", AvatarFinal = true, IsOnline = true })
+		end
+		return entries
+	end
+	function pages:AdvanceToNextPageAsync()
+		friendCalls.advances += 1
+		if onAdvance then
+			onAdvance()
+		end
+		self.index += 1
+		self.IsFinished = self.index >= #list
+	end
+	return pages
+end
 
 local function makePlayer(userId, name)
 	local player = {
@@ -105,9 +133,6 @@ local function makePlayer(userId, name)
 	}
 	function player:GetJoinData()
 		return {}
-	end
-	function player:IsFriendsWith()
-		return false
 	end
 	function player:GetNetworkPing()
 		return 0.1
@@ -387,6 +412,13 @@ records["p/2"] = { pid = "existingpid00000000000000000002", first = os.time() - 
 local newbie = makePlayer(1, "NewbieName")
 local regular = makePlayer(2, "RegularName")
 PlayersService.list = { newbie, regular }
+-- The newbie's friend list holds the regular on page 2 (of 3); the regular's holds the newbie on page 11 (of 12),
+-- past the 10-page cap.
+friendLists[1] = { { 90, 91 }, { 92, 2 }, { 93 } }
+friendLists[2] = {}
+for page = 1, 12 do
+	friendLists[2][page] = if page == 11 then { 1 } else { 200 + page }
+end
 
 local options = {
 	settings = { backend = "duckdb", events = "https://a.example.com/ingest", token = "TKN-secret", flushSeconds = 5 },
@@ -428,6 +460,24 @@ check("join: newp", joinNew.newp == true and joinReg.newp == false)
 check("join: device stamped", joinNew.dev == "phone" and joinReg.dev == "desktop")
 check("join: identity", joinNew.art == "art1" and joinNew.seq == 7 and joinNew.job == "job-1" and joinNew.place == 123 and joinNew.srv == "public" and joinNew.channel == "prod")
 check("join: sid", #joinNew.sid == 32 and joinNew.sid ~= joinReg.sid)
+-- friends: one GetFriendsAsync per join, intersected with the players here.
+check("join: friends found on page 2", joinNewProps and joinNewProps.friends == 1, joinNewProps and joinNewProps.friends)
+check("join: friends past the 10-page cap not seen", joinRegProps and joinRegProps.friends == 0, joinRegProps and joinRegProps.friends)
+check("friends: one lookup per join", friendCalls.lists == 2, friendCalls.lists)
+check("friends: paging stops when all are found, and at 10 pages", friendCalls.advances == 1 + 9, friendCalls.advances)
+local third = makePlayer(3, "ThirdName")
+friendLists[3] = "HTTP 500"
+check("friends: a failed lookup counts 0", core1:friendsHere(third) == 0)
+local listsBefore = friendCalls.lists
+PlayersService.list = { third }
+check("friends: alone, no lookup", core1:friendsHere(third) == 0 and friendCalls.lists == listsBefore)
+PlayersService.list = { newbie, regular }
+friendLists[3] = { { 1 }, { 2 } }
+onAdvance = function()
+	third.Parent = nil -- leaves while the next page loads
+end
+check("friends: the player leaving mid-lookup keeps the count so far", core1:friendsHere(third) == 1)
+onAdvance = nil
 local device = rowsNamed(store().events.rows, "session", "device")
 check("device rows from the client", #device == 2 and device[1].src == "client")
 check("load row", #rowsNamed(store().events.rows, "tech", "load") == 1)
@@ -451,12 +501,14 @@ check("experiment row", #rowsNamed(rows, "experiment", "onboarding") == 1)
 core1:experiment(newbie, "onboarding", { "short", "long" })
 check("experiment row once", #rowsNamed(store().events.rows, "experiment", "onboarding") == 1)
 
--- Client events: valid, a server-only kind, bad JSON, a screen change.
+-- Client events: valid, server-only kinds (session, purchase, currency), bad JSON, a screen change.
 raw["__tt/an"](newbie, "ev", {
 	{ 100, "custom", "opened_map", "{}" },
 	{ 50, "state", "screen", '{"to":"Shop","from":""}' },
 	{ 10, "session", "join", "{}" },
 	{ 10, "custom", "bad", "{not json" },
+	{ 8, "purchase", "product", '{"product":1234,"robux":9999}' },
+	{ 7, "currency", "coins", '{"delta":100000,"reason":"free"}' },
 	{ 5, "custom", "after_screen", '{"a":1}' },
 })
 rows = store().events.rows
@@ -465,6 +517,7 @@ check("client event", opened and opened.src == "client" and opened.pid == newbie
 check("client time corrected", opened and math.abs(opened.t - (nowMs() - 100 - 50)) < 200, opened and (nowMs() - opened.t))
 check("client session kind refused", #rowsNamed(rows, "session", "join") == 2)
 check("client bad json refused", #rowsNamed(rows, "custom", "bad") == 0)
+check("client purchase and currency refused", #rowsNamed(rows, "purchase") == 0 and #rowsNamed(rows, "currency") == 0)
 local afterScreen = rowsNamed(rows, "custom", "after_screen")[1]
 check("screen in state", afterScreen and afterScreen.state == "screen:Shop|activity:round", afterScreen and afterScreen.state)
 check("screen row", #rowsNamed(rows, "state", "screen") == 1)

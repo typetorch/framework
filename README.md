@@ -308,7 +308,9 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   and the next generation sends them. In edit mode (UI Labs) it is inert.
 - **Server calls take the player first** (`track(player, ...)`); without one an event is server-only (no player id).
   Client calls are always about the local player and are marked `src = "client"` (a client can lie). The server
-  checks their shape, size (props at most 4 KB) and rate.
+  checks their shape, size (props at most 4 KB) and rate. `purchase` and `currency` are server-only (revenue and the
+  economy are server-authoritative): on the client they warn once and send nothing, and the server refuses them from
+  clients.
 - **Options** (all on by default): `sessions` (joins, leaves, device, join source, account age bucket, Premium,
   country, friends in the server, first-ever vs returning, days since the last visit), `tech` (FPS, ping, memory, load
   time, client and server errors, swaps and rollbacks, leaves within 60 s of a swap), `zones` (parts or models tagged
@@ -344,8 +346,11 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   as usual but never uploads: no event rows, no identity rows, no HTTP request, so a prod deploy never puts a fake
   server session into your analytics.
 - **Bounds on what a client can cause:** at most 32 experiments per session (each is stamped on every later row), and
-  a client's `exp` messages count against its event budget (120 a minute, 5,000 a session). Revenue queries on the
-  analytics server count `purchase` rows the server sent, never client-sent ones.
+  a client's `exp` messages count against its event budget (120 a minute, 5,000 a session). Clients can't send
+  `purchase` or `currency` rows; the analytics server's ingest also refuses client-marked ones (older engines) and its
+  revenue queries count `purchase` rows the server sent.
+- **Friends in the server** (the join's `friends`): one `Players:GetFriendsAsync` per join (at most 10 pages, none
+  when the player is alone) intersected with the players there, not a web call per player.
 
 **Settings** (server only, never sent to clients): the ConfigService key `TypeTorchAnalytics`, written with
 `writeSettings()` from `@typetorch/analytics` (Open Cloud, universe:write) or in Creator Hub (Configs); no CLI command

@@ -23,6 +23,14 @@ function isPlayer(value: unknown): value is Player {
 	return typeIs(value, "Instance") && value.IsA("Player");
 }
 
+/** Server-only calls made on the client: warned once each per generation; the server refuses these kinds from clients. */
+const warnedServerOnly = new Set<string>();
+function serverOnly(call: string) {
+	if (warnedServerOnly.has(call)) return;
+	warnedServerOnly.add(call);
+	$warn(`[analytics] ${call}() is server-only (revenue and currency are server-authoritative): the client sends nothing`);
+}
+
 function currentServer(options: AnalyticsOptions): ServerAnalytics | undefined {
 	if (serverCore) return serverCore;
 	const scope = generationScope();
@@ -104,10 +112,17 @@ export class AnalyticsEngine {
 		}
 	}
 
-	/** A Robux purchase (log it once the receipt is granted). The event name is `kind` ("product" by default). */
+	/**
+	 * A Robux purchase (log it once the receipt is granted). The event name is `kind` ("product" by default). Server
+	 * only: revenue is server-authoritative, so on the client this warns once and sends nothing.
+	 */
 	purchase(purchase: AnalyticsPurchase): void;
 	purchase(player: Player, purchase: AnalyticsPurchase): void;
 	purchase(first: Player | AnalyticsPurchase, second?: AnalyticsPurchase) {
+		if (this.client) {
+			serverOnly("purchase");
+			return;
+		}
 		const player = isPlayer(first) ? first : undefined;
 		const info = (player ? second : first) as AnalyticsPurchase | undefined;
 		if (!info || !typeIs(info.product, "number") || !typeIs(info.robux, "number")) {
@@ -117,21 +132,23 @@ export class AnalyticsEngine {
 		const kind = typeIs(info.kind, "string") && info.kind !== "" ? info.kind : "product";
 		const props = { product: info.product, robux: info.robux, where: info.where };
 		this.server?.track(player, "purchase", kind, props);
-		this.client?.track("purchase", kind, props);
 	}
 
-	/** Currency in (+) or out (-), e.g. `currency("coins", 50, "round_reward")`. */
+	/**
+	 * Currency in (+) or out (-), e.g. `currency(player, "coins", 50, "round_reward")`. Server only: the economy is
+	 * server-authoritative, so on the client this warns once and sends nothing.
+	 */
 	currency(name: string, delta: number, reason: string): void;
 	currency(player: Player, name: string, delta: number, reason: string): void;
 	currency(first: Player | string, second: string | number, third: number | string, fourth?: string) {
+		if (this.client) {
+			serverOnly("currency");
+			return;
+		}
 		if (isPlayer(first)) {
-			const props = { delta: third as number, reason: fourth };
-			this.server?.track(first, "currency", second as string, props);
-			this.client?.track("currency", second as string, props);
+			this.server?.track(first, "currency", second as string, { delta: third as number, reason: fourth });
 		} else {
-			const props = { delta: second as number, reason: third as string };
-			this.server?.track(undefined, "currency", first, props);
-			this.client?.track("currency", first, props);
+			this.server?.track(undefined, "currency", first, { delta: second as number, reason: third as string });
 		}
 	}
 

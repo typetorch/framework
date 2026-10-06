@@ -92,6 +92,8 @@ const CLIENT_SESSION_MAX = 5000;
  * (1 KB) and have every row of theirs dropped, or spend the server's time re-encoding it.
  */
 const EXPERIMENTS_MAX = 32;
+/** Friend-list pages read per join for the join's `friends` (one web call each; most players fit on the first). */
+const FRIEND_PAGES_MAX = 10;
 /** A recording: at most this many bytes, chunks and seconds after the join. */
 const RECORDING_MAX_BYTES = 262144;
 const RECORDING_MAX_CHUNKS = 80;
@@ -742,15 +744,29 @@ export class ServerAnalytics {
 		return info;
 	}
 
+	/**
+	 * How many of the player's friends are in this server: one `GetFriendsAsync` per join (at most FRIEND_PAGES_MAX
+	 * pages) intersected with the players here, instead of an IsFriendsWith call per player. Stops early once every
+	 * other player was found; after each yield it stops with the count so far if the player left or the generation
+	 * stopped. No call when the player is alone; a failed call counts what it read (0 at first).
+	 */
 	private friendsHere(player: Player): number {
+		const others = new Set<number>();
+		for (const other of Players.GetPlayers()) if (other !== player) others.add(other.UserId);
+		if (others.size() === 0) return 0;
+		const [ok, pages] = pcall(() => Players.GetFriendsAsync(player.UserId as never));
+		if (!ok || pages === undefined) return 0;
 		let count = 0;
-		let checked = 0;
-		for (const other of Players.GetPlayers()) {
-			if (other === player) continue;
-			if (checked >= 30) break;
-			checked += 1;
-			const [ok, friends] = pcall(() => player.IsFriendsWith(other.UserId as never));
-			if (ok && friends) count += 1;
+		for (let page = 1; page <= FRIEND_PAGES_MAX; page++) {
+			if (this.stopped || player.Parent === undefined) break;
+			const [pageOk, entries] = pcall(() => pages.GetCurrentPage());
+			if (!pageOk || !typeIs(entries, "table")) break;
+			for (const entry of entries) {
+				if (typeIs(entry, "table") && others.delete(entry.Id)) count += 1;
+			}
+			if (others.size() === 0 || pages.IsFinished || page === FRIEND_PAGES_MAX) break;
+			const [nextOk] = pcall(() => pages.AdvanceToNextPageAsync());
+			if (!nextOk) break;
 		}
 		return count;
 	}

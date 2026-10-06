@@ -56,8 +56,11 @@ export interface ServerHello {
 
 const DEVICES = new Set<string>(["desktop", "phone", "tablet", "console", "vr", "unknown"]);
 const INPUTS = new Set<string>(["kbm", "touch", "gamepad", "vr", "unknown"]);
-/** Kinds a client may send in "ev". */
-export const CLIENT_KINDS = new Set<string>(["custom", "funnel", "purchase", "currency", "state", "tech"]);
+/**
+ * Kinds a client may send in "ev". Never `purchase` or `currency`: revenue and the economy are server-authoritative
+ * (a client could otherwise add fake payers and Robux), so the server refuses them from clients.
+ */
+export const CLIENT_KINDS = new Set<string>(["custom", "funnel", "state", "tech"]);
 
 function finite(value: unknown, low: number, high: number): value is number {
 	return typeIs(value, "number") && value === value && value >= low && value <= high;
