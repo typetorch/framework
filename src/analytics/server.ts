@@ -1248,17 +1248,21 @@ export class ServerAnalytics {
 			} else if (outcome === "drop" || outcome === "split") {
 				this.store.rejected += rows;
 				settle(request, false);
-				this.warn(`the ${request.table} sink refused ${rows} rows (HTTP ${status}); they were dropped`);
+				this.warn(`analytics upload refused ${rows} rows (HTTP ${status}); they were dropped`);
 			} else {
 				settle(request, true);
 				failed = true;
 				this.store.failures += 1;
 				const wait = outcome === "config" ? 300 : backoffSeconds(this.store.failures, math.random());
 				this.backoffUntil = os.clock() + wait;
+				// "both" = one batch with events and recordings (the DuckDB sink); say "analytics upload" instead.
+				const what = request.table === "both" ? "analytics upload" : `analytics upload (${request.table})`;
+				const reason = status > 0 ? `HTTP ${status}` : (this.store.lastError ?? "no response");
+				const fix = status === 530 ? ": the tunnel is down, run bun run local on the dev PC" : "";
 				this.warn(
 					outcome === "config"
-						? `the ${request.table} sink answered HTTP ${status}: check the URL and token in ${SETTINGS_KEY}; retrying in ${math.floor(wait)} s`
-						: `the ${request.table} sink failed (${this.store.lastError ?? `HTTP ${status}`}); retrying in ${math.floor(wait)} s`,
+						? `${what} got HTTP ${status}: check the URL and token in ${SETTINGS_KEY}; retrying in ${math.floor(wait)} s`
+						: `${what} failed (${reason}${fix}); retrying in ${math.floor(wait)} s`,
 				);
 			}
 		}
