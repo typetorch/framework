@@ -1,7 +1,7 @@
 import { DataStoreService, HttpService, MessagingService, Players, TeleportService, TextService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
-import { normalRole, type Channel, type NewServerReport, type Role, type ServerKernel, type ServerType } from "../kernel";
+import { branchChannelOf, normalRole, type Channel, type NewServerReport, type Role, type ServerKernel, type ServerType } from "../kernel";
 import { RateLimiter } from "../net/limits";
 import { AB_KERNEL, AbReply, kernelHasExperiments, NEEDS_KERNEL_AB, PIN_JOBS_PER_MESSAGE, PIN_TOPIC, PinMessage } from "./ab";
 import { versionLess } from "./health";
@@ -596,7 +596,7 @@ export function registerAdminOps(
 		return {
 			t: kernel.serverType,
 			b: kernel.branch,
-			c: kernel.channel,
+			c: branchChannelOf(kernel),
 			a: kernel.artifact.id,
 			n: Players.GetPlayers().size(),
 			m: Players.MaxPlayers,

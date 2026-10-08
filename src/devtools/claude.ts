@@ -2,6 +2,7 @@ import { DataStoreService, HttpService, MemoryStoreService, MessagingService, Pl
 import { Trove } from "@rbxts/trove";
 import { $print, $warn } from "rbxts-transform-debug";
 import type { LogEntry, ServerKernel } from "../kernel";
+import { branchChannelOf, rulesOf } from "../kernel";
 import type { ServerDispatcher } from "../net/runtime";
 import {
 	CLAUDE_TOOL_REQUEST,
@@ -1388,7 +1389,9 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 					artifact: kernel.artifact.id,
 					generation: status.generation?.name,
 					branch: kernel.branch,
-					channel: kernel.channel,
+					// Kernel 0.3.9: what the branch is, and the rules the server applies (older kernels: both the rules).
+					channel: branchChannelOf(kernel),
+					rules: rulesOf(kernel),
 					serverType: kernel.serverType,
 					placeVersion: status.placeVersion,
 					uptime: math.floor(status.uptime),

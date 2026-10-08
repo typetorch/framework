@@ -7,6 +7,25 @@
 export type Channel = "prod" | "dev";
 export type ServerType = "public" | "private" | "reserved" | "studio";
 
+/**
+ * Kernel 0.3.9 separates two things a server used to report as one "channel":
+ * - the CHANNEL, what the branch is: "prod" for the signed settings' default branch or a branch the settings configure
+ *   prod, "dev" for every other branch (shown in the dev menu, /tt status, heartbeats, analytics);
+ * - the RULES the server enforces: "prod" on every public server and on servers whose branch or build is prod-channel
+ *   (read-only devtools for non-owners, signed deploys, owner-only rollbacks).
+ * The kernel API's `channel` stays the RULES (older frameworks gate their devtools on it); 0.3.9 adds `rules` and
+ * `branchChannel`. Kernel status objects (`status()`, fleet rows) report the channel as `channel` and the rules as
+ * `rules`. These two helpers read either shape, on any kernel (before 0.3.9 both are the old effective channel).
+ */
+export function branchChannelOf(source: { readonly channel?: Channel; readonly branchChannel?: Channel }): Channel | undefined {
+	return source.branchChannel ?? source.channel;
+}
+
+/** The rules a server enforces ("prod": read-only devtools for non-owners); see `branchChannelOf`. */
+export function rulesOf(source: { readonly channel?: Channel; readonly rules?: Channel }): Channel | undefined {
+	return source.rules ?? source.channel;
+}
+
 export interface ArtifactInfo {
 	readonly id: string;
 	readonly assetId?: number;
@@ -157,7 +176,10 @@ export interface DevInfo {
 	reason: string;
 	/** Older kernels may say "admin": read it through `normalRole`. */
 	role?: Role;
+	/** The server's RULES (read-only devtools on "prod"); see `rulesOf`. */
 	channel?: Channel;
+	/** Kernel 0.3.9: what the branch is; see `branchChannelOf`. */
+	branchChannel?: Channel;
 }
 
 /** Kernel 0.3.4+: the last branch switch or build load on this server (`status().switched`). */
@@ -429,7 +451,7 @@ export interface FleetStatus {
 	t: ServerType;
 	/** Branch. */
 	b?: string;
-	/** Effective channel (no generation: absent). */
+	/** The branch's channel (kernel 0.3.9; before: the effective channel, i.e. the rules). No generation: absent. */
 	c?: Channel;
 	/** Artifact id (no generation: absent). */
 	a?: string;
@@ -548,7 +570,10 @@ export interface KernelStatus {
 	placeVersion: number;
 	serverType: ServerType;
 	branch: string;
+	/** What the branch is (kernel 0.3.9; before: the effective channel, i.e. the rules); see `branchChannelOf`. */
 	channel?: Channel;
+	/** Kernel 0.3.9: the rules this server enforces; see `rulesOf`. */
+	rules?: Channel;
 	/** Kernel 0.2+: the running generation was pinned (holds until a newer deploy of this server's branch). */
 	pinned?: boolean;
 	startedAt: number;
@@ -682,7 +707,7 @@ export interface KernelSettings {
  * servers), not authentication.
  */
 export interface GameMessageMeta {
-	/** The sender's effective channel ("prod" on every public server). */
+	/** The sender's channel: kernel 0.3.9+ what its branch is; older kernels the effective channel ("prod" on public servers). */
 	readonly channel: Channel;
 	/** The sender's branch. */
 	readonly branch?: string;
@@ -764,8 +789,16 @@ export interface ServerKernel {
 	readonly artifact: ArtifactInfo;
 	readonly generation: number;
 	readonly branch: string;
-	/** Effective channel: the strictest of branch, artifact and server type (public servers are always "prod"). */
+	/**
+	 * The RULES this server enforces: the strictest of branch, artifact and server type (public servers are always
+	 * "prod"). The name predates kernel 0.3.9's split; read `rules` / `branchChannel` through `rulesOf` /
+	 * `branchChannelOf`.
+	 */
 	readonly channel: Channel;
+	/** Kernel 0.3.9: the rules, by name (same as `channel`). */
+	readonly rules?: Channel;
+	/** Kernel 0.3.9: what the branch is ("prod": the default branch or one configured prod; else "dev"). */
+	readonly branchChannel?: Channel;
 	readonly serverType: ServerType;
 
 	/** A table that survives generation swaps (plain data or kernel-owned handles only). */
@@ -888,7 +921,11 @@ export interface ClientKernel {
 	readonly artifact: ArtifactInfo;
 	readonly generation: number;
 	readonly branch?: string;
+	/** The server's RULES (see ServerKernel.channel). */
 	readonly channel?: Channel;
+	/** Kernel 0.3.9: the rules by name, and what the branch is. */
+	readonly rules?: Channel;
+	readonly branchChannel?: Channel;
 	/** Kernel 0.2.2+. */
 	readonly serverType?: ServerType;
 	/** Kernel 0.2.2+: how this client generation started (a player's first one is kind "boot", reason "boot"). */

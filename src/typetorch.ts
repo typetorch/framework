@@ -21,7 +21,7 @@ import type {
 	SwapOutInfo,
 	SwapReport,
 } from "./kernel";
-import { normalRole } from "./kernel";
+import { branchChannelOf, normalRole, rulesOf } from "./kernel";
 import type { BuildInfo } from "./module";
 import type { Modding } from "./reflection/modding";
 import { resolveModule, tryResolveModule } from "./runtime/dependency";
@@ -83,8 +83,20 @@ export interface TypeTorchApi {
 	readonly generation: number;
 	/** The server's branch. A branch switch starts a new generation (see `startInfo` and `onBranchChanged`). */
 	readonly branch: string;
-	/** Effective channel: the strictest of branch, artifact and server type (public servers are always "prod"). */
+	/**
+	 * The RULES this server runs under: the strictest of branch, artifact and server type (public servers are always
+	 * "prod"). Split data store names by it (a dev build on a public server still writes the prod stores' rules, as
+	 * before). Kernel 0.3.9 reports the branch's own channel separately: `branchChannel`.
+	 */
 	readonly channel: Channel;
+	/** Kernel 0.3.9: the rules by name (same as `channel`): read-only devtools for non-owners on "prod". */
+	readonly rules: Channel;
+	/**
+	 * Kernel 0.3.9: what the branch IS: "prod" for the default branch or a branch the settings configure prod, "dev" for
+	 * every other branch (a dev branch on a public server is "dev" here and "prod" in `channel` / `rules`). For display;
+	 * older kernels: the same as `channel`.
+	 */
+	readonly branchChannel: Channel;
 	/** On a client before kernel 0.2.2 this is a best guess. */
 	readonly serverType: ServerType;
 	readonly kernelVersion: string;
@@ -385,6 +397,8 @@ class TypeTorchRuntime implements TypeTorchApi {
 	generation = 0;
 	branch = "local";
 	channel: Channel = "dev";
+	rules: Channel = "dev";
+	branchChannel: Channel = "dev";
 	serverType: ServerType = "studio";
 	kernelVersion = "none";
 	kernelApi = 0;
@@ -559,6 +573,9 @@ export function bindTypeTorch(
 	runtime.branch = kernel.branch ?? build.branch ?? "unknown";
 	// A client that doesn't know the channel assumes the strictest.
 	runtime.channel = kernel.channel ?? "prod";
+	// Kernel 0.3.9: the rules by name, and what the branch is (older kernels: both the same as `channel`).
+	runtime.rules = rulesOf(kernel) ?? runtime.channel;
+	runtime.branchChannel = branchChannelOf(kernel) ?? runtime.channel;
 	// Kernel 0.3.8: game messaging; the roll call behind servers() and Manage > Servers (one per generation); the signed
 	// settings (liveConfig, analytics).
 	bindMessaging(realm, kernel, trove, runtime.branch, runtime.kernelVersion);

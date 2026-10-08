@@ -5,6 +5,7 @@ import type {
 	ArtifactEntry,
 	ArtifactInfo,
 	BranchInfo,
+	Channel,
 	ClientKernel,
 	DevInfo,
 	KernelStatus,
@@ -16,7 +17,7 @@ import type {
 	SwitchRequest,
 	Verified,
 } from "../kernel";
-import { normalRole } from "../kernel";
+import { branchChannelOf, normalRole, rulesOf } from "../kernel";
 import {
 	branchAction,
 	branchLabel,
@@ -72,6 +73,7 @@ import {
 	COLORS,
 	copyText,
 	corner,
+	DEV_MENU_DISPLAY_ORDER,
 	escapeRich,
 	hex,
 	make,
@@ -401,6 +403,17 @@ interface Waiter {
 export interface DevtoolsClient {
 	/** Call once the client generation is up (all modules started). */
 	readonly started: () => void;
+}
+
+/**
+ * Kernel 0.3.9: "dev" for a dev branch, plus the rules when they are stricter ("dev (prod rules)": a dev branch on a
+ * public server, read-only for non-owners). Older kernels report only the rules.
+ */
+function channelText(source: { channel?: Channel; rules?: Channel; branchChannel?: Channel }): string {
+	const channel = branchChannelOf(source);
+	const rules = rulesOf(source);
+	if (channel === undefined) return "-";
+	return rules !== undefined && rules !== channel ? `${channel} (${rules} rules)` : channel;
 }
 
 /**
@@ -755,7 +768,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		const clientStarted = kernel.start?.startedAt;
 		const clientRunning = page.field("Running", "-");
 		page.field("Branch", str(kernel.branch));
-		page.field("Channel", str(kernel.channel));
+		page.field("Channel", channelText(kernel));
 		page.field("Kernel", `${kernel.kernelVersion} (API ${kernel.kernelApi})`);
 		/** The server's times as of the status reply (os.clock() then); the loop below adds the time since. */
 		let serverTimes: { at: number; generation?: number; server?: number; builtAt?: number; running: TextBox; up: TextBox; built: TextBox } | undefined;
@@ -859,7 +872,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			body.field("Type", status.serverType);
 			body.field("Job", str(status.jobId));
 			body.field("Place version", str(status.placeVersion));
-			body.field("Branch", `${str(status.branch)} (${str(status.channel)})`);
+			body.field("Branch", `${str(status.branch)} (${channelText(status)})`);
 			// Kernel 0.3.4: who switched this server (or loaded a build here), one dim line.
 			const switchedLine = switchedText(status.switched, os.time());
 			if (switchedLine !== undefined) body.text(switchedLine, COLORS.dim);
@@ -1314,7 +1327,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			if (status) {
 				body.field("Type", serverType ?? "-");
 				body.field("Branch", str(status.branch));
-				body.field("Channel", str(status.channel));
+				body.field("Channel", channelText(status));
 				let artifactText = str(running?.id);
 				if (running?.commit !== undefined && artifactText.find(running.commit, 1, true)[0] === undefined) {
 					artifactText += `  ${running.commit}`;
@@ -1459,7 +1472,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 					}
 					// "pin": private/reserved/Studio servers, or an A/B experiment on a public server before kernel 0.3.4.
 					// A dev-channel build on a prod-channel server: a dark "Dev channel" button, so it isn't loaded by mistake.
-					const crossChannel = status?.channel === "prod" && entry.channel === "dev";
+					// (By the server's rules, as before kernel 0.3.9's channel / rules split.)
+					const crossChannel = status !== undefined && rulesOf(status) === "prod" && entry.channel === "dev";
 					let armed = !isPublic && !crossChannel; // public server or cross-channel: tap twice
 					const loadRow = body.row(title, detail, {
 						label: crossChannel ? "Dev channel" : buildLabel(action),
@@ -1697,7 +1711,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			make("ScreenGui", {
 				Name: "TypeTorchDev",
 				ResetOnSpawn: false,
-				DisplayOrder: 100,
+				// Above the kernel's holding screen (which covers every game UI), so the menu opens while "Starting..." shows.
+				DisplayOrder: DEV_MENU_DISPLAY_ORDER,
 				IgnoreGuiInset: true,
 				ZIndexBehavior: Enum.ZIndexBehavior.Sibling,
 			}),

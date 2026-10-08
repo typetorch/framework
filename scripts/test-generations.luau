@@ -706,7 +706,7 @@ do
 		end
 		return list
 	end
-	local base = { kernelApi = 1, kernelVersion = "0.3.8", serverType = "public", generation = { name = "x#1" }, history = {}, memoryMb = 1 }
+	local base = { kernelApi = 1, kernelVersion = "0.3.9", serverType = "public", generation = { name = "x#1" }, history = {}, memoryMb = 1 }
 	local function with(fields)
 		local status = table.clone(base)
 		for key, value in fields do
@@ -714,7 +714,30 @@ do
 		end
 		return status
 	end
-	check("health: LATEST_KERNEL is 0.3.8", health.LATEST_KERNEL == "0.3.8")
+	check("health: LATEST_KERNEL is 0.3.9", health.LATEST_KERNEL == "0.3.9")
+	-- Kernel 0.3.9: the channel (what the branch is) and the rules (what the server enforces) are read apart; older
+	-- kernels only have `channel` (the rules) and both helpers fall back to it.
+	local kernelTypes = TS.import(model.Server, frameworkOut, "kernel")
+	check(
+		"channel: a dev branch on a public server (kernel API: channel = rules prod, branchChannel dev): channel dev, rules prod",
+		kernelTypes.branchChannelOf({ channel = "prod", rules = "prod", branchChannel = "dev" }) == "dev" and kernelTypes.rulesOf({ channel = "prod", rules = "prod", branchChannel = "dev" }) == "prod"
+	)
+	check(
+		"channel: kernel 0.3.9 status() (channel = what the branch is, rules apart) and a 0.3.8 one (channel = rules)",
+		kernelTypes.branchChannelOf({ channel = "dev", rules = "prod" }) == "dev" and kernelTypes.rulesOf({ channel = "dev", rules = "prod" }) == "prod" and kernelTypes.branchChannelOf({ channel = "prod" }) == "prod" and kernelTypes.rulesOf({ channel = "prod" }) == "prod"
+	)
+	local function hasRunLuauHint(status)
+		for _, issue in health.checkHealth(status, { loadstring = false }) do
+			if issue.title == "run_luau off" then
+				return true
+			end
+		end
+		return false
+	end
+	check(
+		"health: the run_luau hint follows the rules, not the branch's channel (dev branch, prod rules: none; dev rules: shown)",
+		not hasRunLuauHint(with({ channel = "dev", rules = "prod" })) and hasRunLuauHint(with({ channel = "dev", rules = "dev" })) and hasRunLuauHint(with({ channel = "dev" }))
+	)
 	local old = titles(with({ kernelVersion = "0.3.1" }))
 	check("health: a 0.3.1 server: Kernel update (warn) and No deploy reports (info)", old["Kernel update"] == "warn" and old["No deploy reports"] == "info")
 	local studio = titles(with({ kernelVersion = "0.3.1", serverType = "studio" }))

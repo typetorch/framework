@@ -9,6 +9,15 @@ import { bump, popIn, popOut } from "../ui";
  * everything that connects or spawns.
  */
 
+/**
+ * ScreenGui DisplayOrders (int32). The kernel's holding screen ("Starting...", kernel 0.3.6+) is 2147483000, above every
+ * game UI; the dev menu and its button sit above it (+100), so a dev can open the menu while the screen is up, and the
+ * copy popup above the menu (+200). Kernel Constants.HOLD_DISPLAY_ORDER is the same number.
+ */
+export const HOLD_DISPLAY_ORDER = 2147483000;
+export const DEV_MENU_DISPLAY_ORDER = HOLD_DISPLAY_ORDER + 100;
+export const COPY_POPUP_DISPLAY_ORDER = HOLD_DISPLAY_ORDER + 200;
+
 export const COLORS = {
 	window: Color3.fromRGB(22, 24, 30),
 	header: Color3.fromRGB(30, 33, 41),
@@ -581,7 +590,7 @@ export function copyText(text: string, anchor?: GuiObject): () => void {
 		layer = trove.add(
 			make("ScreenGui", {
 				Name: "TypeTorchCopy",
-				DisplayOrder: 1000,
+				DisplayOrder: COPY_POPUP_DISPLAY_ORDER, // above the dev menu (and the kernel's holding screen)
 				IgnoreGuiInset: true,
 				ResetOnSpawn: false,
 				ZIndexBehavior: Enum.ZIndexBehavior.Sibling,

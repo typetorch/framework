@@ -320,7 +320,8 @@ export class ServerAnalytics {
 			art: artifact.id,
 			seq: artifact.seq ?? 0,
 			branch: TypeTorch.branch,
-			channel: TypeTorch.channel,
+			// Kernel 0.3.9: what the branch is (a dev branch on a public server is "dev"); older kernels: the rules.
+			channel: TypeTorch.branchChannel ?? TypeTorch.channel,
 		};
 		this.sexp = this.serverExperiment();
 

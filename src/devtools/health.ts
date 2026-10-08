@@ -2,7 +2,7 @@ import type { AssetFacts } from "../assets/manifest";
 import type { DetachedStatus, HealthInfo, KernelStatus, SettingsStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
-export const LATEST_KERNEL = "0.3.8";
+export const LATEST_KERNEL = "0.3.9";
 
 /** Kernels before 0.3.7 use fixed thresholds: 3 errors within 30 s of ready roll back. */
 const OLD_HEALTH_ERRORS = 3;
@@ -355,7 +355,8 @@ export function checkHealth(status: KernelStatus, facts?: ServerFacts): HealthIs
 	if (typeIs(status.memoryMb, "number") && status.memoryMb > HIGH_MEMORY_MB) {
 		issues.push({ level: "warn", title: "High memory", detail: "%.0f MB".format(status.memoryMb) });
 	}
-	if (facts?.loadstring === false && status.channel === "dev") {
+	// By the server's rules (kernel 0.3.9 `rules`; before, `channel` held them): run_luau works on dev-rules servers only.
+	if (facts?.loadstring === false && (status.rules ?? status.channel) === "dev") {
 		issues.push({ level: "info", title: "run_luau off", detail: "LoadStringEnabled is off in this place." });
 	}
 	for (const issue of assetIssues(facts?.assets)) issues.push(issue);

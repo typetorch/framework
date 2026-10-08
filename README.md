@@ -201,6 +201,10 @@ leaves one behind. Each `on*` returns a disconnect function, which a trove can o
 TypeTorch.artifact; // { id, commit, commitHash, branch, channel, builtAt, seq, assetId }
 TypeTorch.generation; // 1, 2, 3... per server (or client)
 TypeTorch.branch; TypeTorch.channel; TypeTorch.serverType; // "public" | "private" | "reserved" | "studio"
+// Kernel 0.3.9: `channel` is the RULES this server runs under ("prod" on every public server; split data stores by it);
+// `branchChannel` is what the branch IS ("prod" for the default branch or one configured prod, else "dev");
+// `rules` is the same as `channel`, by name.
+TypeTorch.branchChannel; TypeTorch.rules;
 TypeTorch.isPinned(); TypeTorch.kernelVersion; TypeTorch.kernelApi; TypeTorch.jobId; TypeTorch.isStudio;
 
 // How this generation started: a branch change starts a new generation.
