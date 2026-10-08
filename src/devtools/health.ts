@@ -1,5 +1,7 @@
+import { describeFleetError } from "../analytics/hints";
+import type { AnalyticsStats } from "../analytics/schema";
 import type { AssetFacts } from "../assets/manifest";
-import type { DetachedStatus, HealthInfo, KernelStatus, SettingsStatus } from "../kernel";
+import type { DetachedStatus, FleetSenderInfo, HealthInfo, KernelStatus, SettingsStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
 export const LATEST_KERNEL = "0.3.8";
@@ -25,15 +27,14 @@ export function healthLimitsText(health: HealthInfo): string {
 	return `${limit} errors / ${seconds} s${health.rollback === false ? ", no rollback" : ""}`;
 }
 
-/** The fleet API's last error as a short fix (the dev PC's `bun run local` restarts the server and its tunnel). */
+/**
+ * The fleet API's last error as a reason and a fix (analytics/hints.ts, the same words the analytics log line uses):
+ * "HTTP 530: the tunnel has nothing behind it. The dev PC's tunnel or server stopped: run bun run local ...".
+ */
 export function fleetFix(lastError: string | undefined): string {
-	if (lastError === undefined) return "-";
-	if (lastError === "HTTP 530") return "HTTP 530: tunnel down. Run bun run local";
-	if (lastError === "HTTP 502" || lastError === "HTTP 504") return `${lastError}: server down. Run bun run local`;
-	if (lastError === "HTTP 401" || lastError === "HTTP 403") return `${lastError}: token mismatch. Run fleet setup`;
-	if (lastError === "HTTP 404") return "HTTP 404: wrong URL. Run bun run local";
-	if (lastError === "HTTP 429") return "HTTP 429: rate limited";
-	return lastError;
+	const help = describeFleetError(lastError);
+	if (help === undefined) return "-";
+	return `${help.reason}. ${help.fix}`;
 }
 /** The oldest kernel API this framework runs on. */
 export const REQUIRED_KERNEL_API = 1;
@@ -63,6 +64,8 @@ export interface ServerFacts {
 	experiments?: boolean;
 	/** Hot assets (assets/sync.ts): failed loads and manifest problems; absent without a manifest. */
 	assets?: AssetFacts;
+	/** The analytics engine's counters (analytics/status.ts); absent when no engine runs in this generation. */
+	analytics?: AnalyticsStats;
 }
 
 /** "0.2.0" < "0.2.1"; missing parts count as 0, non-numbers as 0. */
@@ -128,6 +131,84 @@ export function signingIssues(status: KernelStatus): HealthIssue[] {
 	return issues;
 }
 
+/** The kernel's fleet API sender failed more recently than it succeeded. */
+export function fleetFailing(fleet: FleetSenderInfo): boolean {
+	return fleet.enabled && fleet.lastErrorAt !== undefined && (fleet.lastOkAt === undefined || fleet.lastErrorAt > fleet.lastOkAt);
+}
+
+/** "3m ago" for a unix time `at` (both os.time() values); "just now" for the future or under 5 s. */
+function agoText(now: number, at: number): string {
+	const seconds = now - at;
+	return seconds < 5 ? "just now" : `${ageText(seconds)} ago`;
+}
+
+/**
+ * The Status page's Fleet API line (kernel 0.3.2+ `status().fleet`): "fleet.example.com, 340 sent, 12 failed, FAILING:
+ * HttpError: NetFail 40 s ago". Never the token (the kernel doesn't send it).
+ */
+export function fleetText(fleet: FleetSenderInfo, now: number): string {
+	if (fleet.missing === true) return "off: the kernel's Fleet module is not mapped";
+	if (fleet.settings === "invalid") return `settings invalid: ${fleet.settingsError ?? "-"}`;
+	if (!fleet.enabled) return fleet.settings === "absent" ? "off: no fleet settings (typetorch fleet setup)" : "off (settings not read yet)";
+	const parts = [fleet.host ?? "?", `${fleet.sent ?? 0} sent`];
+	if ((fleet.failed ?? 0) > 0) parts.push(`${fleet.failed} failed`);
+	if ((fleet.queued ?? 0) > 0) parts.push(`${fleet.queued} queued`);
+	if ((fleet.dropped ?? 0) > 0) parts.push(`${fleet.dropped} dropped`);
+	if (fleet.lastErrorAt !== undefined) {
+		const problem = fleet.lastError ?? "?";
+		parts.push(fleetFailing(fleet) ? `FAILING: ${problem} ${agoText(now, fleet.lastErrorAt)}` : `last error ${problem} ${agoText(now, fleet.lastErrorAt)}`);
+	}
+	return parts.join(", ");
+}
+
+/**
+ * The Status page's Analytics line (the engine's `stats()`): "duckdb, 12 queued, 3400 sent, FAILING x5: both: HttpError:
+ * NetFail 20 s ago, retry in 80 s".
+ */
+export function analyticsText(stats: AnalyticsStats, now: number): string {
+	if (!stats.configured) {
+		return stats.settingsErrors.size() > 0 ? `settings invalid: ${stats.settingsErrors[0]}` : "no settings yet (typetorch settings set analytics -)";
+	}
+	const parts = [stats.backend ?? "?", `${stats.queued + stats.queuedFleet} queued`, `${stats.sent} sent`];
+	if (stats.dropped > 0) parts.push(`${stats.dropped} dropped`);
+	if (stats.rejected > 0) parts.push(`${stats.rejected} refused`);
+	const errorAt = stats.lastErrorAt;
+	if (stats.failures > 0) {
+		const when = errorAt !== undefined ? ` ${agoText(now, errorAt)}` : "";
+		const retry = stats.retryIn !== undefined ? `, retry in ${stats.retryIn} s` : "";
+		parts.push(`FAILING x${stats.failures}: ${stats.lastError ?? "?"}${when}${retry}`);
+	} else if (stats.failed > 0 && errorAt !== undefined) {
+		parts.push(`${stats.failed} failed earlier, last ${agoText(now, errorAt)}`);
+	}
+	return parts.join(", ");
+}
+
+/**
+ * The analytics engine (analytics/status.ts):
+ * - settings that don't parse: warn (the engine sends nothing);
+ * - uploads failing: warn with the reason and the fix (the same words as the log line), the streak and the next try;
+ * - rows dropped because the queue filled while the sink was down: info.
+ */
+export function analyticsIssues(stats: AnalyticsStats | undefined): HealthIssue[] {
+	const issues = new Array<HealthIssue>();
+	if (stats === undefined) return issues;
+	if (stats.settingsErrors.size() > 0) {
+		issues.push({ level: "warn", title: "Analytics settings", detail: stats.settingsErrors[0] });
+	}
+	if (stats.failures > 0) {
+		const retry = stats.retryIn !== undefined ? `, retry in ${stats.retryIn} s` : "";
+		issues.push({
+			level: "warn",
+			title: `Analytics failing x${stats.failures}`,
+			detail: `${stats.reason ?? stats.lastError ?? "no answer"}. ${stats.fix ?? ""}${retry}`,
+		});
+	}
+	if (stats.dropped > 0) {
+		issues.push({ level: "info", title: `Analytics dropped ${stats.dropped}`, detail: "Rows were lost while the sink was down or too slow." });
+	}
+	return issues;
+}
+
 /**
  * Kernel 0.3.2 (plans/12 P-F1, P-O1, P-K7): the health window, the kernel's heartbeat and deploy reports, and client
  * generation reports.
@@ -169,7 +250,8 @@ export function deployIssues(status: KernelStatus): HealthIssue[] {
 	} else if (fleet?.settings === "invalid") {
 		issues.push({ level: "warn", title: "Fleet settings", detail: fleet.settingsError ?? "settings.fleet is invalid." });
 	} else if (fleet?.enabled === true && fleet.lastErrorAt !== undefined && (fleet.lastOkAt === undefined || fleet.lastErrorAt > fleet.lastOkAt)) {
-		issues.push({ level: "warn", title: "Fleet API failing", detail: fleetFix(fleet.lastError) });
+		const failed = (fleet.failed ?? 0) > 0 ? ` (${fleet.failed} failed, last ${agoText(os.time(), fleet.lastErrorAt)})` : "";
+		issues.push({ level: "warn", title: "Fleet API failing", detail: `${fleetFix(fleet.lastError)}${failed}` });
 	}
 	const clients = status.clients;
 	if (clients !== undefined && clients.failed > 0) {
@@ -361,6 +443,7 @@ export function checkHealth(status: KernelStatus, facts?: ServerFacts): HealthIs
 	for (const issue of assetIssues(facts?.assets)) issues.push(issue);
 	for (const issue of signingIssues(status)) issues.push(issue);
 	for (const issue of deployIssues(status)) issues.push(issue);
+	for (const issue of analyticsIssues(facts?.analytics)) issues.push(issue);
 	for (const issue of fallbackIssues(status)) issues.push(issue);
 	for (const issue of messagingIssues(status)) issues.push(issue);
 	for (const issue of settingsIssues(status)) issues.push(issue);

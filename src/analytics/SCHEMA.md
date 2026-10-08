@@ -176,8 +176,13 @@ Unknown fields are ignored. Settings errors are warned once (never with the toke
 - **Batches:** every `flushSeconds`, or at 500 queued events or 20 recordings. At most 500 event rows (fleet rows
   first) and 50 recording rows per request, about 900 KB each. At most ~10 requests a minute per server (burst 3).
 - **Answers:** 2xx sent; 413 the batch is halved and resent (a single row is dropped); 401/403/404 rows are kept and
-  sending waits 300 s (or until the settings change); 408/429/5xx/no answer retry with backoff 5, 10, 20... 300 s;
-  other 4xx drop the batch (counted as rejected).
+  sending waits about 300 s (225-375 s, jittered; or until the settings change); 408/429/5xx/no answer retry with
+  backoff 5, 10, 20... 300 s (each +-25%); other 4xx drop the batch (counted as rejected).
+- **Failure log and status:** at most one log line a minute (the reason and the fix from `hints.ts`, the streak, the next
+  try; later lines say how many were held back) and one line when uploads work again. `stats()`: `failures` (in a
+  row), `failed` (total), `lastError`, `lastStatus` (0: no answer, an `HttpError` such as NetFail / DnsResolve),
+  `lastErrorAt`, `lastOkAt`, `retryIn`, and while failing `reason` and `fix`. The dev menu reads them through
+  `analytics/status.ts`.
 - **Delivery is at least once:** a hot swap during a request sends its rows again. Readers may drop exact duplicate
   rows.
 - **The cloud test sends nothing:** inside `typetorch test --cloud` (the stub kernel's `test = true`, or the workspace

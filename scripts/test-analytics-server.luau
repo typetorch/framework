@@ -625,6 +625,48 @@ check("queue empty after 200", #store().events.rows == 0 and #store().fleet.rows
 check("sent counted", store().sent == queuedBefore + 3 + 2 and store().failures == 0, store().sent)
 check("no token in rows", not string.find(requests[2].Body, "TKN", 1, true))
 
+-- NetFail (no answer at all): the counters say what happened, the log line carries the reason and the fix, at most one a
+-- minute, and the next accepted request ends the streak.
+local function said(fragment)
+	for _, line in warnings do
+		if string.find(line, fragment, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+core1:track(newbie, "custom", "net_fail_probe", nil)
+core1.lastWarnAt = -math.huge -- (a minute has passed since the 503 line)
+local warnedBeforeNetFail = #warnings
+respond = function()
+	error("HttpError: NetFail", 0)
+end
+core1:flushSoon()
+task.wait(1.5)
+local failing = core1:stats()
+check("NetFail: one failure counted", failing.failures == 1 and failing.failed >= 2, failing.failed)
+check("NetFail: status 0 and the message kept", failing.lastStatus == 0 and string.find(failing.lastError, "NetFail", 1, true) ~= nil, failing.lastError)
+check("NetFail: when it failed and when it last worked", failing.lastErrorAt ~= nil and failing.lastOkAt ~= nil and failing.lastErrorAt >= failing.lastOkAt)
+check("NetFail: retry in a few seconds (jittered)", failing.retryIn ~= nil and failing.retryIn >= 3 and failing.retryIn <= 7, failing.retryIn)
+check("NetFail: reason and fix", string.find(failing.reason, "NetFail", 1, true) ~= nil and string.find(failing.fix, "typetorch doctor", 1, true) ~= nil, failing.fix)
+check("NetFail: one log line with the reason, the fix and the retry", #warnings == warnedBeforeNetFail + 1 and said("NetFail") and said("typetorch doctor") and said("Retrying in"), warnings[#warnings])
+check("NetFail: the token is not in the line", not said("TKN"))
+-- Many failures in a minute: still one line; the next one after the minute says how many it held back.
+for _ = 1, 3 do
+	core1:warn("analytics upload failed: again")
+end
+check("log gate: at most one line a minute", #warnings == warnedBeforeNetFail + 1, #warnings)
+core1.lastWarnAt = -math.huge
+core1:warn("analytics upload failed: after the minute")
+check("log gate: the next line counts the held-back ones", string.find(warnings[#warnings], "(+3 more in the last minute)", 1, true) ~= nil, warnings[#warnings])
+respond = function()
+	return { Success = true, StatusCode = 200, StatusMessage = "OK", Body = "" }
+end
+task.wait(7.5)
+local recovered = core1:stats()
+check("recovered: the streak is over, the history stays", recovered.failures == 0 and recovered.failed >= 2 and recovered.lastError ~= nil and recovered.lastOkAt >= recovered.lastErrorAt)
+check("recovered: nothing left to fix", recovered.retryIn == nil and recovered.reason == nil and recovered.fix == nil)
+
 -- A refused batch is dropped.
 core1:track(newbie, "custom", "refused_one", nil)
 respond = function()

@@ -113,6 +113,14 @@ export function backoffSeconds(failures: number, jitter: number): number {
 	return base * (0.75 + 0.5 * math.clamp(jitter, 0, 1));
 }
 
+/**
+ * Seconds to wait after a settings problem (401/403/404: wrong token or URL): long, because retrying doesn't help until
+ * the settings change (that retries at once), spread by `jitter` (0..1) so a whole fleet of servers doesn't retry in step.
+ */
+export function configWaitSeconds(jitter: number): number {
+	return 300 * (0.75 + 0.5 * math.clamp(jitter, 0, 1));
+}
+
 /** What to do with a batch after an HTTP status (0 = no response: network error, timeout, HttpService off). */
 export type Outcome = "sent" | "retry" | "split" | "drop" | "config";
 

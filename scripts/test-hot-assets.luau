@@ -15,7 +15,20 @@ local function load(path, env)
 end
 
 local M = load("assets/manifest.luau")
-local health = load("devtools/health.luau")
+-- health.luau imports analytics/hints.luau (the shared failure words for the Status page).
+local hintsModule = load("analytics/hints.luau")
+local healthScript = { Parent = { Parent = {} } }
+local health = load(
+	"devtools/health.luau",
+	setmetatable({
+		script = healthScript,
+		_G = { [healthScript] = {
+			import = function()
+				return hintsModule
+			end,
+		} },
+	}, { __index = _G })
+)
 local decode = function(text)
 	return serde.decode("json", text)
 end

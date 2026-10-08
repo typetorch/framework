@@ -420,6 +420,17 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   `flushSeconds` (15) or at 500 rows, at most ~10 HttpService requests a minute, retries with backoff, and a last
   flush on shutdown (kernel 0.3.2). Delivery is at least once (a swap mid-request sends that batch again).
   `analytics.stats()` (server) has the counters; `flush()` sends soon.
+- **When uploads fail** (a stale quick-tunnel URL, the dev PC's server or tunnel down, a wrong token, HttpService off;
+  Roblox reports most network problems as `HttpError: NetFail`, `DnsResolve` or `ConnectFail`): the server backs off
+  with jitter (5, 10, 20 ... 300 s, spread +-25% so a fleet of servers doesn't retry in step; a wrong token or URL waits
+  about 5 minutes, and a settings change retries at once), keeps the rows, and logs at most ONE line a minute: the
+  reason and the fix (`analytics upload failed 5 times in a row: NetFail: the connection broke mid-request. ... Retrying
+  in 80 s.`, with "(+N more in the last minute)" for the lines it held back) and one line when uploads work again.
+  `stats()` also has `failures` (in a row), `failed` (since the server started), `lastError`, `lastStatus`
+  (0 = no answer), `lastErrorAt` / `lastOkAt` (`os.time()`), `retryIn`, and, while failing, `reason` and `fix`. The dev
+  menu shows them: **Server > Status** has an *Analytics* line (queued, sent, `FAILING x5: ... retry in 80 s`) and a
+  *Fleet API* line (the kernel's sender: sent, failed, last error and its age), and **Attention** lists the reason and
+  the fix; `typetorch doctor` tests the address and token in the settings record.
 - **The cloud test sends nothing.** `typetorch test --cloud` boots the payload headless in a Luau Execution task where
   HttpService works; there the engine (stub kernel `test = true`, or `workspace:GetAttribute("TypeTorchTest")`) collects
   as usual but never uploads: no event rows, no identity rows, no HTTP request, so a prod deploy never puts a fake
@@ -481,9 +492,11 @@ bun run build   # rbxtsc --type package -> out/
   shorthand, setCallback with values and Promises, predict, a swap, and the client side (invoke, invokeWithTimeout,
   `createClient({ defaultTimeout })`).
   `scripts/test-analytics.luau` checks the analytics engine's pure parts (experiment assignment, settings, the queue
-  and HTTP budget, tt-rec-1, the sink request bodies); `test-analytics-server.luau` and `test-analytics-client.luau`
-  run the compiled server and client cores against mocked services (sessions, intake, retries, a swap with a request
-  in flight, shutdown; the recorder, screens, batching).
+  and HTTP budget, tt-rec-1, the sink request bodies, the failure help); `test-analytics-server.luau` and
+  `test-analytics-client.luau` run the compiled server and client cores against mocked services (sessions, intake,
+  retries, a NetFail streak and its one log line a minute, a swap with a request in flight, shutdown; the recorder,
+  screens, batching). `scripts/test-net-health.luau` checks the dev menu's Fleet API / Analytics status lines and
+  Attention issues.
 - **Publishing:** `npm publish` runs `prepublishOnly` (clean + build). The package ships only `out/` (no
   `.tsbuildinfo`), `README.md` and `LICENSE`; check with `bun pm pack --dry-run`.
 
