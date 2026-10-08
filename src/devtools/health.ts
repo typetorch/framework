@@ -1,10 +1,10 @@
 import { describeFleetError } from "../analytics/hints";
 import type { AnalyticsStats } from "../analytics/schema";
 import type { AssetFacts } from "../assets/manifest";
-import type { DetachedStatus, FleetSenderInfo, HealthInfo, KernelStatus, SettingsStatus } from "../kernel";
+import type { DetachedStatus, ErrorReportsStatus, FleetSenderInfo, HealthInfo, KernelStatus, SettingsStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
-export const LATEST_KERNEL = "0.3.9";
+export const LATEST_KERNEL = "0.4.0";
 
 /** Kernels before 0.3.7 use fixed thresholds: 3 errors within 30 s of ready roll back. */
 const OLD_HEALTH_ERRORS = 3;
@@ -149,16 +149,56 @@ function agoText(now: number, at: number): string {
 export function fleetText(fleet: FleetSenderInfo, now: number): string {
 	if (fleet.missing === true) return "off: the kernel's Fleet module is not mapped";
 	if (fleet.settings === "invalid") return `settings invalid: ${fleet.settingsError ?? "-"}`;
-	if (!fleet.enabled) return fleet.settings === "absent" ? "off: no fleet settings (typetorch fleet setup)" : "off (settings not read yet)";
+	if (!fleet.enabled) return fleet.settings === "absent" ? "off: no backend settings (typetorch backend setup)" : "off (settings not read yet)";
 	const parts = [fleet.host ?? "?", `${fleet.sent ?? 0} sent`];
 	if ((fleet.failed ?? 0) > 0) parts.push(`${fleet.failed} failed`);
 	if ((fleet.queued ?? 0) > 0) parts.push(`${fleet.queued} queued`);
 	if ((fleet.dropped ?? 0) > 0) parts.push(`${fleet.dropped} dropped`);
 	if (fleet.lastErrorAt !== undefined) {
 		const problem = fleet.lastError ?? "?";
-		parts.push(fleetFailing(fleet) ? `FAILING: ${problem} ${agoText(now, fleet.lastErrorAt)}` : `last error ${problem} ${agoText(now, fleet.lastErrorAt)}`);
+		if (fleetFailing(fleet)) {
+			// Kernel 0.3.9: failed requests in a row and the backoff ("FAILING x5: NetFail 40 s ago, retry in 80 s").
+			const streak = (fleet.failures ?? 0) > 1 ? ` x${fleet.failures}` : "";
+			const retry = fleet.retryIn !== undefined ? `, retry in ${fleet.retryIn} s` : "";
+			parts.push(`FAILING${streak}: ${problem} ${agoText(now, fleet.lastErrorAt)}${retry}`);
+		} else {
+			parts.push(`last error ${problem} ${agoText(now, fleet.lastErrorAt)}`);
+		}
+	}
+	// Kernel 0.4.0: the old settings.fleet still in use (typetorch backend setup moves it to settings.backend).
+	if (fleet.source === "fleet") parts.push("old settings.fleet");
+	return parts.join(", ");
+}
+
+/**
+ * The Status page's Error reports line (kernel 0.4.0 `status().errors`): "3 kinds, 12 sent, 2 waiting", plus drops and
+ * a failure with its backoff. Studio counts without posting.
+ */
+export function errorsText(errors: ErrorReportsStatus, now: number): string {
+	if (errors.missing === true) return "off: the kernel's Errors module is not mapped";
+	const seen = (errors.seen?.server ?? 0) + (errors.seen?.client ?? 0);
+	const parts = [`${seen} seen`, `${errors.kinds ?? 0} kinds`];
+	if (!errors.enabled) {
+		parts.push("not posted (no backend settings, or Studio)");
+		return parts.join(", ");
+	}
+	parts.push(`${errors.sent ?? 0} sent`);
+	if ((errors.waiting ?? 0) > 0) parts.push(`${errors.waiting} waiting`);
+	const dropped = errors.dropped;
+	const lost = dropped !== undefined ? dropped.kinds + dropped.items + dropped.rate + dropped.old + dropped.client : 0;
+	if (lost > 0) parts.push(`${lost} dropped`);
+	if ((errors.rejected ?? 0) > 0) parts.push(`${errors.rejected} refused`);
+	if ((errors.failures ?? 0) > 0) {
+		const when = errors.lastErrorAt !== undefined ? ` ${agoText(now, errors.lastErrorAt)}` : "";
+		const retry = errors.retryIn !== undefined ? `, retry in ${errors.retryIn} s` : "";
+		parts.push(`FAILING x${errors.failures}: ${errors.lastError ?? "?"}${when}${retry}`);
 	}
 	return parts.join(", ");
+}
+
+/** The error reports are failing to post (kernel 0.4.0). */
+export function errorsFailing(errors: ErrorReportsStatus): boolean {
+	return errors.enabled && (errors.failures ?? 0) > 0;
 }
 
 /**
@@ -167,7 +207,7 @@ export function fleetText(fleet: FleetSenderInfo, now: number): string {
  */
 export function analyticsText(stats: AnalyticsStats, now: number): string {
 	if (!stats.configured) {
-		return stats.settingsErrors.size() > 0 ? `settings invalid: ${stats.settingsErrors[0]}` : "no settings yet (typetorch settings set analytics -)";
+		return stats.settingsErrors.size() > 0 ? `settings invalid: ${stats.settingsErrors[0]}` : "no settings yet (typetorch backend setup)";
 	}
 	const parts = [stats.backend ?? "?", `${stats.queued + stats.queuedFleet} queued`, `${stats.sent} sent`];
 	if (stats.dropped > 0) parts.push(`${stats.dropped} dropped`);

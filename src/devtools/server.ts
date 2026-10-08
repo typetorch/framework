@@ -158,6 +158,11 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 		return { server: kernel.status(), artifact: kernel.artifact, modules, you: kernel.devInfo(player), facts: serverFacts(kernel) };
 	});
 	ops.set("logs", (_, payload) => kernel.logs(typeIs(payload, "number") ? payload : undefined, 200));
+	// Server > Budget (kernel 0.4.0): requests per minute and per caller next to Roblox's limits, memory.
+	ops.set("budget", () => {
+		if (!typeIs((kernel as unknown as Record<string, unknown>).budget, "function")) return { supported: false };
+		return { supported: true, budget: kernel.budget!() };
+	});
 	ops.set("branches", () => kernel.branches());
 	ops.set("reload", (player) => {
 		if (!mayRetarget(player)) error(NOT_YOURS, 0);

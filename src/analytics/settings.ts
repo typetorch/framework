@@ -126,7 +126,38 @@ export function parseSettings(raw: unknown, decode: (text: string) => unknown): 
 	};
 }
 
-/** Where identity rows go on a Basin game: the fleet API (the settings' `fleet` = { url, token }) at /v1/identity. */
+/**
+ * Kernel 0.4.0 / plans/21: the raw sink settings from the signed record. `backend` = { url, key, analytics? } is the
+ * DuckDB sink at <url>/v1/ingest with the key (flushSeconds, recordShare, techEvery and experiments from
+ * `backend.analytics`). The old `analytics` value is used while `backend` is missing, and whenever it names a Basin sink
+ * (`backend` can't describe Basin streams). Returns what parseSettings reads (undefined: no settings).
+ */
+export function sinkSettings(backend: unknown, analytics: unknown, decode: (text: string) => unknown): unknown {
+	if (analytics !== undefined) {
+		let value: unknown = analytics;
+		if (typeIs(value, "string")) {
+			const [ok, decoded] = pcall(decode, value);
+			value = ok ? decoded : undefined;
+		}
+		if (typeIs(value, "table") && (value as Record<string, unknown>).backend === "basin") return analytics;
+	}
+	if (!typeIs(backend, "table")) return analytics;
+	const entry = backend as Record<string, unknown>;
+	if (!typeIs(entry.url, "string")) return analytics;
+	const base = entry.url.gsub("/+$", "")[0];
+	const extra = typeIs(entry.analytics, "table") ? (entry.analytics as Record<string, unknown>) : {};
+	return {
+		backend: "duckdb",
+		events: `${base}/v1/ingest`,
+		token: entry.key,
+		flushSeconds: extra.flushSeconds,
+		recordShare: extra.recordShare,
+		techEvery: extra.techEvery,
+		experiments: extra.experiments,
+	};
+}
+
+/** Where identity rows go on a Basin game: the backend (`backend` = { url, key }, or the old `fleet` = { url, token }) at /v1/identity. */
 export interface IdentityTarget {
 	url: string;
 	token?: string;
@@ -143,7 +174,8 @@ export function identityTarget(settings: ResolvedSettings, fleetRaw: unknown, de
 		const [ok, decoded] = pcall(decode, fleetRaw);
 		if (ok && typeIs(decoded, "table")) fleet = decoded as Record<string, unknown>;
 	} else if (typeIs(fleetRaw, "table")) fleet = fleetRaw as Record<string, unknown>;
-	const fleetToken = fleet !== undefined && typeIs(fleet.token, "string") && fleet.token.size() > 0 ? fleet.token : undefined;
+	const secret = fleet !== undefined ? (fleet.key !== undefined ? fleet.key : fleet.token) : undefined;
+	const fleetToken = typeIs(secret, "string") && secret.size() > 0 ? secret : undefined;
 	if (settings.identity !== undefined) return { url: settings.identity, token: settings.identityToken ?? fleetToken };
 	if (fleet === undefined || !isUrl(fleet.url)) return undefined;
 	const base = (fleet.url as string).gsub("/+$", "")[0];

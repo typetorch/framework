@@ -519,6 +519,89 @@ export interface FleetSenderInfo {
 	lastError?: string;
 	lastErrorAt?: number;
 	lastStatus?: number;
+	/** Kernel 0.3.9: failed requests in a row (0 once one works). */
+	failures?: number;
+	/** Kernel 0.3.9: seconds until the next try while the sender backs off (or holds off after a 401/403/404). */
+	retryIn?: number;
+	/** Kernel 0.4.0: the settings field the URL and key came from: "backend" (plans/21) or the old "fleet". */
+	source?: "backend" | "fleet";
+}
+
+/**
+ * Kernel 0.4.0 `status().errors`: the error reports (problem 19). Templates only (players' names, display names and
+ * UserIds already replaced); never the key.
+ */
+export interface ErrorReportsStatus {
+	/** Posting (a live server with backend settings). Studio counts without posting. */
+	enabled: boolean;
+	/** The place doesn't map the kernel's Errors module. */
+	missing?: boolean;
+	host?: string;
+	/** Error kinds held (template + first stack). */
+	kinds?: number;
+	/** Per-minute items waiting to be posted. */
+	waiting?: number;
+	/** Errors seen since boot (each occurrence). */
+	seen?: { server: number; client: number };
+	/** Items the backend accepted. */
+	sent?: number;
+	requests?: number;
+	failed?: number;
+	/** Items the backend refused. */
+	rejected?: number;
+	dropped?: { kinds: number; items: number; rate: number; old: number; client: number };
+	failures?: number;
+	retryIn?: number;
+	lastOkAt?: number;
+	lastError?: string;
+	lastErrorAt?: number;
+	lastStatus?: number;
+	/** The busiest kinds since boot. */
+	top?: { fp: string; template: string; total: number; realm: "server" | "client" }[];
+}
+
+/** Who made a request, for the budget view (kernel 0.4.0). */
+export type BudgetCaller = "kernel" | "devtools" | "analytics" | "game" | "framework";
+export type BudgetKind = "datastore" | "memorystore" | "http" | "messaging";
+
+/**
+ * Kernel 0.4.0 `status().budget` and the fleet heartbeat's `bu`: requests in the last 60 s (rounded) next to Roblox's
+ * limits for the player count. `ds` DataStore (r read, w write, l list, x remove, lr / lw limits, br / bw the server's
+ * budget left, shared with the game), `ms` MemoryStore units (l = this server's players' part of the experience
+ * quota), `h` HTTP, `mg` MessagingService (p publish, s subscribe requests), `by` per caller (k kernel, d devtools,
+ * a analytics, g game, f framework), `mem` MB (t total, h LuaHeap).
+ */
+export interface BudgetSummary {
+	p: number;
+	ds: { r: number; w: number; l: number; x: number; lr: number; lw: number; br?: number; bw?: number };
+	ms: { u: number; l: number };
+	h: { r: number; l: number };
+	mg: { p: number; lp: number; s: number; ls: number };
+	by: Partial<Record<"k" | "d" | "a" | "g" | "f", number>>;
+	mem: { t?: number; h?: number };
+}
+
+/** One bar of the budget view: TypeTorch's requests in the last 60 s, the limit, and (DataStore) the budget left. */
+export interface BudgetRow {
+	name: string;
+	used: number;
+	limit: number;
+	left?: number;
+}
+
+/** Kernel 0.4.0 `api:budget()`: the dev menu's Server > Budget. */
+export interface BudgetSnapshot {
+	missing?: boolean;
+	players: number;
+	window: number;
+	kinds: Record<BudgetKind, { rows: BudgetRow[]; callers: Partial<Record<BudgetCaller, number>> }>;
+	/** Busiest first. */
+	detail: { caller: BudgetCaller; kind: BudgetKind; op: string; perMinute: number; total: number }[];
+	memory: { total?: number; luaHeap?: number; heapKb: number; tags?: { name: string; mb: number }[] };
+	/** The mounted server generations (old ones stay a moment after a swap). */
+	generations: { name: string; modules: number; running: boolean }[];
+	/** Counts that found no free counter (counted as "other"). */
+	refused: number;
 }
 
 /** Kernel 0.3.2+ `status().clients`: what clients reported about their generation start (P-K7). */
@@ -644,6 +727,10 @@ export interface KernelStatus {
 	settings?: SettingsStatus;
 	/** Kernel 0.3.8: detached jobs (`TypeTorch.runDetached`). */
 	detached?: DetachedStatus;
+	/** Kernel 0.4.0: the error reports (templates only). */
+	errors?: ErrorReportsStatus;
+	/** Kernel 0.4.0: the budget summary (the heartbeat's `bu`); the full view is `budget()`. */
+	budget?: BudgetSummary;
 }
 
 /** Kernel 0.3.8: detached jobs on this server (`runDetached`): counters since boot and the running ones. */
@@ -694,8 +781,14 @@ export interface KernelSettings {
 	defaultBranch?: string;
 	channels?: Record<string, Channel>;
 	access?: { members?: Record<string, string>; revoked?: Record<string, boolean>; devBadgeId?: number };
+	/**
+	 * Kernel 0.4.0 / CLI 0.9 (plans/21): ONE backend and one key: heartbeats to <url>/v1/fleet/*, events to <url>/v1/ingest,
+	 * error reports to <url>/v1/errors. Replaces `fleet` and `analytics` (both still read while it is missing).
+	 */
+	backend?: { url: string; key: string; analytics?: { flushSeconds?: number; recordShare?: number; techEvery?: number; experiments?: unknown } };
+	/** The old fleet settings (before `backend`). */
 	fleet?: { url: string; token: string };
-	/** The analytics sink settings (`typetorch settings set analytics -`). */
+	/** The old analytics sink settings (before `backend`; still the way to a Basin sink). */
 	analytics?: unknown;
 	/** The game's own live values (`typetorch settings set game.<key> <json>`; `TypeTorch.liveConfig`). */
 	game?: Record<string, unknown>;
@@ -909,6 +1002,20 @@ export interface ServerKernel {
 	 * the job's id.
 	 */
 	runDetached?(fn: () => unknown, done?: (ok: boolean, result: unknown) => void): number;
+
+	/**
+	 * Kernel 0.4.0 (additive; plans/21 C): the analytics engine tells the kernel each player's pid, so the kernel's error
+	 * reports count affected players without names or UserIds. Returns whether it was taken.
+	 */
+	setAnalyticsId?(player: Player, pid: string): boolean;
+	/**
+	 * Kernel 0.4.0: counts this caller's own DataStore / MemoryStore / HTTP / MessagingService requests for the budget
+	 * view ("kernel" is refused: it counts as "game"). `op`: a category (read, write, list, remove, publish, subscribe) or
+	 * a label (an HTTP target). Never throws.
+	 */
+	budgetCount?(caller: BudgetCaller, kind: BudgetKind, op: string, n?: number): void;
+	/** Kernel 0.4.0: the full budget view (dev menu Server > Budget). Cheap, no yield. */
+	budget?(): BudgetSnapshot;
 
 	/** `typetorch test --cloud`'s stub kernel: true (code that must not run in the gate checks it). */
 	readonly test?: boolean;

@@ -60,7 +60,8 @@ import { Layout, newLayout, sanitizeLayout } from "./layout";
 import { createWindowManager, PaneHost, PaneTab, PickItem, WindowManager } from "./panes";
 import { describeState } from "./state";
 import type { ArtifactNotes } from "./artifact-notes";
-import { analyticsText, badgeLevel, checkHealth, detachedText, fleetFailing, fleetText, HealthIssue, HealthLevel, healthLimitsText, ServerFacts, settingsText } from "./health";
+import { analyticsText, badgeLevel, checkHealth, detachedText, errorsFailing, errorsText, fleetFailing, fleetText, HealthIssue, HealthLevel, healthLimitsText, ServerFacts, settingsText } from "./health";
+import { renderBudgetTab } from "./budget-ui";
 import { NEEDS_KERNEL_AB } from "./ab";
 import {
 	addButton,
@@ -159,7 +160,7 @@ const CLIENT_UPLOAD_BYTES = 256 * 1024;
 const TABS = ["Artifact", "Modules", "Server", "Manage", "Logs", "Dex", "Network", "Claude"] as const;
 type TabName = (typeof TABS)[number];
 /** Tabs with sub-tabs (a segmented bar on top of the content); the first one is the default. */
-const SUBTABS: Partial<Record<TabName, readonly string[]>> = { Modules: ["Overview", "State", "Assets"], Server: ["Status", "Branch"], Manage: ["Players", "Servers", "Bans"], Network: ["Packets", "Stats"] };
+const SUBTABS: Partial<Record<TabName, readonly string[]>> = { Modules: ["Overview", "State", "Assets"], Server: ["Status", "Branch", "Budget"], Manage: ["Players", "Servers", "Bans"], Network: ["Packets", "Stats"] };
 
 /**
  * Pages that open in one pane at most (panes.ts focuses the open one instead of opening a second):
@@ -897,6 +898,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			if (status.fleet !== undefined && status.fleet.missing !== true) {
 				body.field("Fleet API", fleetText(status.fleet, os.time()), fleetFailing(status.fleet) ? COLORS.warn : COLORS.text);
 			}
+			// Kernel 0.4.0: the error reports to the backend (templates only).
+			if (status.errors !== undefined) body.field("Error reports", errorsText(status.errors, os.time()), errorsFailing(status.errors) ? COLORS.warn : COLORS.text);
 			const analytics = (reply as StatusReply).facts?.analytics;
 			if (analytics !== undefined) body.field("Analytics", analyticsText(analytics, os.time()), analytics.failures > 0 || analytics.settingsErrors.size() > 0 ? COLORS.warn : COLORS.text);
 			// Kernel 0.3.8: TypeTorch.runDetached jobs ("2 running (oldest 4 s), 1 failed").
@@ -1547,6 +1550,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		"Modules/Assets": (tab) => renderAssetsTab(tab, { call, ...modulesRealm(tab), feed: assetsFeed }),
 		"Server/Status": renderServer,
 		"Server/Branch": renderBranch,
+		"Server/Budget": (tab) => renderBudgetTab(tab, { call }),
 		...adminTabs({ kernel, call }),
 		Logs: renderLogs,
 		Dex: renderDex,

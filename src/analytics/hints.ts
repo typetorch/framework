@@ -70,7 +70,7 @@ export function describeFailure(status: number, message?: string): FailureHelp {
 		return { reason: `${name}: the TLS certificate was refused`, fix: "use an address with a valid certificate (the Cloudflare tunnel, or Caddy on a VPS)." };
 	}
 	if (name === "InvalidUrl") {
-		return { reason: "InvalidUrl: the address isn't a valid URL", fix: "set it again with typetorch settings set analytics - (typetorch doctor tests it)." };
+		return { reason: "InvalidUrl: the address isn't a valid URL", fix: "set it again with typetorch backend setup (typetorch doctor tests it)." };
 	}
 	if (name === "TooManyRedirects" || name === "InvalidRedirect") {
 		return { reason: `${name}: the address redirects`, fix: "use the final address directly in the settings." };
@@ -85,7 +85,7 @@ function describeStatus(status: number): FailureHelp {
 	if (status === 401 || status === 403) {
 		return {
 			reason: `HTTP ${status}: the server refused the token`,
-			fix: "put the server's API key (TYPETORCH_API_KEY; TT_ANALYTICS_INGEST_TOKENS before the rename) in the settings (typetorch fleet setup, typetorch settings set analytics -); typetorch doctor tests it.",
+			fix: "put the server's API key (TYPETORCH_API_KEY; TT_ANALYTICS_INGEST_TOKENS before the rename) in the settings (typetorch backend setup); typetorch doctor tests it.",
 		};
 	}
 	if (status === 404) return { reason: "HTTP 404: no such address on the server", fix: `the URL is wrong (analytics ends in /v1/ingest) or the tunnel points at nothing. Run typetorch doctor; ${RUN_LOCAL}.` };

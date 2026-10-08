@@ -10,7 +10,7 @@ import {
 } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
-import type { KernelSettings, ServerKernel } from "../kernel";
+import type { BudgetKind, KernelSettings, ServerKernel } from "../kernel";
 import { maybeServerDispatcher } from "../net/runtime";
 import { observePlayers } from "../players";
 import { currentSettings, onSettings, settingsSupported } from "../settings";
@@ -46,7 +46,7 @@ import {
 	type RecordingRow,
 	type ResolvedSettings,
 } from "./schema";
-import { identityTarget, parseSettings, recordsSupported, DEFAULT_TECH_EVERY, type ParsedSettings } from "./settings";
+import { identityTarget, parseSettings, recordsSupported, sinkSettings, DEFAULT_TECH_EVERY, type ParsedSettings } from "./settings";
 import { registerAnalyticsStatus } from "./status";
 import { buildRequests, estimateEventBytes, estimateRecordingBytes, type SinkRequest } from "./sinks";
 
@@ -554,7 +554,7 @@ export class ServerAnalytics {
 	private applySettings(parsed: ParsedSettings) {
 		const errorsText = parsed.errors.join("; ");
 		if (errorsText !== this.settingsErrors.join("; ") && errorsText !== "") {
-			$warn(`[analytics] settings.analytics: ${errorsText}`);
+			$warn(`[analytics] the sink settings (settings.backend or settings.analytics): ${errorsText}`);
 		}
 		this.settingsErrors = parsed.errors;
 		const hadSettings = this.settings !== undefined;
@@ -582,7 +582,7 @@ export class ServerAnalytics {
 		if (!settingsSupported()) {
 			if (this.kernel !== undefined && this.kernel.test !== true) {
 				$warn(
-					`[analytics] no sink settings: they come from the signed settings record (kernel 0.3.8+, "typetorch settings set analytics -"); this server runs kernel ${this.kernel.kernelVersion}. Or pass new AnalyticsEngine({ settings })`,
+					`[analytics] no sink settings: they come from the signed settings record (kernel 0.3.8+, "typetorch backend setup"); this server runs kernel ${this.kernel.kernelVersion}. Or pass new AnalyticsEngine({ settings })`,
 				);
 			}
 			this.settingsTried = true;
@@ -590,8 +590,10 @@ export class ServerAnalytics {
 		}
 		let lastRaw: string | undefined;
 		const apply = (settings: KernelSettings | undefined) => {
-			this.fleetSettings = settings?.fleet;
-			const value = settings?.analytics;
+			// Kernel 0.4.0 / plans/21: `backend` = { url, key, analytics? } is one URL and one key for everything; the old
+			// `fleet` / `analytics` while it is missing (and `analytics` for a Basin sink, which `backend` can't describe).
+			this.fleetSettings = settings?.backend ?? settings?.fleet;
+			const value = sinkSettings(settings?.backend, settings?.analytics, decode);
 			// Compare without decoding twice; the text never reaches a log.
 			const [encodedOk, raw] = pcall(() => (value === undefined ? "" : HttpService.JSONEncode(value)));
 			const text = encodedOk ? raw : tostring(os.clock());
@@ -626,6 +628,7 @@ export class ServerAnalytics {
 		if (!store) return [false];
 		for (let attempt = 1; attempt <= 3; attempt++) {
 			this.waitForBudget(Enum.DataStoreRequestType.GetAsync);
+			this.countBudget("datastore", "read");
 			const [ok, value] = pcall(() => store.GetAsync(`p/${userId}`)[0]);
 			if (ok) {
 				if (!typeIs(value, "table")) return [true, undefined];
@@ -645,6 +648,9 @@ export class ServerAnalytics {
 		const now = os.time();
 		for (let attempt = 1; attempt <= 3; attempt++) {
 			this.waitForBudget(Enum.DataStoreRequestType.UpdateAsync);
+			// UpdateAsync uses both the read and the write budget.
+			this.countBudget("datastore", "read");
+			this.countBudget("datastore", "write");
 			let stored = pid;
 			const [ok] = pcall(() =>
 				store.UpdateAsync(`p/${userId}`, (old: unknown) => {
@@ -703,6 +709,7 @@ export class ServerAnalytics {
 		session.first = first;
 		session.ret = ret;
 		session.ready = true;
+		this.tellKernelPid(player, pid);
 		if (this.options.identity !== false) this.queueIdentity(player.UserId, pid);
 		for (const row of session.pending) {
 			row.pid = session.pid;
@@ -711,6 +718,23 @@ export class ServerAnalytics {
 		}
 		session.pending = [];
 		if (this.helloWaiting.has(player)) this.sendHello(player, session);
+	}
+
+	/**
+	 * Kernel 0.4.0 (plans/21 C): the kernel's error reports count affected players by pid (never a name or UserId), so
+	 * the kernel hears each player's pid. Older kernels: nothing.
+	 */
+	private tellKernelPid(player: Player, pid: string) {
+		const kernel = this.kernel;
+		if (kernel === undefined || pid === "" || !typeIs((kernel as unknown as Record<string, unknown>).setAnalyticsId, "function")) return;
+		pcall(() => kernel.setAnalyticsId!(player, pid));
+	}
+
+	/** Kernel 0.4.0: counts this engine's own requests for the budget view (older kernels: nothing). */
+	private countBudget(kind: BudgetKind, op: string, n = 1) {
+		const kernel = this.kernel;
+		if (kernel === undefined || !typeIs((kernel as unknown as Record<string, unknown>).budgetCount, "function")) return;
+		pcall(() => kernel.budgetCount!("analytics", kind, op, n));
 	}
 
 	private joinSource(player: Player): Record<string, unknown> {
@@ -791,6 +815,8 @@ export class ServerAnalytics {
 		this.refreshState(session);
 		const current = session;
 		if (!current.ready) task.spawn(() => this.resolve(player, current));
+		// A session handed over by an older generation: the kernel may not know its pid yet (kernel 0.4.0 error reports).
+		else this.tellKernelPid(player, current.pid);
 		if (!current.joined && this.options.sessions !== false) task.spawn(() => this.emitJoin(player, current));
 	}
 
@@ -1258,6 +1284,7 @@ export class ServerAnalytics {
 
 	/** POST one request. Returns the HTTP status (0: no response). Never logs the token or the body. */
 	private post(request: SinkRequest): number {
+		this.countBudget("http", request.table === "identities" ? "identity" : "ingest");
 		const [ok, response] = pcall(() =>
 			HttpService.RequestAsync({
 				Url: request.url,
