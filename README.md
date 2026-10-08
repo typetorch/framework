@@ -446,6 +446,13 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
 - **Friends in the server** (the join's `friends`): one `Players:GetFriendsAsync` per join (at most 10 pages, none
   when the player is alone) intersected with the players there, not a web call per player.
 
+**Settings, framework 0.4.0 / kernel 0.4.0 (plans/21):** the record's `backend` = `{ url, key, analytics?: { flushSeconds,
+recordShare } }` (`typetorch backend setup`) is the whole sink: DuckDB at `<url>/v1/ingest` with the one key (Basin
+identities to `<url>/v1/identity`). The old `analytics` value below is read while `backend` is missing, and stays the
+way to a Basin sink. The engine also tells the kernel each player's pid (`setAnalyticsId`: the kernel's error reports
+count affected players by pid, never by name) and counts its own DataStore and HTTP requests for the budget view (dev
+menu **Server > Budget**: bars per Roblox limit for the player count, who spends it, the DataStore budget left, memory).
+
 **Settings** (server only, never sent to clients): the signed settings record's `analytics` field (kernel 0.3.8,
 plans/20), written with `typetorch settings set analytics -` (JSON on stdin; `@typetorch/analytics`' `writeSettings()`
 and `bun run local` call it). Every new copy applies live within seconds (the CLI pings servers). Before kernel 0.3.8
