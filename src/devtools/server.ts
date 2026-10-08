@@ -2,6 +2,7 @@ import { DataStoreService, HttpService, InsertService, MarketplaceService, Playe
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
 import type { ServerKernel } from "../kernel";
+import { countBudget } from "../budget";
 import { normalRole } from "../kernel";
 import type { ServerDispatcher } from "../net/runtime";
 import { runningModules } from "../runtime/registry";
@@ -117,6 +118,7 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 	 */
 	const reservedCreator = (): number | undefined => {
 		if (guard.reservedCreator !== undefined) return guard.reservedCreator;
+		countBudget(kernel, "devtools", "datastore", "read");
 		const [ok, record] = pcall(() => DataStoreService.GetDataStore(REGISTRY_STORE).GetAsync(`private/${game.PrivateServerId}`)[0]);
 		if (!ok || !typeIs(record, "table")) return undefined;
 		const setBy = (record as { setBy?: unknown }).setBy;

@@ -435,7 +435,7 @@ check("DnsResolve: a stale quick tunnel", has(dns.reason, "DnsResolve") and has(
 check("ConnectFail", has(H.describeFailure(0, "HttpError: ConnectFail").reason, "ConnectFail") and has(H.describeFailure(0, "HttpError: ConnectFail").fix, "down"))
 check("TimedOut", has(H.describeFailure(0, "HttpError: TimedOut").reason, "TimedOut"))
 check("Ssl", has(H.describeFailure(0, "HttpError: SslVerificationFail").fix, "certificate"))
-check("InvalidUrl", has(H.describeFailure(0, "HttpError: InvalidUrl").fix, "settings set analytics"))
+check("InvalidUrl", has(H.describeFailure(0, "HttpError: InvalidUrl").fix, "typetorch backend setup"))
 check("redirects", has(H.describeFailure(0, "HttpError: TooManyRedirects").reason, "redirects"))
 check("an unknown HttpError is named", has(H.describeFailure(0, "HttpError: Strange").reason, "Strange"))
 check("HttpService off", has(H.describeFailure(0, "Http requests are not enabled. Enable via game settings.").fix, "Allow HTTP Requests"))
@@ -451,6 +451,19 @@ check("an unusual status", H.describeFailure(418).reason == "HTTP 418")
 check("fleet error text: HTTP 530", H.describeFleetError("HTTP 530").reason == H.describeFailure(530).reason)
 check("fleet error text: HttpError", has(H.describeFleetError("HttpError: NetFail").reason, "NetFail"))
 check("fleet error text: none", H.describeFleetError(nil) == nil)
+
+-- Kernel 0.4.0 / plans/21: settings.backend = { url, key, analytics? } is the DuckDB sink at <url>/v1/ingest; the old
+-- analytics value while backend is missing, and for Basin.
+local fromBackend = S.parseSettings(S.sinkSettings({ url = "https://b.example.com/", key = "backend-key-0123456789", analytics = { flushSeconds = 20, recordShare = 0.5 } }, nil, decode), decode)
+check("backend: duckdb at <url>/v1/ingest with the key, flushSeconds and recordShare", fromBackend.settings ~= nil and fromBackend.settings.backend == "duckdb" and fromBackend.settings.events == "https://b.example.com/v1/ingest" and fromBackend.settings.token == "backend-key-0123456789" and fromBackend.settings.flushSeconds == 20 and fromBackend.settings.recordShare == 0.5)
+local oldOnly = S.sinkSettings(nil, { backend = "duckdb", events = "https://old.example.com/v1/ingest" }, decode)
+check("no backend: the old analytics value", oldOnly.events == "https://old.example.com/v1/ingest")
+local both = S.sinkSettings({ url = "https://b.example.com", key = "k-0123456789" }, { backend = "duckdb", events = "https://old.example.com/v1/ingest" }, decode)
+check("backend wins over the old duckdb analytics value", both.events == "https://b.example.com/v1/ingest")
+local basin = S.sinkSettings({ url = "https://b.example.com", key = "k-0123456789" }, '{"backend":"basin","events":"https://s.ingest.cloudflare.com"}', decode)
+check("a Basin sink stays on analytics (backend can't describe streams)", basin == '{"backend":"basin","events":"https://s.ingest.cloudflare.com"}')
+local target = S.identityTarget({ backend = "basin", events = "https://s.ingest.cloudflare.com" }, { url = "https://b.example.com/", key = "k-0123456789" }, decode)
+check("Basin identities go to the backend with its key", target ~= nil and target.url == "https://b.example.com/v1/identity" and target.token == "k-0123456789")
 
 print(`analytics: {passed} passed, {failed} failed`)
 if failed > 0 then

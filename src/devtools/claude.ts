@@ -2,6 +2,7 @@ import { DataStoreService, HttpService, MemoryStoreService, MessagingService, Pl
 import { Trove } from "@rbxts/trove";
 import { $print, $warn } from "rbxts-transform-debug";
 import type { LogEntry, ServerKernel } from "../kernel";
+import { countBudget } from "../budget";
 import { branchChannelOf, rulesOf } from "../kernel";
 import type { ServerDispatcher } from "../net/runtime";
 import {
@@ -473,6 +474,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		const ttl = (announcement.exp as number) - os.time();
 		if (ttl < 5) return;
 		task.spawn(() => {
+			countBudget(kernel, "devtools", "memorystore", "units");
 			const [ok, err] = pcall(() => discovery().SetAsync(`session/${kernel.branch}`, announcement, math.min(ttl, 300)));
 			if (!ok) $warn(`[remote-claude] could not share the session: ${err}`);
 		});
@@ -552,6 +554,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		});
 		// Not in the trove: a cancelled SubscribeAsync would leave a subscription nobody can disconnect.
 		task.spawn(() => {
+			countBudget(kernel, "devtools", "messaging", "subscribe");
 			const [ok, result] = pcall(() =>
 				MessagingService.SubscribeAsync(TOPIC, (message) => {
 					if (!stopped) onMessage(message.Data);
@@ -567,6 +570,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		// A new server: take the last shared announcement instead of waiting up to a minute for the next one.
 		if (activeSession() === undefined) {
 			task.spawn(() => {
+				countBudget(kernel, "devtools", "memorystore", "units");
 				const [ok, value] = pcall(() => discovery().GetAsync(`session/${kernel.branch}`));
 				if (ok && value !== undefined && !stopped && activeSession() === undefined) onMessage(value, false);
 			});
@@ -585,6 +589,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	): [sent: boolean, status: number, data: unknown] => {
 		const request: RequestAsyncRequest = { Url: `${session.url}${path}`, Method: method, Headers: headers };
 		if (body !== undefined) request.Body = HttpService.JSONEncode(body);
+		countBudget(kernel, "devtools", "http", "claude");
 		const [ok, response] = pcall(() => HttpService.RequestAsync(request));
 		// Never log or return the error text: it can contain the URL.
 		if (!ok) return [false, 0, undefined];
@@ -1371,6 +1376,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 			ms: run.ms,
 		};
 		task.spawn(() => {
+			countBudget(kernel, "devtools", "datastore", "write");
 			const [ok, err] = pcall(() => DataStoreService.GetDataStore(AUDIT_STORE).SetAsync(key, record));
 			if (!ok) $warn(`[claude] run_luau audit record not saved (${key}): ${err}`);
 		});
@@ -1642,6 +1648,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		});
 		// Wake messages (fast path).
 		task.spawn(() => {
+			countBudget(kernel, "devtools", "messaging", "subscribe");
 			const [ok, result] = pcall(() =>
 				MessagingService.SubscribeAsync(TOOL_TOPIC, (message) => {
 					if (stopped) return;

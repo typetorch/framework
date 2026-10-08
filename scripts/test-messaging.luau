@@ -121,7 +121,7 @@ local Instance = {
 
 local env
 local modules = {}
-local PATHS = { relay = "out/runtime/relay.luau", ["roll-call"] = "out/devtools/roll-call.luau", messaging = "out/messaging.luau", servers = "out/servers.luau" }
+local PATHS = { relay = "out/runtime/relay.luau", ["roll-call"] = "out/devtools/roll-call.luau", messaging = "out/messaging.luau", servers = "out/servers.luau", budget = "out/budget.luau" }
 local function loadModule(name)
 	if modules[name] then
 		return modules[name]

@@ -2,6 +2,7 @@ import { DataStoreService, HttpService, MessagingService, Players, TeleportServi
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
 import { branchChannelOf, normalRole, type Channel, type NewServerReport, type Role, type ServerKernel, type ServerType } from "../kernel";
+import { countBudget } from "../budget";
 import { RateLimiter } from "../net/limits";
 import { AB_KERNEL, AbReply, kernelHasExperiments, NEEDS_KERNEL_AB, PIN_JOBS_PER_MESSAGE, PIN_TOPIC, PinMessage } from "./ab";
 import { versionLess } from "./health";
@@ -388,6 +389,7 @@ export function registerAdminOps(
 		};
 		if (extra) for (const [name, value] of pairs(extra)) entry[name] = value;
 		task.spawn(() => {
+			countBudget(kernel, "devtools", "datastore", "write");
 			const [ok, err] = pcall(() => DataStoreService.GetDataStore(MOD_STORE).SetAsync(key, entry));
 			if (!ok) $warn(`[manage] durable record ${key} failed: ${err}`);
 		});
@@ -564,6 +566,7 @@ export function registerAdminOps(
 	if (kernel.serverType === "reserved" && game.PrivateServerId !== "" && saved.ownCode === undefined) {
 		trove.add(
 			task.spawn(() => {
+				countBudget(kernel, "devtools", "datastore", "read");
 				const [ok, value] = pcall(() => DataStoreService.GetDataStore(MOD_STORE).GetAsync(`private/${game.PrivateServerId}`)[0]);
 				if (!ok) return; // tried again by the next generation
 				const code = typeIs(value, "table") ? (value as { code?: unknown }).code : undefined;
@@ -746,6 +749,7 @@ export function registerAdminOps(
 		let failed = 0;
 		const publish = (message: PinMessage) => {
 			messages += 1;
+			countBudget(kernel, "devtools", "messaging", "publish");
 			const [ok, err] = pcall(() => MessagingService.PublishAsync(PIN_TOPIC, HttpService.JSONEncode(message)));
 			if (!ok) {
 				failed += 1;
@@ -965,6 +969,7 @@ export function registerAdminOps(
 		let written = false;
 		let writeError: unknown;
 		for (let attempt = 1; attempt <= 3 && !written; attempt++) {
+			countBudget(kernel, "devtools", "datastore", "write");
 			const [ok, err] = pcall(() => DataStoreService.GetDataStore(MOD_STORE).SetAsync(`private/${privateServerId}`, override));
 			if (ok) written = true;
 			else {

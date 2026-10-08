@@ -54,7 +54,7 @@ check("fleetFailing: the error is newer than the last success", H.fleetFailing(d
 check("fleetText: failing says what, how many and how long ago", H.fleetText(down, NOW) == "fleet.example.com, 340 sent, 12 failed, 2 queued, FAILING: HttpError: NetFail 40 s ago", H.fleetText(down, NOW))
 local recovered = fleet({ failed = 3, lastError = "HTTP 530", lastErrorAt = NOW - 600, lastOkAt = NOW - 20 })
 check("fleetText: recovered keeps the history, not an alarm", has(H.fleetText(recovered, NOW), "last error HTTP 530 10m ago") and not has(H.fleetText(recovered, NOW), "FAILING"), H.fleetText(recovered, NOW))
-check("fleetText: off cases", has(H.fleetText({ enabled = false, settings = "absent" }, NOW), "typetorch fleet setup") and has(H.fleetText({ enabled = false, settings = "invalid", settingsError = "url must be https" }, NOW), "url must be https") and has(H.fleetText({ enabled = false, missing = true }, NOW), "not mapped"))
+check("fleetText: off cases", has(H.fleetText({ enabled = false, settings = "absent" }, NOW), "typetorch backend setup") and has(H.fleetText({ enabled = false, settings = "invalid", settingsError = "url must be https" }, NOW), "url must be https") and has(H.fleetText({ enabled = false, missing = true }, NOW), "not mapped"))
 check("fleetFix: NetFail", has(H.fleetFix("HttpError: NetFail"), "NetFail") and has(H.fleetFix("HttpError: NetFail"), "bun run local"))
 check("fleetFix: HTTP 530 / 401 / 404", has(H.fleetFix("HTTP 530"), "tunnel") and has(H.fleetFix("HTTP 401"), "TYPETORCH_API_KEY") and has(H.fleetFix("HTTP 404"), "wrong"))
 check("fleetFix: nothing", H.fleetFix(nil) == "-")
@@ -75,7 +75,7 @@ local netFail = analytics({ failures = 5, failed = 7, lastError = "both: HttpErr
 check("analyticsText: failing shows the streak, the message, the age and the next try", H.analyticsText(netFail, NOW) == "duckdb, 12 queued, 3400 sent, FAILING x5: both: HttpError: NetFail 20 s ago, retry in 80 s", H.analyticsText(netFail, NOW))
 check("analyticsText: recovered", has(H.analyticsText(analytics({ failed = 4, lastErrorAt = NOW - 120 }), NOW), "4 failed earlier, last 2m ago") and not has(H.analyticsText(analytics({ failed = 4, lastErrorAt = NOW - 120 }), NOW), "FAILING"))
 check("analyticsText: dropped and refused rows", has(H.analyticsText(analytics({ dropped = 30, rejected = 5 }), NOW), "30 dropped, 5 refused"))
-check("analyticsText: no settings / invalid settings", has(H.analyticsText(analytics({ configured = false }), NOW), "typetorch settings set analytics") and has(H.analyticsText(analytics({ configured = false, settingsErrors = { "events must be an http(s) URL" } }), NOW), "events must be an http(s) URL"))
+check("analyticsText: no settings / invalid settings", has(H.analyticsText(analytics({ configured = false }), NOW), "typetorch backend setup") and has(H.analyticsText(analytics({ configured = false, settingsErrors = { "events must be an http(s) URL" } }), NOW), "events must be an http(s) URL"))
 
 -- Attention list -------------------------------------------------------------------------------------------------------------
 local issues = H.analyticsIssues(netFail)
@@ -91,6 +91,14 @@ check("checkHealth lists the analytics issue (and nothing else)", #all == 1 and 
 check("checkHealth without an engine", #H.checkHealth(status, {}) == 0 and #H.checkHealth(status) == 0)
 local withFleet = H.checkHealth({ kernelApi = 1, kernelVersion = H.LATEST_KERNEL, generation = {}, history = {}, memoryMb = 10, fleet = down }, nil)
 check("checkHealth: the fleet issue carries the fix and the counts", #withFleet == 1 and withFleet[1].title == "Fleet API failing" and has(withFleet[1].detail, "bun run local") and has(withFleet[1].detail, "12 failed"), withFleet[1] and withFleet[1].detail)
+
+-- Kernel 0.3.9 / 0.4.0: failures in a row and the backoff; the error reports line.
+local failing = { enabled = true, settings = "ok", host = "b.example", sent = 3, failed = 5, lastError = "HttpError: NetFail", lastErrorAt = NOW - 40, lastOkAt = NOW - 400, failures = 5, retryIn = 80, source = "fleet" }
+check("fleetText: failures in a row, retry in, the old settings.fleet", has(H.fleetText(failing, NOW), "FAILING x5: HttpError: NetFail 40 s ago, retry in 80 s") and has(H.fleetText(failing, NOW), "old settings.fleet"), H.fleetText(failing, NOW))
+local reports = { enabled = true, kinds = 3, waiting = 2, seen = { server = 10, client = 4 }, sent = 12, rejected = 0, dropped = { kinds = 0, items = 1, rate = 0, old = 0, client = 2 }, failures = 0 }
+check("errorsText: seen, kinds, sent, waiting, dropped", H.errorsText(reports, NOW) == "14 seen, 3 kinds, 12 sent, 2 waiting, 3 dropped", H.errorsText(reports, NOW))
+check("errorsText: not posted without settings; missing module", has(H.errorsText({ enabled = false, kinds = 1, seen = { server = 1, client = 0 } }, NOW), "not posted") and has(H.errorsText({ enabled = false, missing = true }, NOW), "not mapped"))
+check("errorsFailing", H.errorsFailing({ enabled = true, failures = 2 }) and not H.errorsFailing(reports))
 
 print(`net health: {passed} passed, {failed} failed`)
 process.exit(if failed == 0 then 0 else 1)

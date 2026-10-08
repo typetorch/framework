@@ -3,6 +3,7 @@ import type { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
 import { isJobId, ROLL_CALL_TOPIC, RollCall, type RollCallRow } from "./devtools/roll-call";
 import type { Channel, ServerKernel, ServerType } from "./kernel";
+import { countBudget } from "./budget";
 import { isCloudTest, jsonProblem } from "./messaging";
 import { Relay } from "./runtime/relay";
 
@@ -232,9 +233,13 @@ export function bindServers(kernel: ServerKernel, trove: Trove, branch: string) 
 				kernel.onRollCall!((data) => relay.run(() => handler(data)));
 				return { Disconnect() {} };
 			}
+			countBudget(kernel, "framework", "messaging", "subscribe");
 			return MessagingService.SubscribeAsync(topic, (message) => handler(message.Data));
 		},
-		publish: (topic, data) => MessagingService.PublishAsync(topic, data),
+		publish: (topic, data) => {
+			countBudget(kernel, "framework", "messaging", "publish");
+			return MessagingService.PublishAsync(topic, data);
+		},
 		entry: () => serverRow(),
 		encode: (value) => HttpService.JSONEncode(value),
 		decode: (value) => HttpService.JSONDecode(value),
