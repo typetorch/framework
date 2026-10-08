@@ -56,7 +56,7 @@ local Instance = {
 }
 local env
 local modules = {}
-local PATHS = { relay = "out/runtime/relay.luau", settings = "out/settings.luau", health = "out/devtools/health.luau" }
+local PATHS = { relay = "out/runtime/relay.luau", settings = "out/settings.luau", health = "out/devtools/health.luau", hints = "out/analytics/hints.luau" }
 local function loadModule(name)
 	if modules[name] then
 		return modules[name]
@@ -64,7 +64,7 @@ local function loadModule(name)
 	modules[name] = luau.load(fs.readFile(root .. PATHS[name]), { debugName = name, environment = env })()
 	return modules[name]
 end
-local script = {}
+local script = { Parent = { Parent = {} } } -- health.luau reads script.Parent.Parent for its import of analytics/hints
 local TS = {
 	getModule = function()
 		return "services"

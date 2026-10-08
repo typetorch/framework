@@ -213,9 +213,25 @@ export interface AnalyticsStats {
 	dropped: number;
 	/** Rows the backend refused (HTTP 4xx). */
 	rejected: number;
-	/** Failed requests in a row. */
+	/** Failed requests in a row (0 after a success). */
 	failures: number;
+	/** Failed requests since the server started, every attempt (across swaps). */
+	failed: number;
+	/**
+	 * The last failure's message ("both: HttpError: NetFail", "both: HTTP 530 ..."). Kept after a later success:
+	 * compare `lastErrorAt` with `lastOkAt`.
+	 */
 	lastError?: string;
+	/** HTTP status of the last failure (0: no answer at all, an HttpError). */
+	lastStatus?: number;
+	/** os.time() of the last failed request and of the last accepted one. */
+	lastErrorAt?: number;
+	lastOkAt?: number;
+	/** Seconds until the next attempt while backing off after failures. */
+	retryIn?: number;
+	/** While failing: what the last failure means and what to do (hints.ts); the same words the log line and the dev menu use. */
+	reason?: string;
+	fix?: string;
 	/** Settings problems (never contains the token). */
 	settingsErrors: string[];
 }

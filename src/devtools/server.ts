@@ -27,6 +27,7 @@ import type { ServerFacts } from "./health";
 import { ArtifactNotes, notesFromAttribute, parseArtifactNotes } from "./artifact-notes";
 import { loadstringAvailable } from "./claude-tools";
 import { kernelHasExperiments, NEEDS_KERNEL_AB } from "./ab";
+import { analyticsStatus } from "../analytics/status";
 import { assetFacts, assetReport } from "../assets/sync";
 
 function isAssetId(value: unknown): value is number {
@@ -53,7 +54,7 @@ function serverFacts(kernel: ServerKernel): ServerFacts {
 	if (loadstringWorks === undefined) {
 		loadstringWorks = loadstringAvailable();
 	}
-	return { loadstring: loadstringWorks, http: HttpService.HttpEnabled, experiments: kernelHasExperiments(kernel), assets: assetFacts() };
+	return { loadstring: loadstringWorks, http: HttpService.HttpEnabled, experiments: kernelHasExperiments(kernel), assets: assetFacts(), analytics: analyticsStatus() };
 }
 
 const LOG_KINDS = new Set(["output", "info", "warning", "error"]);

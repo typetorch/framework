@@ -69,7 +69,7 @@ local Promise = luau.load(fs.readFile(`{root}node_modules/roblox-ts/include/Prom
 
 local env
 local modules = {}
-local PATHS = { relay = "out/runtime/relay.luau", detached = "out/detached.luau", health = "out/devtools/health.luau" }
+local PATHS = { relay = "out/runtime/relay.luau", detached = "out/detached.luau", health = "out/devtools/health.luau", hints = "out/analytics/hints.luau" }
 local function loadModule(name)
 	if modules[name] then
 		return modules[name]
@@ -77,7 +77,7 @@ local function loadModule(name)
 	modules[name] = luau.load(fs.readFile(root .. PATHS[name]), { debugName = name, environment = env })()
 	return modules[name]
 end
-local script = {}
+local script = { Parent = { Parent = {} } } -- health.luau reads script.Parent.Parent for its import of analytics/hints
 local TS = {
 	Promise = Promise,
 	import = function(_, _from, ...)

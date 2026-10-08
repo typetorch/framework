@@ -28,7 +28,8 @@ import {
 	type HelloInfo,
 	type ServerHello,
 } from "./protocol";
-import { backoffSeconds, classifyStatus, newQueueState, RowQueue, takeToken, type BucketState, type QueueState } from "./queue";
+import { describeFailure } from "./hints";
+import { backoffSeconds, classifyStatus, configWaitSeconds, newQueueState, RowQueue, takeToken, type BucketState, type QueueState } from "./queue";
 import {
 	RECORDING_CODEC,
 	SCHEMA_VERSION,
@@ -46,6 +47,7 @@ import {
 	type ResolvedSettings,
 } from "./schema";
 import { identityTarget, parseSettings, recordsSupported, DEFAULT_TECH_EVERY, type ParsedSettings } from "./settings";
+import { registerAnalyticsStatus } from "./status";
 import { buildRequests, estimateEventBytes, estimateRecordingBytes, type SinkRequest } from "./sinks";
 
 /**
@@ -160,10 +162,17 @@ interface ServerStore {
 	identities?: IdentityRow[];
 	inflightIdentities?: IdentityRow[];
 	budget: BucketState;
+	/** Failed requests in a row. */
 	failures: number;
 	sent: number;
 	rejected: number;
 	lastError?: string;
+	/** Added with the dev menu's analytics status (a store handed over from an older generation lacks them). */
+	failed?: number;
+	lastStatus?: number;
+	/** os.time() of the last failed and the last accepted request. */
+	lastErrorAt?: number;
+	lastOkAt?: number;
 	players: Map<string, PlayerSession>;
 	/** os.time() of the last swap, for "left within 60 s of a swap". */
 	lastSwapAt?: number;
@@ -289,6 +298,10 @@ export class ServerAnalytics {
 	private backoffUntil = 0;
 	private batchRows = BATCH_ROWS;
 	private lastWarnAt = -math.huge;
+	/** Lines held back by the one-a-minute limit since the last one that was printed. */
+	private suppressed = 0;
+	/** A failure line was printed since the last recovery line (so a recovery is only announced after an announced failure). */
+	private outageLogged = false;
 	private flushing = false;
 	private closing = false;
 	private readonly identity: { job: string; srv: string; place: number; art: string; seq: number; branch: string; channel: string };
@@ -339,6 +352,8 @@ export class ServerAnalytics {
 		trove.add(() => {
 			this.stopped = true;
 		});
+		// The dev menu (Status > Analytics, the Attention list) reads the counters through this.
+		trove.add(registerAnalyticsStatus(() => this.stats()));
 		if (this.testMode) print("[analytics] cloud test: rows are collected but nothing is sent (no uploads, no identity rows)");
 		this.startSettings();
 		this.startIntake();
@@ -1216,11 +1231,29 @@ export class ServerAnalytics {
 
 	// Sinks ------------------------------------------------------------------------------------------------------------
 
-	private warn(message: string) {
+	/** At most one log line a minute; the ones held back are counted in the next line. Returns whether it was printed. */
+	private warn(message: string): boolean {
 		const now = os.clock();
-		if (now - this.lastWarnAt < 60) return;
+		if (now - this.lastWarnAt < 60) {
+			this.suppressed += 1;
+			return false;
+		}
 		this.lastWarnAt = now;
-		$warn(`[analytics] ${message}`);
+		const more = this.suppressed > 0 ? ` (+${this.suppressed} more in the last minute)` : "";
+		this.suppressed = 0;
+		$warn(`[analytics] ${message}${more}`);
+		return true;
+	}
+
+	/** A request was accepted: ends a failure streak, and says so once if the streak was announced. */
+	private noteSuccess() {
+		const streak = this.store.failures;
+		this.store.failures = 0;
+		this.store.lastOkAt = os.time();
+		if (streak > 0 && this.outageLogged) {
+			this.outageLogged = false;
+			print(`[analytics] uploads work again after ${streak} failed attempt${streak === 1 ? "" : "s"}`);
+		}
 	}
 
 	/** POST one request. Returns the HTTP status (0: no response). Never logs the token or the body. */
@@ -1304,7 +1337,7 @@ export class ServerAnalytics {
 			if (outcome === "sent") {
 				// Identity rows aren't analytics rows: "sent" counts events and recordings.
 				this.store.sent += request.events + request.recordings;
-				this.store.failures = 0;
+				this.noteSuccess();
 				this.batchRows = BATCH_ROWS;
 				settle(request, false);
 			} else if (outcome === "split" && rows > 1) {
@@ -1318,17 +1351,18 @@ export class ServerAnalytics {
 				settle(request, true);
 				failed = true;
 				this.store.failures += 1;
-				const wait = outcome === "config" ? 300 : backoffSeconds(this.store.failures, math.random());
+				this.store.failed = (this.store.failed ?? 0) + 1;
+				this.store.lastStatus = status;
+				this.store.lastErrorAt = os.time();
+				// Backs off with jitter (so a fleet of servers doesn't retry in step): 5, 10, 20 ... 300 s for a network or
+				// server problem, about 5 minutes for a settings problem (a settings change retries at once).
+				const wait = outcome === "config" ? configWaitSeconds(math.random()) : backoffSeconds(this.store.failures, math.random());
 				this.backoffUntil = os.clock() + wait;
 				// "both" = one batch with events and recordings (the DuckDB sink); say "analytics upload" instead.
 				const what = request.table === "both" ? "analytics upload" : `analytics upload (${request.table})`;
-				const reason = status > 0 ? `HTTP ${status}` : (this.store.lastError ?? "no response");
-				const fix = status === 530 ? ": the tunnel is down, run bun run local on the dev PC" : "";
-				this.warn(
-					outcome === "config"
-						? `${what} got HTTP ${status}: check the URL and token in settings.analytics (typetorch settings set analytics -); retrying in ${math.floor(wait)} s`
-						: `${what} failed (${reason}${fix}); retrying in ${math.floor(wait)} s`,
-				);
+				const help = describeFailure(status, this.store.lastError);
+				const streak = this.store.failures > 1 ? ` ${this.store.failures} times in a row` : "";
+				if (this.warn(`${what} failed${streak}: ${help.reason}. ${help.fix} Retrying in ${math.floor(wait)} s.`)) this.outageLogged = true;
 			}
 		}
 		// Recordings without a request (basin without a recordings URL) were never taken; nothing else is left.
@@ -1447,6 +1481,9 @@ export class ServerAnalytics {
 	// Stats ------------------------------------------------------------------------------------------------------------
 
 	stats(): AnalyticsStats {
+		const failing = this.store.failures > 0;
+		const help = failing ? describeFailure(this.store.lastStatus ?? 0, this.store.lastError) : undefined;
+		const retryIn = failing ? math.max(0, math.ceil(this.backoffUntil - os.clock())) : 0;
 		return {
 			configured: this.settings !== undefined,
 			backend: this.settings?.backend,
@@ -1458,7 +1495,14 @@ export class ServerAnalytics {
 			dropped: this.store.events.dropped + this.store.recordings.dropped + this.store.fleet.dropped,
 			rejected: this.store.rejected,
 			failures: this.store.failures,
+			failed: this.store.failed ?? 0,
 			lastError: this.store.lastError,
+			lastStatus: this.store.lastStatus,
+			lastErrorAt: this.store.lastErrorAt,
+			lastOkAt: this.store.lastOkAt,
+			retryIn: retryIn > 0 ? retryIn : undefined,
+			reason: help?.reason,
+			fix: help?.fix,
 			settingsErrors: [...this.settingsErrors],
 		};
 	}
