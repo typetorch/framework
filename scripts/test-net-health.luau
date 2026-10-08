@@ -56,7 +56,7 @@ local recovered = fleet({ failed = 3, lastError = "HTTP 530", lastErrorAt = NOW 
 check("fleetText: recovered keeps the history, not an alarm", has(H.fleetText(recovered, NOW), "last error HTTP 530 10m ago") and not has(H.fleetText(recovered, NOW), "FAILING"), H.fleetText(recovered, NOW))
 check("fleetText: off cases", has(H.fleetText({ enabled = false, settings = "absent" }, NOW), "typetorch fleet setup") and has(H.fleetText({ enabled = false, settings = "invalid", settingsError = "url must be https" }, NOW), "url must be https") and has(H.fleetText({ enabled = false, missing = true }, NOW), "not mapped"))
 check("fleetFix: NetFail", has(H.fleetFix("HttpError: NetFail"), "NetFail") and has(H.fleetFix("HttpError: NetFail"), "bun run local"))
-check("fleetFix: HTTP 530 / 401 / 404", has(H.fleetFix("HTTP 530"), "tunnel") and has(H.fleetFix("HTTP 401"), "TT_ANALYTICS_INGEST_TOKENS") and has(H.fleetFix("HTTP 404"), "wrong"))
+check("fleetFix: HTTP 530 / 401 / 404", has(H.fleetFix("HTTP 530"), "tunnel") and has(H.fleetFix("HTTP 401"), "TYPETORCH_API_KEY") and has(H.fleetFix("HTTP 404"), "wrong"))
 check("fleetFix: nothing", H.fleetFix(nil) == "-")
 
 -- Analytics engine: the Status line ------------------------------------------------------------------------------------------

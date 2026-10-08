@@ -85,7 +85,7 @@ function describeStatus(status: number): FailureHelp {
 	if (status === 401 || status === 403) {
 		return {
 			reason: `HTTP ${status}: the server refused the token`,
-			fix: "put one of the server's TT_ANALYTICS_INGEST_TOKENS in the settings (typetorch fleet setup, typetorch settings set analytics -); typetorch doctor tests it.",
+			fix: "put the server's API key (TYPETORCH_API_KEY; TT_ANALYTICS_INGEST_TOKENS before the rename) in the settings (typetorch fleet setup, typetorch settings set analytics -); typetorch doctor tests it.",
 		};
 	}
 	if (status === 404) return { reason: "HTTP 404: no such address on the server", fix: `the URL is wrong (analytics ends in /v1/ingest) or the tunnel points at nothing. Run typetorch doctor; ${RUN_LOCAL}.` };

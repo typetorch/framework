@@ -444,7 +444,7 @@ check("no message at all", H.describeFailure(0, nil).reason == "no answer" and h
 check("unknown text is kept, cut", #H.describeFailure(0, string.rep("x", 500)).reason == 120)
 check("HTTP 530: tunnel", has(H.describeFailure(530).reason, "tunnel has nothing behind it") and has(H.describeFailure(530).fix, "bun run local"))
 check("HTTP 502/504: server behind the tunnel", has(H.describeFailure(502).reason, "behind the tunnel") and has(H.describeFailure(504).reason, "HTTP 504"))
-check("HTTP 401/403: token", has(H.describeFailure(401).fix, "TT_ANALYTICS_INGEST_TOKENS") and has(H.describeFailure(403).reason, "refused the token"))
+check("HTTP 401/403: token", has(H.describeFailure(401).fix, "TYPETORCH_API_KEY") and has(H.describeFailure(403).reason, "refused the token"))
 check("HTTP 404: URL", has(H.describeFailure(404).fix, "/v1/ingest"))
 check("HTTP 429/413/500/408", has(H.describeFailure(429).reason, "rate limited") and has(H.describeFailure(413).fix, "splits") and has(H.describeFailure(500).fix, "log") and has(H.describeFailure(408).reason, "timed out"))
 check("an unusual status", H.describeFailure(418).reason == "HTTP 418")
