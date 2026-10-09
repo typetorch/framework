@@ -152,8 +152,8 @@ export class CoinService extends Module implements OnStart {
 - **Dev menu:** devs (Studio, project members, dev badge) get a DEV button, `Ctrl+Shift+D` and `/tt dev`: artifact
   (with how long the server and client generations have run, the server's uptime and the build's age), server status,
   logs (server, own client, other players' clients), client and server dex, network stats, module state, a branch and
-  build picker (Server > Branch) and a Claude prompt. The sidebar, top to bottom: Server, Network, Modules, Manage,
-  Artifact, Logs, Dex, Claude. The window can be dragged by its header and resized from its corner (double-tap the
+  build picker (Server > Branch) and a Claude prompt. The sidebar, top to bottom: Artifact, Server, Network, Modules,
+  Manage, Logs, Dex, Claude. The window can be dragged by its header and resized from its corner (double-tap the
   header to reset).
 - **Dev-only tools (framework 0.4.1, `devtools/access.ts`):** Claude, Logs > Upload, Dex edits on the server, Network
   packet blocking and the hot-swap sound work under dev rules (private, reserved and Studio servers on a dev branch)
