@@ -423,7 +423,7 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   row carries a UserId.
 - **Identities** (option `identity`, default on): once the pid is known, one row `{ pid, uid, t }` (the UserId, nothing
   else) per session goes to the dev's own server only, never into the events: duckdb games in the batch body, Basin
-  games to the fleet API (the settings' `fleet` url + `/v1/identity`, or the `identity` / `identityToken` settings). The
+  games to the backend (the record's `backend` url + `/v1/identity`, or the `identity` / `identityToken` settings). The
   analytics server keeps pid -> UserId in a deletable table (support lookups, Right to Erasure).
 - **Player ids:** DataStore `TypeTorchAnalytics`, key `p/<UserId>` -> `{ pid, first, last }`: one read per join, a
   write on the first join and at leave. Deleting the key (Right to Erasure) leaves that player's rows anonymous.
@@ -461,8 +461,9 @@ count affected players by pid, never by name) and counts its own DataStore and H
 menu **Server > Budget**: bars per Roblox limit for the player count, who spends it, the DataStore budget left, memory).
 
 **Settings** (server only, never sent to clients): the signed settings record's `analytics` field (kernel 0.3.8,
-plans/20), written with `typetorch settings set analytics -` (JSON on stdin; `@typetorch/analytics`' `writeSettings()`
-and `bun run local` call it). Every new copy applies live within seconds (the CLI pings servers). Before kernel 0.3.8
+plans/20), derived from `backend` by `typetorch backend setup` (`writeBackendSettings()` in `@typetorch/backend` runs it, and
+`bun run local` too). Every new copy applies live within seconds (the CLI pings servers). A Basin sink has no CLI writer
+since CLI 0.9: `backend setup` replaces it. Before kernel 0.3.8
 there are no settings unless the game passes `new AnalyticsEngine({ settings })`:
 
 ```json
