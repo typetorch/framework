@@ -66,6 +66,11 @@ export interface ServerFacts {
 	assets?: AssetFacts;
 	/** The analytics engine's counters (analytics/status.ts); absent when no engine runs in this generation. */
 	analytics?: AnalyticsStats;
+	/**
+	 * Framework 0.4.1: the asking player's access to the dev-only tools (access.ts): "ok" or why not ("dev_branch_only",
+	 * "owner_switch_only", "owners_only"). Absent from older frameworks (go by the rules).
+	 */
+	access?: string;
 }
 
 /** "0.2.0" < "0.2.1"; missing parts count as 0, non-numbers as 0. */
@@ -477,8 +482,10 @@ export function checkHealth(status: KernelStatus, facts?: ServerFacts): HealthIs
 	if (typeIs(status.memoryMb, "number") && status.memoryMb > HIGH_MEMORY_MB) {
 		issues.push({ level: "warn", title: "High memory", detail: "%.0f MB".format(status.memoryMb) });
 	}
-	// By the server's rules (kernel 0.3.9 `rules`; before, `channel` held them): run_luau works on dev-rules servers only.
-	if (facts?.loadstring === false && (status.rules ?? status.channel) === "dev") {
+	// run_luau works where Claude does for this player (facts.access, access.ts); older frameworks: dev-rules servers
+	// (kernel 0.3.9 `rules`; before, `channel` held them).
+	const claudeHere = facts?.access !== undefined ? facts.access === "ok" : (status.rules ?? status.channel) === "dev";
+	if (facts?.loadstring === false && claudeHere) {
 		issues.push({ level: "info", title: "run_luau off", detail: "LoadStringEnabled is off in this place." });
 	}
 	for (const issue of assetIssues(facts?.assets)) issues.push(issue);

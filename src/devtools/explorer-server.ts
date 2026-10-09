@@ -1,17 +1,20 @@
 import { Players } from "@rbxts/services";
 import { $print } from "rbxts-transform-debug";
 import type { ServerKernel } from "../kernel";
+import { DevAccess } from "./access";
 import { EXPLORER_OPS, Handler, Registry, explorerHandlers } from "./explorer/core";
 
 /**
  * Server half of the explorer: registers the "explorer.*" dev ops. Each dev gets their own id registry (created on
  * their first request, dropped when they leave). The devtools dispatcher has already checked that the player is a dev;
- * every change is re-checked here against the effective channel ("dev" only) and logged.
+ * every change is re-checked here against the dev-only tools' rule (access.ts: dev rules, or an owner on a public
+ * server an owner switched to a dev branch) and logged.
  * Returns a cleanup function (put it in the devtools trove).
  */
 export function registerExplorerOps(
 	register: (op: string, handler: (player: Player, payload: unknown) => unknown) => void,
 	kernel: ServerKernel,
+	access = new DevAccess(kernel),
 ): () => void {
 	const sessions = new Map<Player, Record<string, Handler>>();
 	const sessionOf = (player: Player) => {
@@ -19,7 +22,7 @@ export function registerExplorerOps(
 		if (!handlers) {
 			handlers = explorerHandlers(
 				new Registry(),
-				() => kernel.channel === "dev",
+				() => access.allows(player),
 				(line) => $print(`[explorer] ${player.Name} (${player.UserId}): ${line}`),
 			);
 			sessions.set(player, handlers);

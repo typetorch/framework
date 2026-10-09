@@ -2,6 +2,7 @@ import { DataStoreService, HttpService, MessagingService, Players, TeleportServi
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
 import { branchChannelOf, devRoleOf, type Channel, type NewServerReport, type Role, type ServerKernel, type ServerType } from "../kernel";
+import { DevAccess } from "./access";
 import { countBudget } from "../budget";
 import { RateLimiter } from "../net/limits";
 import { AB_KERNEL, AbReply, kernelHasExperiments, NEEDS_KERNEL_AB, PIN_JOBS_PER_MESSAGE, PIN_TOPIC, PinMessage } from "./ab";
@@ -291,6 +292,7 @@ export function registerAdminOps(
 	register: (op: string, handler: (player: Player, payload: unknown) => unknown) => void,
 	kernel: ServerKernel,
 	trove: Trove,
+	access = new DevAccess(kernel),
 ) {
 	const saved = kernel.persist<AdminPersist>(PERSIST_KEY, () => ({ modSeq: 0 }));
 	const limiter = new RateLimiter();
@@ -332,7 +334,8 @@ export function registerAdminOps(
 		return {
 			tp: !isSelf,
 			bring: !isSelf && actor.owner && actor.rank >= targetRank,
-			respawn: isSelf ? kernel.channel === "dev" || actor.owner : actor.owner && actor.rank >= targetRank,
+			// Your own respawn: owners anywhere, devs where the dev-only tools are open to them (access.ts).
+			respawn: isSelf ? actor.owner || access.allows(actor.player) : actor.owner && actor.rank >= targetRank,
 			kick: !isSelf && actor.owner && actor.rank > targetRank,
 			ban: !isSelf && actor.owner && actor.rank > targetRank,
 		};

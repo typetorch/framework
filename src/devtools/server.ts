@@ -6,6 +6,7 @@ import { countBudget } from "../budget";
 import { normalRole } from "../kernel";
 import type { ServerDispatcher } from "../net/runtime";
 import { runningModules } from "../runtime/registry";
+import { DevAccess } from "./access";
 import { registerRemoteClaude } from "./claude";
 import { registerExplorerOps } from "./explorer-server";
 import { registerNetworkOps } from "./network-server";
@@ -100,11 +101,15 @@ interface SwapGuard {
 
 /**
  * Server half of the dev menu (plans/10). Every request is checked here: the player must be a dev (Studio, registry
- * member or dev badge, not revoked), and anything that changes the server needs the "dev" effective channel.
- * Prod-channel servers are read-only.
+ * member or dev badge, not revoked), and the dev-only tools (Claude, Dex edits, Logs > Upload, ...) need access.ts:
+ * dev rules, or an owner on a public server an owner switched to a dev branch. Other prod-rules servers are read-only.
  */
 export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDispatcher, trove: Trove) {
 	const ops = new Map<string, DevOp>();
+	/** Who may use the dev-only tools here (access.ts): one rule for every gate below and in the ops it registers. */
+	const access = new DevAccess(kernel);
+	// The menu asks when the rules aren't dev (Claude tab, Dex, Network, the hot-swap sound; client.ts).
+	ops.set("access", (player) => access.reply(player));
 	const guard = kernel.persist<SwapGuard>("typetorch/devtools-swaps", () => ({}));
 
 	/** An owner (kernel 0.3.4 roles; an older kernel's "admin" is a dev). */
@@ -157,7 +162,10 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 				initMs: running.initSeconds !== undefined ? math.floor(running.initSeconds * 1000) : undefined,
 			}),
 		);
-		return { server: kernel.status(), artifact: kernel.artifact, modules, you: kernel.devInfo(player), facts: serverFacts(kernel) };
+		const facts = serverFacts(kernel);
+		// Framework 0.4.1: this player's access to the dev-only tools (access.ts): "ok" or why not.
+		facts.access = access.refusal(player) ?? "ok";
+		return { server: kernel.status(), artifact: kernel.artifact, modules, you: kernel.devInfo(player), facts };
 	});
 	ops.set("logs", (_, payload) => kernel.logs(typeIs(payload, "number") ? payload : undefined, 200));
 	// Server > Budget (kernel 0.4.0): requests per minute and per caller next to Roblox's limits, memory.
@@ -273,8 +281,9 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 	// The legacy dex.children/props/set/destroy ops are gone: the explorer (explorer.* ops) replaced them.
 	ops.set("state", () => describeState());
 	// Modules > State (state-inspect.ts): the live state of this generation's services and the persist store, read-only
-	// (no function is ever called). Server state can hold player data, so devs on dev-channel servers and owners only on
-	// prod-effective ones. One query or {queries} (at most 12); every query costs one token of a per-dev bucket.
+	// (no function is ever called). Server state can hold player data, so devs where the dev-only tools are open to them
+	// (access.ts) and owners everywhere. One query or {queries} (at most 12); every query costs one token of a per-dev
+	// bucket.
 	const inspectBudget = new Map<Player, { tokens: number; at: number }>();
 	trove.connect(Players.PlayerRemoving, (player) => inspectBudget.delete(player));
 	const takeInspect = (player: Player, cost: number): boolean => {
@@ -288,7 +297,7 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 		return true;
 	};
 	ops.set("state.inspect", (player, payload) => {
-		if (kernel.channel !== "dev" && !isOwner(player)) error("owners_only", 0);
+		if (!access.allows(player) && !isOwner(player)) error("owners_only", 0);
 		const queries = parseStateRequest(payload);
 		if (typeIs(queries, "string")) error(queries, 0);
 		for (const query of queries) if (query.side !== "server") error("bad_side", 0);
@@ -350,20 +359,29 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 		for (const [id] of pendingLogs) finishLogs(id, false, "no_reply");
 	});
 	// Claude prompt (plans/11): claude.session / claude.prompt / claude.status / claude.cancel.
-	registerRemoteClaude(kernel, trove, ops, { dispatcher, clientLogs: askClientLogs });
+	registerRemoteClaude(kernel, trove, ops, { dispatcher, clientLogs: askClientLogs }, access);
 	// Explorer ops (explorer.children/props/set/attr/rename/destroy/find/ancestry/instance).
 	trove.add(
-		registerExplorerOps((op, handler) => {
-			ops.set(op, handler);
-		}, kernel),
+		registerExplorerOps(
+			(op, handler) => {
+				ops.set(op, handler);
+			},
+			kernel,
+			access,
+		),
 	);
 	// Network inspector ops (net.packets/packet/stop): packet capture while a dev watches.
 	registerNetworkOps(kernel, dispatcher, trove, ops);
 	// Manage ops, owners only (admin.players/tp/bring/respawn/kick/ban/unban/history/servers/join/newServer/shutdown/ab/
 	// migrate).
-	registerAdminOps((op, handler) => {
-		ops.set(op, handler);
-	}, kernel, trove);
+	registerAdminOps(
+		(op, handler) => {
+			ops.set(op, handler);
+		},
+		kernel,
+		trove,
+		access,
+	);
 
 	const reply = (player: Player, id: unknown, ok: boolean, result: unknown) => kernel.send(player, DEV_RESPONSE, id, ok, result);
 

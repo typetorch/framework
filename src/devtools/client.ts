@@ -94,7 +94,8 @@ import {
 /**
  * Client half of the dev menu (plans/10), built in code. Only devs see it: the toggle button, Ctrl+Shift+D and
  * `/tt dev` all check the server's last word on dev status, and the server re-checks every request anyway.
- * Prod-channel servers are read-only (the server enforces it; the UI only hides edit controls).
+ * The dev-only tools follow access.ts (dev rules, or an owner on a public server an owner switched to a dev branch);
+ * elsewhere the menu is read-only (the server enforces it; the UI only hides edit controls).
  *
  * Every client (dev or not) also answers the server's DEVLOGS_REQUEST with its recent logs, so a dev can read another
  * player's client logs (Logs > Others). Only the server can ask, and it only asks for devs.
@@ -140,16 +141,20 @@ const OTHER_LOG_ERRORS: Record<string, string> = {
 	rate_limited: "Slow down",
 };
 
-/** Logs > Upload ("logs.upload", claude.ts): one short line per error code. */
-const UPLOAD_ERRORS: Record<string, string> = {
-	needs_pairing: "Pair in the Claude tab first",
-	not_connected: "Pair in the Claude tab first",
-	not_allowed: "Pair in the Claude tab first",
-	// claude-access.ts ClaudeRefusal (prod_channel: a server generation before 0.4.1).
+/** Why the dev-only tools are closed to this player here (access.ts DevRefusal; prod_channel: a server before 0.4.1). */
+const ACCESS_TEXT: Record<string, string> = {
 	dev_branch_only: "Dev branch only",
 	owner_switch_only: "Owner-switched servers only",
 	owners_only: "Owners only on public servers",
 	prod_channel: "Dev branch only",
+};
+
+/** Logs > Upload ("logs.upload", claude.ts): one short line per error code. */
+const UPLOAD_ERRORS: Record<string, string> = {
+	...ACCESS_TEXT,
+	needs_pairing: "Pair in the Claude tab first",
+	not_connected: "Pair in the Claude tab first",
+	not_allowed: "Pair in the Claude tab first",
 	rate_limited: "Slow down",
 	player_gone: "That player left",
 	no_reply: "No reply from that player",
@@ -494,6 +499,27 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	dispatcher.setRaw(DEV_RESPONSE, (id, ok, result) => {
 		if (typeIs(id, "number")) resume(id, ok === true, result);
 	});
+
+	// Dev-only tools (access.ts): under dev rules every dev; otherwise the server decides for this player (op "access",
+	// and `facts.access` of every "status" reply): an owner on a public server an owner switched to a dev branch. Dex
+	// edits, Network blocking and the hot-swap sound follow it. Cosmetic: the server re-checks every op.
+	const devRules = rulesOf(kernel) === "dev";
+	let access: string | undefined = devRules ? "ok" : undefined;
+	const noteAccess = (value: unknown) => {
+		if (!devRules && typeIs(value, "string")) access = value;
+	};
+	/** Asks the server and keeps the answer (yields: call from a spawned thread). */
+	const refreshAccess = () => {
+		if (devRules) return;
+		const [ok, reply] = call("access");
+		if (!ok || !typeIs(reply, "table")) return;
+		const answer = reply as { ok?: boolean; error?: unknown };
+		noteAccess(answer.ok === true ? "ok" : answer.error);
+	};
+	/** The dev-only tools are open to this player here (as far as the client knows). */
+	const mayChange = () => access === "ok";
+	/** Why not, in a few words (panes that are read-only here show it). */
+	const accessNote = () => (access !== undefined ? ACCESS_TEXT[access] : undefined) ?? "Read-only here";
 	// Every client answers the server's log requests (Logs > Others on a dev's menu). Never shown, never logged.
 	dispatcher.setRaw(DEVLOGS_REQUEST, (id, since) => {
 		if (!typeIs(id, "number")) return;
@@ -643,11 +669,19 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		return ReplicatedStorage.FindFirstChild("TypeTorch")?.GetAttribute("Channel");
 	};
 
-	/** After a hot swap (client generation > 1) on a dev-channel server, for devs. No setting. */
+	/**
+	 * After a hot swap (client generation > 1), for devs where the dev-only tools are open to them: dev-rules servers,
+	 * or (the server says, access.ts) an owner on a public server an owner switched to a dev branch. No setting. Yields
+	 * for the server's answer off dev rules.
+	 */
 	const playReloadSound = () => {
-		if (kernel.generation <= 1 || effectiveChannel() !== "dev") return;
+		if (kernel.generation <= 1) return;
 		const [ok, info] = pcall(() => kernel.devStatus());
 		if (!ok || !typeIs(info, "table") || info.dev !== true) return;
+		if (effectiveChannel() !== "dev") {
+			refreshAccess();
+			if (!mayChange()) return;
+		}
 		const sound = trove.add(make("Sound", { Name: "TypeTorchReload", SoundId: RELOAD_SOUND, Volume: 0.5 }));
 		sound.Parent = SoundService;
 		SoundService.PlayLocalSound(sound);
@@ -864,6 +898,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				return;
 			}
 			const status = (reply as StatusReply).server;
+			noteAccess((reply as StatusReply).facts?.access);
 			const issues = checkHealth(status, (reply as StatusReply).facts);
 			setHealth(issues);
 			if (issues.size() > 0) {
@@ -1175,7 +1210,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 						if (ok) resolve(result);
 						else reject(result);
 					}),
-				canEdit: (realm) => realm === "client" || kernel.channel === "dev",
+				// This client's own DataModel always; the server's where the dev-only tools are open to this player.
+				canEdit: (realm) => realm === "client" || mayChange(),
 				trove: tabTrove,
 				persist: paneTable<ExplorerPersist>(tab, "explorer", "typetorch/explorer"),
 				onSelect: (realm, path) => {
@@ -1559,7 +1595,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		Logs: renderLogs,
 		Dex: renderDex,
 		"Network/Packets": (tab) =>
-			renderNetworkInspector(tab, { kernel, dispatcher, call, persist: paneTable(tab, "packets", "typetorch/netinspect") }),
+			renderNetworkInspector(tab, { kernel, dispatcher, call, persist: paneTable(tab, "packets", "typetorch/netinspect"), mayChange, accessNote }),
 		"Network/Stats": renderNetwork,
 		Claude: renderClaude,
 	};
@@ -2026,6 +2062,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		if (value === dev) return;
 		dev = value;
 		if (dev) {
+			// Off dev rules, learn whether the dev-only tools are open to this player before a pane asks (Dex, Network).
+			if (!devRules) trove.add(task.spawn(refreshAccess));
 			if (!ui) ui = build();
 			ui.toggle.Visible = true;
 			paintBadges();
@@ -2070,7 +2108,9 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	every(trove, HEALTH_INTERVAL, () => {
 		if (!dev || statusFeed.active()) return;
 		const [ok, reply] = call("status");
-		if (ok && typeIs(reply, "table")) setHealth(checkHealth((reply as StatusReply).server, (reply as StatusReply).facts));
+		if (!ok || !typeIs(reply, "table")) return;
+		noteAccess((reply as StatusReply).facts?.access);
+		setHealth(checkHealth((reply as StatusReply).server, (reply as StatusReply).facts));
 	});
 
 	every(trove, REFRESH, refreshDev);
@@ -2094,8 +2134,13 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 
 	return {
 		started: () => {
-			const [ok, err] = pcall(() => playReloadSound());
-			if (!ok) $warn(`[devtools] reload sound failed: ${err}`);
+			// Its own thread: off dev rules it waits for the server's answer (op "access").
+			trove.add(
+				task.spawn(() => {
+					const [ok, err] = pcall(() => playReloadSound());
+					if (!ok) $warn(`[devtools] reload sound failed: ${err}`);
+				}),
+			);
 		},
 	};
 }

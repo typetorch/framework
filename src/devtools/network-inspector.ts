@@ -2,6 +2,7 @@ import { UserInputService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
 import type { ClientKernel } from "../kernel";
+import { rulesOf } from "../kernel";
 import { PACKET_CAPACITY, PacketPage, PacketRecord, PacketStatus, PacketSummary, PacketTap } from "../net/inspect";
 import type { ClientDispatcher } from "../net/runtime";
 import {
@@ -60,6 +61,13 @@ export interface InspectorDeps {
 	readonly call: (op: string, payload?: unknown) => [ok: boolean, result: unknown];
 	/** This pane's remembered realm and filters (client.ts: per pane); defaults to one shared persist store. */
 	readonly persist?: object;
+	/**
+	 * Framework 0.4.1: the dev-only tools are open to this player here (access.ts; client.ts asks the server). Without
+	 * it: dev rules only.
+	 */
+	readonly mayChange?: () => boolean;
+	/** Framework 0.4.1: why not, in a few words ("Dev branch only", "Owners only on public servers"). */
+	readonly accessNote?: () => string;
 }
 
 /** Remembered across swaps (kernel persist store). */
@@ -146,9 +154,8 @@ let serverWatching = false;
 let pollEpoch = 0;
 let lastPoll = -math.huge;
 let lastDropped = 0;
-/** The server poll's last problem and the server's channel (every server pane shows them). */
+/** The server poll's last problem (every server pane shows it). */
 let serverProblem: string | undefined;
-let serverChannel: string | undefined;
 
 function notify(realm: Realm) {
 	for (const watcher of [...watchers]) {
@@ -209,7 +216,6 @@ function pollServer(call: InspectorDeps["call"]) {
 	}
 	serverProblem = undefined;
 	const page = reply as PacketPage;
-	serverChannel = page.channel;
 	if (view.session !== page.session) {
 		const restarted = view.session !== undefined && view.cursor > 0;
 		view.session = page.session;
@@ -342,6 +348,7 @@ function arrow(parent: Instance, right: boolean, color: Color3): Frame {
 export function renderNetworkInspector(tab: InspectorTab, deps: InspectorDeps) {
 	const { trove, content } = tab;
 	const { kernel, call } = deps;
+	const mayChange = deps.mayChange ?? (() => rulesOf(kernel) === "dev");
 	const persist = (deps.persist as InspectorPersist | undefined) ?? kernel.persist<InspectorPersist>("typetorch/netinspect", () => ({}));
 	let realm: Realm = persist.realm === "server" ? "server" : "client";
 	let direction: Direction = persist.dir === "in" || persist.dir === "out" ? persist.dir : "both";
@@ -637,7 +644,8 @@ export function renderNetworkInspector(tab: InspectorTab, deps: InspectorDeps) {
 
 	// Detail ------------------------------------------------------------------------------------------------------
 
-	const blockable = (row: Row) => realm === "client" && kernel.channel === "dev" && row.path !== LATE;
+	// Blocking this client's packets: where the dev-only tools are open to this player (access.ts, via client.ts).
+	const blockable = (row: Row) => realm === "client" && mayChange() && row.path !== LATE;
 	const paintBlock = () => {
 		const blocked = selected !== undefined && tap.blocked.has(selected.path);
 		blockButton.Text = blocked ? "Unblock" : "Block";
@@ -704,7 +712,8 @@ export function renderNetworkInspector(tab: InspectorTab, deps: InspectorDeps) {
 	// The feed's news ---------------------------------------------------------------------------------------------------
 
 	const showNote = () => {
-		note.Visible = realm === "server" && (serverChannel ?? kernel.channel) === "prod";
+		note.Visible = realm === "server" && !mayChange();
+		if (note.Visible && deps.accessNote) note.Text = `Read-only: ${deps.accessNote()}`;
 	};
 
 	onChanged = (changed) => {

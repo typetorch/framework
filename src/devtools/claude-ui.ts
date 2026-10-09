@@ -106,7 +106,7 @@ const ERRORS: Record<string, string> = {
 	code_busy: "Another code change is pending",
 	already_decided: "Already decided",
 	not_allowed: "Not on the session's user list",
-	// Who may use Claude here (claude-access.ts ClaudeRefusal); prod_channel: a server generation before 0.4.1.
+	// Who may use Claude here (access.ts DevRefusal); prod_channel: a server generation before 0.4.1.
 	dev_branch_only: "Claude: dev branch only",
 	owner_switch_only: "Claude: owner-switched servers only",
 	owners_only: "Claude: owners only on public servers",
@@ -783,9 +783,9 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		content.Visible = true;
 	});
 
-	// Who may use Claude here (claude-access.ts): under dev rules every dev, as before. Under prod rules only a public
-	// server on a dev branch an owner switched to, for owners: the server says (op "claude.access") and re-checks every
-	// op. Everything else is refused here at once.
+	// Who may use Claude here (access.ts): under dev rules every dev, as before. Under prod rules only a public server
+	// on a dev branch an owner switched to, for owners: the server says (op "access") and re-checks every op. Everything
+	// else is refused here at once.
 	if (rulesOf(kernel) !== "dev") {
 		const askServer = branchChannelOf(kernel) === "dev" && kernel.serverType === "public";
 		const note = label(askServer ? "Checking..." : errorText("dev_branch_only"), COLORS.dim, SMALL, false);
@@ -798,7 +798,7 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		});
 		trove.add(
 			task.spawn(() => {
-				const [ok, reply] = call("claude.access");
+				const [ok, reply] = call("access");
 				if (closed) return;
 				const answer = (typeIs(reply, "table") ? reply : {}) as { ok?: boolean; error?: unknown };
 				if (ok && answer.ok === true) {

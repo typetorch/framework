@@ -88,7 +88,7 @@ export interface ClaudeSessionView {
 	label: string;
 	requests: ClaudeRequestView[];
 	/**
-	 * Framework 0.4.1: why this player may not use Claude here (claude-access.ts ClaudeRefusal: "dev_branch_only",
+	 * Framework 0.4.1: why this player may not use Claude here (access.ts DevRefusal: "dev_branch_only",
 	 * "owner_switch_only", "owners_only"); absent when they may.
 	 */
 	refused?: string;

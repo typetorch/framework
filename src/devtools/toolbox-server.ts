@@ -1,6 +1,6 @@
 import { AssetService, CollectionService, HttpService, Workspace } from "@rbxts/services";
 import { $print, $warn } from "rbxts-transform-debug";
-import type { ClaudeRefusal } from "./claude-access";
+import type { DevRefusal } from "./access";
 import { resolveGamePath, toJson } from "./claude-tools";
 import type { ClaudeToolboxApproval, ClaudeToolboxInsert, ClaudeToolboxOptions, ClaudeToolboxTile, ClaudeToolboxType } from "./protocol";
 import { leftovers, sanitizeAsset, scanAsset, type AssetScan } from "./toolbox-sanitize";
@@ -12,7 +12,7 @@ declare const SecurityCapabilities: SecurityCapabilitiesConstructor;
  * Creator Store inserts into the requesting dev's live server (plans/14 "toolbox_insert"), run by claude.ts for a
  * game-tool request of the dev machine. Server only.
  *
- *   1. only where the requesting dev may use Claude (claude-access.ts: dev rules, or an owner on a public server an
+ *   1. only where the requesting dev may use Claude (access.ts: dev rules, or an owner on a public server an
  *      owner switched to a dev branch); prod servers never get runtime third-party content from a chat;
  *   2. the prompt must be one this server forwarded with the "Toolbox" chip (ToolboxGate.isAllowed), and the asset id
  *      must be in a toolbox_results event this server relayed for the conversation (ToolboxGate.fromSearch);
@@ -384,8 +384,8 @@ export interface ToolboxAsk {
 export interface ToolboxInsertDeps {
 	gate: ToolboxGate;
 	store: ToolboxStore;
-	/** Why `player` may not use Claude here (claude-access.ts), or undefined. */
-	refusal: (player: Player) => ClaudeRefusal | undefined;
+	/** Why `player` may not use Claude here (access.ts), or undefined. */
+	refusal: (player: Player) => DevRefusal | undefined;
 	/** Shows the approval card to the requesting dev and yields: "insert" | "deny" | "timeout", with the card's options. */
 	ask: (player: Player, card: ToolboxAsk) => LuaTuple<[decision: string, options: ClaudeToolboxOptions | undefined]>;
 	/** The requester is still in this server, still a dev, and still allowed to use Claude here. */
@@ -590,7 +590,7 @@ function findInsert(insertId: string): Instance | undefined {
 }
 
 /** Op "claude.toolboxRemove": only the dev who inserted it, only where they may use Claude (`refusal` undefined). */
-export function removeToolboxInsert(player: Player, insertId: unknown, store: ToolboxStore, refusal: ClaudeRefusal | undefined): { ok: boolean; error?: string } {
+export function removeToolboxInsert(player: Player, insertId: unknown, store: ToolboxStore, refusal: DevRefusal | undefined): { ok: boolean; error?: string } {
 	if (refusal !== undefined) return { ok: false, error: refusal };
 	if (!typeIs(insertId, "string") || insertId.size() > 32 || insertId.match("^%x+$")[0] === undefined) return { ok: false, error: "bad_request" };
 	const record = store.inserts.find((insert) => insert.insertId === insertId);

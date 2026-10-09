@@ -35,14 +35,14 @@ import type {
 	DevOp,
 } from "./protocol";
 import { CLAUDE_IMAGE_CHUNK, MAX_STROKES_JSON, cleanAttachmentIds, cleanCrop, cleanImageMeta, cleanStrokes, decodeImageChunk } from "./claude-images";
-import { ClaudeGate } from "./claude-access";
+import { DevAccess } from "./access";
 import { ToolboxGate, cleanTiles, insertsFor, newToolboxStore, removeToolboxInsert, toolboxInsert, type ToolboxAsk, type ToolboxStore } from "./toolbox-server";
 import { CODE_ALPHABET, CODE_LENGTH, CODE_SECRET_LENGTH, codeFingerprint, sha256 } from "./sha256";
 import { FRAMEWORK_VERSION } from "../version";
 
 /**
  * Game side of `typetorch remote-claude` (plans/11). A dev's machine announces a session over MessagingService; this
- * server keeps it only when Claude may work here (claude-access.ts: dev rules, or a public server an owner switched to
+ * server keeps it only when Claude may work here (access.ts: dev rules, or a public server an owner switched to
  * a dev branch, where only owners use it) and its branch is the session branch, and forwards prompts.
  *
  * AUTH (pairing, no Roblox Secrets Store): a dev pastes the pairing code printed by typetorch-dev-server into the
@@ -63,7 +63,7 @@ import { FRAMEWORK_VERSION } from "../version";
  * GAME TOOLS: Claude's game tools (run_luau, game_logs, inspect, find, game_status) act on the server that sent the
  * prompt. The dev machine publishes a wake message on TypeTorch/tool {v, s, j, x, u} (no code); this server also
  * polls GET /v1/game/pending while a dev's prompt runs. A request is served only when: Claude may work here for u
- * (claude-access.ts), j is this server's JobId, s is the session, u is in the session's users, is in this server, is
+ * (access.ts), j is this server's JobId, s is the session, u is in the session's users, is in this server, is
  * still a dev and is paired here. The request itself is fetched with that user's token (the dev machine checks user AND job).
  *
  * TRANSPORT (2026-10-04): one HTTP long-poll per paired dev, GET /v1/game/poll?since=<cursor> (held up to 20 s by the
@@ -404,14 +404,16 @@ function encodedSize(value: unknown): number {
 	return ok ? json.size() : math.huge;
 }
 
-export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Map<string, DevOp>, deps?: ClaudeToolDeps) {
+/**
+ * Registers the claude.* ops and logs.upload. `gate`: the devtools' access rule (access.ts; server.ts passes its own,
+ * so every devtools gate shares one).
+ */
+export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Map<string, DevOp>, deps?: ClaudeToolDeps, gate = new DevAccess(kernel)) {
 	const store = kernel.persist<Store>(PERSIST_KEY, () => ({ requests: [], sent: new Map(), pairings: new Map() }));
 	if (store.pairings === undefined) store.pairings = new Map();
 	const pairings = store.pairings;
 	if (store.toolbox === undefined) store.toolbox = newToolboxStore();
 	const toolboxStore = store.toolbox;
-	/** Who may use Claude here (claude-access.ts): every gate below asks it. */
-	const gate = new ClaudeGate(kernel);
 	/** The refusal for `player` as a dev op failure, or undefined when they may use Claude here. */
 	const refused = (player: Player): Failure | undefined => {
 		const why = gate.refusal(player);
@@ -768,9 +770,6 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	};
 
 	// Ops -------------------------------------------------------------------------------------------------------------
-	// Whether the player may use Claude here: the tab asks first when the rules aren't dev (claude-ui.ts).
-	ops.set("claude.access", (player) => refused(player) ?? { ok: true });
-
 	ops.set("claude.session", (player): ClaudeSessionView => {
 		const why = gate.refusal(player);
 		if (why !== undefined) return { available: false, allowed: false, branch: kernel.branch, label: "", requests: [], refused: why };
@@ -1470,7 +1469,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		}
 		if (tool === "toolbox_insert") {
 			// Creator Store insert (plans/14): chip-gated prompt, id from this conversation's relayed search, Claude allowed
-			// here for the dev (claude-access.ts), a per-insert approval card (no "always"), load into nothing, sanitize,
+			// here for the dev (access.ts), a per-insert approval card (no "always"), load into nothing, sanitize,
 			// then parent (toolbox-server.ts).
 			return toolboxInsert(player, request, {
 				gate: toolboxGate,
@@ -1532,7 +1531,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 
 	/**
 	 * Who may use the game tools here right now: the session's user, in this server, a dev, allowed to use Claude here
-	 * (an owner on a public server an owner switched; claude-access.ts), paired here. The long-polls and the wake
+	 * (an owner on a public server an owner switched; access.ts), paired here. The long-polls and the wake
 	 * messages serve only such players.
 	 */
 	const toolPlayer = (session: Session, userId: number): Player | undefined => {
