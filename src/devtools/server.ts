@@ -11,6 +11,7 @@ import { registerRemoteClaude } from "./claude";
 import { registerExplorerOps } from "./explorer-server";
 import { registerNetworkOps } from "./network-server";
 import { registerAdminOps } from "./admin-server";
+import { registerRemoteDebug } from "./remote-debug";
 import {
 	DEV_REQUEST,
 	DEV_RESPONSE,
@@ -382,6 +383,10 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 		trove,
 		access,
 	);
+
+	// Framework 0.5.0 (plans/25): remote debug's read-only ops for this generation (kernel 0.5.0+; owners only, checked
+	// by the kernel and again in remote-debug.ts): modules, state, assets, network stats, a read-only Dex.
+	registerRemoteDebug(kernel, { netStats: () => dispatcher.stats });
 
 	const reply = (player: Player, id: unknown, ok: boolean, result: unknown) => kernel.send(player, DEV_RESPONSE, id, ok, result);
 

@@ -639,6 +639,9 @@ stubs.sync = { -- assets/sync
 	end,
 }
 stubs["network-server"] = { registerNetworkOps = function() end }
+stubs["remote-debug"] = { registerRemoteDebug = function() -- framework 0.5.0 (plans/25): its own test, test-remote-debug.luau
+	return false
+end }
 stubs.hints = { describeFleetError = function() end } -- analytics/hints (health.luau)
 -- Dex: the real explorer-server.luau over a stub explorer core whose "set" needs canEdit (as core.ts's edits do).
 stubs.core = {
