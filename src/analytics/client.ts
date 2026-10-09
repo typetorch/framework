@@ -22,6 +22,7 @@ import {
 	CHUNK_TARGET_BYTES,
 	CLIENT_BATCH_BYTES,
 	CLIENT_BATCH_MAX,
+	deviceClass,
 	isEventName,
 	type ClientEvent,
 	type HelloInfo,
@@ -71,17 +72,28 @@ interface ClientStore {
 
 type Held = [clock: number, kind: string, name: string, props: string];
 
-function deviceInfo(): HelloInfo {
+/** The camera's viewport in points (0 x 0 without a camera). */
+function viewportSize(): Vector2 {
 	const camera = Workspace.CurrentCamera;
-	const viewport = camera ? camera.ViewportSize : new Vector2(0, 0);
+	return camera ? camera.ViewportSize : new Vector2(0, 0);
+}
+
+/** Seconds the first hello waits for a real viewport (a camera reports 1 x 1 for a moment at startup). */
+const VIEWPORT_WAIT = 2;
+
+function deviceInfo(): HelloInfo {
+	const viewport = viewportSize();
 	const vr = VRService.VREnabled;
 	const [consoleOk, isConsole] = pcall(() => GuiService.IsTenFootInterface());
-	let dev: DeviceKind = "unknown";
-	if (vr) dev = "vr";
-	else if (consoleOk && isConsole) dev = "console";
-	else if (UserInputService.TouchEnabled && !UserInputService.KeyboardEnabled) {
-		dev = math.min(viewport.X, viewport.Y) >= 600 ? "tablet" : "phone";
-	} else if (UserInputService.KeyboardEnabled || UserInputService.MouseEnabled) dev = "desktop";
+	const dev: DeviceKind = deviceClass({
+		vr,
+		tenFoot: consoleOk && isConsole === true,
+		touch: UserInputService.TouchEnabled,
+		keyboard: UserInputService.KeyboardEnabled,
+		mouse: UserInputService.MouseEnabled,
+		w: viewport.X,
+		h: viewport.Y,
+	});
 	const last = UserInputService.GetLastInputType();
 	let input = "unknown";
 	if (vr) input = "vr";
@@ -583,6 +595,9 @@ export class ClientAnalytics {
 	private startSending() {
 		this.trove.add(
 			task.spawn(() => {
+				// The device class reads the viewport (phone vs tablet): give the camera a moment to report a real size.
+				const waitUntil = os.clock() + VIEWPORT_WAIT;
+				while (math.min(viewportSize().X, viewportSize().Y) <= 1 && os.clock() < waitUntil && !this.stopped) task.wait(0.1);
 				// Hello until the server answers (its engine may start later than this one): every 5 s for a minute, then
 				// every 30 s.
 				let tries = 0;

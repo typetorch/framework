@@ -408,6 +408,24 @@ check("identity: bad fields reported, token never echoed", #badIdentity.errors =
 check("hello clean", P.cleanHello({ dev = "phone", input = "touch", w = 390.4, h = 844, touch = true, load = 3.14159 }).w == 390)
 check("hello bad dev", P.cleanHello({ dev = "toaster" }).dev == "unknown")
 check("hello not table", P.cleanHello("x") == nil)
+local function device(facts)
+	local f = { vr = false, tenFoot = false, touch = false, keyboard = false, mouse = false, w = 0, h = 0 }
+	for key, value in facts do
+		f[key] = value
+	end
+	return P.deviceClass(f)
+end
+check("device: phone (portrait)", device({ touch = true, w = 390, h = 844 }) == "phone")
+check("device: phone (landscape, short side)", device({ touch = true, w = 932, h = 430 }) == "phone")
+check("device: tablet at 600 pt", device({ touch = true, w = 600, h = 960 }) == "tablet")
+check("device: tablet (landscape)", device({ touch = true, w = 1180, h = 820 }) == "tablet")
+check("device: touch with no viewport yet counts as a phone", device({ touch = true }) == "phone")
+check("device: touch laptop is a desktop", device({ touch = true, keyboard = true, mouse = true, w = 1280, h = 800 }) == "desktop")
+check("device: tablet with a keyboard is a desktop", device({ touch = true, keyboard = true, w = 1024, h = 768 }) == "desktop")
+check("device: mouse only is a desktop", device({ mouse = true, w = 1920, h = 1080 }) == "desktop")
+check("device: console wins over input", device({ tenFoot = true, keyboard = true, w = 1920, h = 1080 }) == "console")
+check("device: VR wins over everything", device({ vr = true, tenFoot = true, touch = true }) == "vr")
+check("device: nothing known", device({}) == "unknown")
 check("hello load", P.cleanHello({ load = 3.14159 }).load == 3.1)
 check("event ok", P.cleanClientEvent({ 100, "custom", "quest_done", "{}" }) ~= nil)
 check("event bad kind", P.cleanClientEvent({ 100, "session", "join", "{}" }) == nil)

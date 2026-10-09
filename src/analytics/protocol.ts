@@ -40,6 +40,36 @@ export interface HelloInfo {
 	load?: number;
 }
 
+/** What the client knows about its device when it says hello (UserInputService, VRService, GuiService, the camera). */
+export interface DeviceFacts {
+	vr: boolean;
+	/** GuiService:IsTenFootInterface(): a console (Xbox, PlayStation). */
+	tenFoot: boolean;
+	touch: boolean;
+	keyboard: boolean;
+	mouse: boolean;
+	/** Viewport size in points (0 when the camera has none yet). */
+	w: number;
+	h: number;
+}
+
+/** A touch-only device whose viewport's short side is at least this many points is a tablet, else a phone. */
+export const TABLET_MIN_SHORT_SIDE = 600;
+
+/**
+ * The session's device class (the `dev` column), in this order: VR headset; console (ten-foot interface); touch without
+ * a keyboard: tablet when the viewport's short side is 600 points or more, else phone (also when the viewport isn't
+ * known); a keyboard or mouse: desktop (a touch laptop or a tablet with a keyboard counts here); else unknown. Roblox
+ * gives game scripts no OS, so this is the closest a game gets.
+ */
+export function deviceClass(f: DeviceFacts): DeviceKind {
+	if (f.vr) return "vr";
+	if (f.tenFoot) return "console";
+	if (f.touch && !f.keyboard) return math.min(f.w, f.h) >= TABLET_MIN_SHORT_SIDE ? "tablet" : "phone";
+	if (f.keyboard || f.mouse) return "desktop";
+	return "unknown";
+}
+
 /** [ageMs, kind, name, propsJson] */
 export type ClientEvent = [age: number, kind: string, name: string, props: string];
 
