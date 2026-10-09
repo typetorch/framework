@@ -1,6 +1,6 @@
 {
 	"name": "@typetorch/framework",
-	"version": "0.4.1",
+	"version": "0.5.0",
 	"description": "TypeTorch framework for roblox-ts: hot-swappable modules (dependency injection, lifecycle, troves), guarded networking, hot assets and the in-game dev menu. Ships inside every TypeTorch artifact.",
 	"license": "MIT",
 	"author": "TypeTorch",

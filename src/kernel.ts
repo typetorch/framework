@@ -741,6 +741,8 @@ export interface KernelStatus {
 	errors?: ErrorReportsStatus;
 	/** Kernel 0.4.0: the budget summary (the heartbeat's `bu`); the full view is `budget()`. */
 	budget?: BudgetSummary;
+	/** Kernel 0.5.0 (plans/25): remote debug's counters. */
+	remoteDebug?: RemoteDebugStatus;
 }
 
 /** Kernel 0.3.8: detached jobs on this server (`runDetached`): counters since boot and the running ones. */
@@ -886,6 +888,34 @@ export interface MessagingStatus {
 	rollCall: { state: "off" | "subscribing" | "on" | "local"; asks: number; handled: number };
 }
 
+/** Kernel 0.5.0 (plans/25): who asked for a remote debug op. Always an owner (the kernel refuses everyone else). */
+export interface RemoteDebugCaller {
+	/** "roblox": an owner signed in to the explorer with Roblox; "token": the backend's admin token (an owner by decision). */
+	kind: "roblox" | "token";
+	userId?: number;
+	owner: true;
+	via: "roblox" | "admin token";
+}
+
+/** Kernel 0.5.0: `status().remoteDebug` (counters; never a command's contents, the URL or the key). */
+export interface RemoteDebugStatus {
+	state: "off" | "polling" | "held";
+	missing?: boolean;
+	sessions?: number;
+	polls?: number;
+	commands?: number;
+	answered?: number;
+	refused?: number;
+	failed?: number;
+	timeouts?: number;
+	redacted?: number;
+	lastPollAt?: number;
+	lastCommandAt?: number;
+	lastOp?: string;
+	lastError?: string;
+	lastErrorAt?: number;
+}
+
 export interface ServerKernel {
 	readonly kernelApi: number;
 	readonly kernelVersion: string;
@@ -1026,6 +1056,14 @@ export interface ServerKernel {
 	budgetCount?(caller: BudgetCaller, kind: BudgetKind, op: string, n?: number): void;
 	/** Kernel 0.4.0: the full budget view (dev menu Server > Budget). Cheap, no yield. */
 	budget?(): BudgetSnapshot;
+
+	/**
+	 * Kernel 0.5.0 (plans/25): remote debug. One handler per generation (the framework installs it with its devtools):
+	 * the kernel calls it on a kernel thread for the explorer's read-only ops that need the generation (modules, state,
+	 * assets, network, dex.children, dex.props), after checking its allow-list, the rate and that the caller is an owner;
+	 * the answer is JSON-encoded and scrubbed of secrets by the kernel. `onRemoteDebug` doubles as the feature test.
+	 */
+	onRemoteDebug?(handler: (op: string, args: unknown, caller: RemoteDebugCaller) => unknown): void;
 
 	/** `typetorch test --cloud`'s stub kernel: true (code that must not run in the gate checks it). */
 	readonly test?: boolean;
