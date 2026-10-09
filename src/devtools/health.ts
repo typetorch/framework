@@ -4,7 +4,7 @@ import type { AssetFacts } from "../assets/manifest";
 import type { DetachedStatus, ErrorReportsStatus, FleetSenderInfo, HealthInfo, KernelStatus, PerfSummary, SettingsStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
-export const LATEST_KERNEL = "0.4.2";
+export const LATEST_KERNEL = "0.5.1";
 
 /** Kernels before 0.3.7 use fixed thresholds: 3 errors within 30 s of ready roll back. */
 const OLD_HEALTH_ERRORS = 3;

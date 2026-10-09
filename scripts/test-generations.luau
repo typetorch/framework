@@ -706,7 +706,7 @@ do
 		end
 		return list
 	end
-	local base = { kernelApi = 1, kernelVersion = "0.4.2", serverType = "public", generation = { name = "x#1" }, history = {}, memoryMb = 1 }
+	local base = { kernelApi = 1, kernelVersion = "0.5.1", serverType = "public", generation = { name = "x#1" }, history = {}, memoryMb = 1 }
 	local function with(fields)
 		local status = table.clone(base)
 		for key, value in fields do
@@ -714,7 +714,7 @@ do
 		end
 		return status
 	end
-	check("health: LATEST_KERNEL is 0.4.2", health.LATEST_KERNEL == "0.4.2")
+	check("health: LATEST_KERNEL is 0.5.1", health.LATEST_KERNEL == "0.5.1")
 	-- Kernel 0.3.9: the channel (what the branch is) and the rules (what the server enforces) are read apart; older
 	-- kernels only have `channel` (the rules) and both helpers fall back to it.
 	local kernelTypes = TS.import(model.Server, frameworkOut, "kernel")
