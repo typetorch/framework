@@ -155,6 +155,10 @@ export class CoinService extends Module implements OnStart {
   build picker (Server > Branch) and a Claude prompt. The sidebar, top to bottom: Artifact, Server, Network, Modules,
   Manage, Logs, Dex, Claude. The window can be dragged by its header and resized from its corner (double-tap the
   header to reset).
+- **Server TPS (framework 0.4.2, kernel 0.4.2):** Server > Status has a *TPS* line next to Memory and Lua heap: the
+  last minute's average, its slowest second and the physics FPS (`59.9 avg, 52.0 min, physics 60`; the warning colour
+  under 50 on average). Older kernels show `needs kernel 0.4.2`. The same numbers ride on fleet heartbeats (the
+  explorer's fleet table).
 - **Dev-only tools (framework 0.4.1, `devtools/access.ts`):** Claude, Logs > Upload, Dex edits on the server, Network
   packet blocking and the hot-swap sound work under dev rules (private, reserved and Studio servers on a dev branch)
   for every dev, and on a public server an owner switched to a dev branch (Server > Branch) for owners only. Everywhere
