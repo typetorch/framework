@@ -166,7 +166,8 @@ const UPLOAD_ERRORS: Record<string, string> = {
 /** The client's own logs for Logs > Upload: about 256 KB, newest kept (the server caps it again). */
 const CLIENT_UPLOAD_BYTES = 256 * 1024;
 
-const TABS = ["Artifact", "Modules", "Server", "Manage", "Logs", "Dex", "Network", "Claude"] as const;
+/** The sidebar, top to bottom (framework 0.4.1: Server, Network, Modules and Manage first; owner request). */
+const TABS = ["Server", "Network", "Modules", "Manage", "Artifact", "Logs", "Dex", "Claude"] as const;
 type TabName = (typeof TABS)[number];
 /** Tabs with sub-tabs (a segmented bar on top of the content); the first one is the default. */
 const SUBTABS: Partial<Record<TabName, readonly string[]>> = { Modules: ["Overview", "State", "Assets"], Server: ["Status", "Branch", "Budget"], Manage: ["Players", "Servers", "Bans"], Network: ["Packets", "Stats"] };
