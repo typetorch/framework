@@ -946,13 +946,15 @@ export class ServerAnalytics {
 		if (!info) return;
 		const first = session.device === undefined;
 		session.device = info;
-		session.dev = info.dev;
+		// The device class is the session's: set by the first hello and kept (a later hello after a hot swap, or a keyboard
+		// plugged into a tablet, doesn't move the session's rows to another class), unless the first one didn't know.
+		if (first || session.dev === "unknown") session.dev = info.dev;
 		if (first && this.options.sessions !== false) {
 			this.emit(
 				session,
 				"session",
 				"device",
-				encodeProps({ input: info.input, w: info.w, h: info.h, touch: info.touch, kb: info.kb, mouse: info.mouse, pad: info.pad, vr: info.vr }),
+				encodeProps({ dev: info.dev, input: info.input, w: info.w, h: info.h, touch: info.touch, kb: info.kb, mouse: info.mouse, pad: info.pad, vr: info.vr }),
 				"client",
 			);
 			if (info.load !== undefined && this.options.tech !== false) {

@@ -499,6 +499,11 @@ check("friends: the player leaving mid-lookup keeps the count so far", core1:fri
 onAdvance = nil
 local device = rowsNamed(store().events.rows, "session", "device")
 check("device rows from the client", #device == 2 and device[1].src == "client")
+local deviceDevs = {}
+for _, row in device do
+	deviceDevs[serde.decode("json", row.props).dev] = row.dev
+end
+check("device row: the device class once per session, in props and the column", deviceDevs.phone == "phone" and deviceDevs.desktop == "desktop")
 check("load row", #rowsNamed(store().events.rows, "tech", "load") == 1)
 
 core1:track(newbie, "custom", "quest_done", { quest = "tutorial" })
@@ -706,12 +711,15 @@ check("handover: in-flight rows requeued", #rowsNamed(store().events.rows, "cust
 check("handover: no second join", #rowsNamed(store().events.rows, "session", "join") == 0)
 check("handover: deploy reports not repeated", #rowsNamed(store().fleet.rows, "fleet", "deploy_report") == 0)
 check("handover: heartbeat at start", #rowsNamed(store().fleet.rows, "fleet", "heartbeat") == 1)
-raw["__tt/an"](newbie, "hello", { dev = "phone", input = "touch" })
+-- A keyboard plugged in since: the client now says tablet, but the session keeps its class and gets no second device row.
+raw["__tt/an"](newbie, "hello", { dev = "tablet", input = "touch" })
 local hiAgain = hiFor(newbie)
 check("handover: same pid, still recording flag off after end", hiAgain.pid == newbiePid and hiAgain.rec == false)
+check("handover: no second device row", #rowsNamed(store().events.rows, "session", "device") == 0)
 core2:track(newbie, "custom", "gen2_event", nil)
 local gen2 = rowsNamed(store().events.rows, "custom", "gen2_event")[1]
 check("gen 2 rows: new artifact, same session", gen2 and gen2.art == "art2" and gen2.seq == 8 and gen2.sid == joinNew.sid and gen2.newp == true)
+check("gen 2 rows: the session's device class is kept", gen2 and gen2.dev == "phone", gen2 and gen2.dev)
 check("gen 2 rows: experiment kept", gen2 and serde.decode("json", gen2.exp).onboarding == variant)
 task.wait(5.2)
 local swap = everywhere("tech", "swap")[1]
