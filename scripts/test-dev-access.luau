@@ -795,6 +795,5 @@ do
 end
 
 print(`dev access: {passed} passed, {failed} failed`)
-if failed > 0 then
-	process.exit(1)
-end
+-- Exit now, like test-messaging / test-settings: the stub kernels' scheduler leftovers must not keep Lune running.
+process.exit(if failed == 0 then 0 else 1)
