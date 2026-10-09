@@ -1,14 +1,16 @@
 --!nocheck
--- Offline test of who may use Claude (framework 0.4.1): the rule in out/devtools/claude-access.luau, and every gate of
--- out/devtools/claude.luau (+ out/devtools/toolbox-server.luau) that goes through it, against stub kernels under Lune.
--- The rule: dev RULES (private/reserved/Studio as before) for every dev; or a PUBLIC server on a dev-channel branch that
--- an OWNER switched to (status().switched names the branch, the kernel follows it by dev rules: signedOnly false) for
--- owners only; nothing else. Cases: private dev server (allowed), public prod branch (refused), public dev branch
--- switched by an owner + owner (allowed), same + non-owner (refused), public dev branch not switched by an owner
--- (refused), older kernels without the new fields (as before), plus session keeping and the polls on public servers.
+-- Offline test of who may use the dev-only devtools (framework 0.4.1): the rule in out/devtools/access.luau, every gate
+-- of out/devtools/claude.luau (+ toolbox-server.luau) that goes through it, the devtools server's own gates
+-- (out/devtools/server.luau: op "access", status facts.access, state.inspect, explorer edits through
+-- explorer-server.luau, one shared rule handed to Claude, Dex and Manage) and the run_luau hint (health.luau), against
+-- stub kernels under Lune. The rule: dev RULES (private/reserved/Studio as before) for every dev; or a PUBLIC server on a
+-- dev-channel branch that an OWNER switched to (status().switched names the branch, the kernel follows it by dev rules:
+-- signedOnly false) for owners only; nothing else. Cases: private dev server (allowed), public prod branch (refused),
+-- public dev branch switched by an owner + owner (allowed), same + non-owner (refused), public dev branch not switched
+-- by an owner (refused), older kernels without the new fields (as before), plus Claude's session keeping and polls.
 -- Run after `bun run build`:
---   cd ../kernel && lune run ../framework/scripts/test-claude-access.luau ../framework/
--- or from framework/: <rokit>/tool-storage/lune-org/lune/0.10.5/lune.exe run scripts/test-claude-access.luau
+--   cd ../kernel && lune run ../framework/scripts/test-dev-access.luau ../framework/
+-- or from framework/: <rokit>/tool-storage/lune-org/lune/0.10.5/lune.exe run scripts/test-dev-access.luau
 local fs = require("@lune/fs")
 local luau = require("@lune/luau")
 local process = require("@lune/process")
@@ -150,7 +152,7 @@ local stubs = {
 }
 local PATHS = {
 	kernel = "out/kernel.luau",
-	["claude-access"] = "out/devtools/claude-access.luau",
+	access = "out/devtools/access.luau",
 	claude = "out/devtools/claude.luau",
 	["toolbox-server"] = "out/devtools/toolbox-server.luau",
 	sha256 = "out/devtools/sha256.luau",
@@ -190,7 +192,7 @@ env = setmetatable({
 	print = function() end,
 }, { __index = _G })
 
-local A = loadModule("claude-access")
+local A = loadModule("access")
 local C = loadModule("claude")
 
 -- Players and kernels ---------------------------------------------------------------------------------------------------
@@ -313,7 +315,7 @@ local KERNELS = {
 	},
 }
 
--- 1. The rule (claude-access.luau) ----------------------------------------------------------------------------------------
+-- 1. The rule (access.luau) ----------------------------------------------------------------------------------------
 local EXPECT = {
 	-- name = { server half, owner, non-owner dev }
 	privateDev = { "dev", nil, nil },
@@ -337,10 +339,10 @@ local EXPECT = {
 for name, spec in KERNELS do
 	local expect = EXPECT[name]
 	local kernel = makeKernel(spec.fields, spec.status)
-	check(`{name}: server half`, A.claudeServerAccess(kernel) == expect[1], A.claudeServerAccess(kernel))
-	check(`{name}: owner`, A.claudeAccess(kernel, owner) == expect[2], A.claudeAccess(kernel, owner))
-	check(`{name}: non-owner dev`, A.claudeAccess(kernel, dev) == expect[3], A.claudeAccess(kernel, dev))
-	local gate = A.ClaudeGate.new(kernel)
+	check(`{name}: server half`, A.serverAccess(kernel) == expect[1], A.serverAccess(kernel))
+	check(`{name}: owner`, A.devAccess(kernel, owner) == expect[2], A.devAccess(kernel, owner))
+	check(`{name}: non-owner dev`, A.devAccess(kernel, dev) == expect[3], A.devAccess(kernel, dev))
+	local gate = A.DevAccess.new(kernel)
 	check(`{name}: gate owner`, gate:refusal(owner) == expect[2], gate:refusal(owner))
 	check(`{name}: gate non-owner`, gate:refusal(dev) == expect[3], gate:refusal(dev))
 	check(`{name}: serverOpen`, gate:serverOpen() == (expect[1] == "dev" or expect[1] == "owners"))
@@ -349,7 +351,7 @@ end
 -- Dev rules never read status() (it isn't needed, and older kernels may lack fields).
 do
 	local kernel = makeKernel(KERNELS.privateDev.fields, "throw")
-	A.claudeServerAccess(kernel)
+	A.serverAccess(kernel)
 	check("dev rules: no status() read", kernel.statusCalls == 0, kernel.statusCalls)
 end
 -- ownerSwitchedHere on its own.
@@ -361,13 +363,13 @@ check("ownerSwitchedHere: other generation's branch", A.ownerSwitchedHere({ bran
 -- The gate keeps the server half for `ttl` seconds (status() is not cheap) and asks the owner check every time.
 do
 	local kernel = makeKernel(KERNELS.publicOwnerSwitched.fields, KERNELS.publicOwnerSwitched.status)
-	local gate = A.ClaudeGate.new(kernel, 60)
+	local gate = A.DevAccess.new(kernel, 60)
 	for _ = 1, 5 do
 		gate:refusal(owner)
 		gate:refusal(dev)
 	end
 	check("gate cache: one status() read in the ttl", kernel.statusCalls == 1, kernel.statusCalls)
-	local fresh = A.ClaudeGate.new(kernel, 0)
+	local fresh = A.DevAccess.new(kernel, 0)
 	fresh:refusal(owner)
 	fresh:refusal(owner)
 	check("gate ttl 0: status() every time", kernel.statusCalls == 3, kernel.statusCalls)
@@ -376,7 +378,7 @@ do
 	local live = makeKernel(KERNELS.publicOwnerSwitched.fields, function()
 		return current
 	end)
-	local liveGate = A.ClaudeGate.new(live, 0)
+	local liveGate = A.DevAccess.new(live, 0)
 	check("live: owner allowed", liveGate:refusal(owner) == nil)
 	current = { branch = "main", signedOnly = true, switched = { by = OWNER, name = "Owner", at = 5, branch = "main" } }
 	check("live: after a switch away", liveGate:refusal(owner) == "owner_switch_only", liveGate:refusal(owner))
@@ -412,8 +414,9 @@ local function generation(spec, persist)
 	}
 	local kernel, store = makeKernel(spec.fields, spec.status, persist)
 	local ops = {}
-	C.registerRemoteClaude(kernel, trove, ops, nil)
-	return ops, cleanupOf(items), store
+	local gate = A.DevAccess.new(kernel)
+	C.registerRemoteClaude(kernel, trove, ops, nil, gate)
+	return ops, cleanupOf(items), store, gate
 end
 
 local function announce(users, branch)
@@ -435,18 +438,18 @@ local GATED = { "claude.prompt", "claude.pair", "claude.status", "claude.cancel"
 
 local function opsCase(name, expectOwner, expectDev, open)
 	local spec = KERNELS[name]
-	local ops, stop = generation(spec)
+	local ops, stop, _, gate = generation(spec)
 	task.wait() -- the subscribe threads
 	local subscribed = subscriptions["TypeTorch/remote-claude"] ~= nil
 	check(`{name}: listens for sessions`, subscribed == open, subscribed)
 	check(`{name}: listens for tool wakes`, (subscriptions["TypeTorch/tool"] ~= nil) == open)
 	for _, case in { { owner, expectOwner, "owner" }, { dev, expectDev, "non-owner" } } do
 		local target, expect, who = case[1], case[2], case[3]
-		local access = ops["claude.access"](target)
+		local access = gate:reply(target) -- op "access" (server.luau below)
 		if expect == nil then
-			check(`{name}: claude.access {who} ok`, type(access) == "table" and access.ok == true, errorOf(access))
+			check(`{name}: access {who} ok`, type(access) == "table" and access.ok == true, errorOf(access))
 		else
-			check(`{name}: claude.access {who}`, errorOf(access) == expect, errorOf(access))
+			check(`{name}: access {who}`, errorOf(access) == expect, errorOf(access))
 		end
 		local session = ops["claude.session"](target)
 		check(`{name}: claude.session {who} refused`, session.refused == expect, session.refused)
@@ -579,7 +582,219 @@ do
 	stop()
 end
 
-print(`claude access: {passed} passed, {failed} failed`)
+-- Without a rule handed in, claude.luau makes its own (same answers).
+do
+	local items = {}
+	local kernel = makeKernel(KERNELS.publicOwnerSwitched.fields, KERNELS.publicOwnerSwitched.status)
+	local ops = {}
+	C.registerRemoteClaude(kernel, { add = function(_, item) table.insert(items, item) return item end }, ops, nil)
+	check("own rule: owner", ops["claude.session"](owner).refused == nil)
+	check("own rule: non-owner", ops["claude.session"](dev).refused == "owners_only")
+	cleanupOf(items)()
+end
+
+-- 3. The devtools server's own gates (server.luau), through its DEV_REQUEST dispatcher ------------------------------------
+services.Players.PlayerRemoving = {
+	Connect = function()
+		return { Disconnect = function() end }
+	end,
+}
+services.HttpService.HttpEnabled = true
+services.InsertService = {}
+services.MarketplaceService = {}
+stubs.registry = { runningModules = {} }
+stubs.state = {
+	describeState = function()
+		return {}
+	end,
+	stateRoots = function()
+		return {}
+	end,
+}
+stubs["state-inspect"] = {
+	parseStateRequest = function()
+		return { { side = "server" } }
+	end,
+	inspectState = function()
+		return "state"
+	end,
+}
+stubs["artifact-notes"] = {
+	notesFromAttribute = function() end,
+	parseArtifactNotes = function()
+		return { changes = {}, identity = {} }
+	end,
+}
+stubs.ab = {
+	kernelHasExperiments = function()
+		return false
+	end,
+	NEEDS_KERNEL_AB = "kernel 0.2.3 needed",
+}
+stubs.status = { analyticsStatus = function() end } -- analytics/status
+stubs.sync = { -- assets/sync
+	assetFacts = function() end,
+	assetReport = function()
+		return {}
+	end,
+}
+stubs["network-server"] = { registerNetworkOps = function() end }
+stubs.hints = { describeFleetError = function() end } -- analytics/hints (health.luau)
+-- Dex: the real explorer-server.luau over a stub explorer core whose "set" needs canEdit (as core.ts's edits do).
+stubs.core = {
+	EXPLORER_OPS = { "set", "props" },
+	Registry = {
+		new = function()
+			return {}
+		end,
+	},
+	explorerHandlers = function(_, canEdit)
+		return {
+			set = function()
+				if not canEdit() then
+					error("read-only here", 0)
+				end
+				return "changed"
+			end,
+			props = function()
+				return { editable = canEdit() }
+			end,
+		}
+	end,
+}
+PATHS.server = "out/devtools/server.luau"
+PATHS.protocol = "out/devtools/protocol.luau"
+PATHS["explorer-server"] = "out/devtools/explorer-server.luau"
+PATHS.health = "out/devtools/health.luau"
+-- Which rule each registration got (server.luau must hand the same one to Claude, Dex and Manage).
+local handed = {}
+local ES = loadModule("explorer-server")
+stubs["explorer-server"] = {
+	registerExplorerOps = function(register, kernel, gate)
+		handed.explorer = gate
+		return ES.registerExplorerOps(register, kernel, gate)
+	end,
+}
+stubs.claude = {
+	registerRemoteClaude = function(kernel, trove, ops, deps, gate)
+		handed.claude = gate
+		return C.registerRemoteClaude(kernel, trove, ops, deps, gate)
+	end,
+}
+stubs["admin-server"] = {
+	registerAdminOps = function(_, _, _, gate)
+		handed.admin = gate
+	end,
+}
+local S = loadModule("server")
+
+local stranger = player(404, "Stranger")
+local function devServer(fields, status)
+	handed = {}
+	subscriptions = {}
+	local raws, sent, items = {}, {}, {}
+	local dispatcher = {
+		setRaw = function(_, name, fn)
+			raws[name] = fn
+		end,
+		removeRaw = function() end,
+		stats = {},
+	}
+	local trove = {
+		add = function(_, item)
+			table.insert(items, item)
+			return item
+		end,
+		connect = function(_, signal, fn)
+			local connection = signal:Connect(fn)
+			table.insert(items, connection)
+			return connection
+		end,
+	}
+	local kernel = makeKernel(fields, status)
+	function kernel:send(target, channel, id, ok, result)
+		table.insert(sent, { channel = channel, id = id, ok = ok, result = result })
+	end
+	S.startDevtoolsServer(kernel, dispatcher, trove)
+	local nextId = 0
+	local function request(target, op, payload)
+		nextId += 1
+		raws["__tt/dev"](target, nextId, op, payload)
+		for _, reply in sent do
+			if reply.id == nextId and reply.channel == "__tt/devres" then
+				return reply.ok, reply.result
+			end
+		end
+		return false, "no reply"
+	end
+	return request, cleanupOf(items)
+end
+
+local SERVER_CASES = {
+	-- name, fields, a status() that works, owner's refusal, non-owner's refusal
+	{ "private dev server", KERNELS.privateDev.fields, { branch = "feature" }, nil, nil },
+	{ "public prod branch", KERNELS.publicProd.fields, KERNELS.publicProd.status, "dev_branch_only", "dev_branch_only" },
+	{ "public dev branch, owner switch", KERNELS.publicOwnerSwitched.fields, KERNELS.publicOwnerSwitched.status, nil, "owners_only" },
+	{ "public dev branch, no owner switch", KERNELS.publicDevNotSwitched.fields, KERNELS.publicDevNotSwitched.status, "owner_switch_only", "owner_switch_only" },
+	{ "older kernel, public, switched", KERNELS.oldPublicSwitched.fields, KERNELS.oldPublicSwitched.status, "dev_branch_only", "dev_branch_only" },
+	{ "older kernel, private dev", KERNELS.oldPrivateDev.fields, { branch = "feature" }, nil, nil },
+}
+for _, case in SERVER_CASES do
+	local label, fields, status = case[1], case[2], case[3]
+	local request, stop = devServer(fields, status)
+	check(`{label}: one rule handed to Claude, Dex and Manage`, handed.claude ~= nil and handed.claude == handed.explorer and handed.explorer == handed.admin)
+	for _, who in { { owner, case[4], "owner", true }, { dev, case[5], "non-owner", false } } do
+		local target, expect, name, isOwner = who[1], who[2], who[3], who[4]
+		local ok, reply = request(target, "access")
+		check(`{label}: op access, {name}`, ok and (if expect == nil then reply.ok == true else reply.ok == false and reply.error == expect), if ok then reply.error else reply)
+		ok, reply = request(target, "status")
+		check(`{label}: status facts.access, {name}`, ok and reply.facts.access == (expect or "ok"), if ok then reply.facts.access else reply)
+		-- Modules > State: owners everywhere, other devs where the tools are open to them.
+		ok, reply = request(target, "state.inspect", { side = "server" })
+		local stateOpen = isOwner or expect == nil
+		check(`{label}: state.inspect, {name}`, if stateOpen then ok == true else (ok == false and reply == "owners_only"), reply)
+		-- Dex edits through explorer-server.luau.
+		ok, reply = request(target, "explorer.set", {})
+		check(`{label}: explorer.set, {name}`, if expect == nil then (ok and reply == "changed") else (not ok and reply == "read-only here"), reply)
+		ok, reply = request(target, "explorer.props", {})
+		check(`{label}: explorer.props editable, {name}`, ok and reply.editable == (expect == nil), if ok then reply.editable else reply)
+		-- Claude through the same dispatcher.
+		ok, reply = request(target, "claude.session")
+		check(`{label}: claude.session, {name}`, ok and reply.refused == expect, if ok then reply.refused else reply)
+		ok, reply = request(target, "logs.upload", { kind = "server" })
+		local code = if ok then reply.error else reply
+		check(`{label}: logs.upload, {name}`, if expect ~= nil then code == expect else code == "not_connected", code)
+	end
+	local ok, reply = request(stranger, "access")
+	check(`{label}: not a dev`, ok == false and reply == "not a dev", reply)
+	stop()
+end
+
+-- 4. The run_luau hint (Server > Status): where Claude works for this player (facts.access); older frameworks: rules.
+do
+	local H = loadModule("health")
+	local function runLuauOff(status, facts)
+		local ok, issues = pcall(H.checkHealth, status, facts)
+		if not ok then
+			return "error: " .. tostring(issues)
+		end
+		for _, issue in issues do
+			if issue.title == "run_luau off" then
+				return true
+			end
+		end
+		return false
+	end
+	local devStatus = { serverType = "private", branch = "feature", channel = "dev", rules = "dev", kernelVersion = "0.4.0", kernelApi = 1, history = {}, uptime = 100, players = 1, maxPlayers = 10, appliedSeq = 1 }
+	local publicStatus = { serverType = "public", branch = "dev", channel = "dev", rules = "prod", kernelVersion = "0.4.0", kernelApi = 1, history = {}, uptime = 100, players = 1, maxPlayers = 10, appliedSeq = 1 }
+	check("hint: dev rules, no facts.access (older framework)", runLuauOff(devStatus, { loadstring = false }) == true, runLuauOff(devStatus, { loadstring = false }))
+	check("hint: prod rules, no facts.access", runLuauOff(publicStatus, { loadstring = false }) == false)
+	check("hint: owner on an owner-switched public server", runLuauOff(publicStatus, { loadstring = false, access = "ok" }) == true)
+	check("hint: non-owner there", runLuauOff(publicStatus, { loadstring = false, access = "owners_only" }) == false)
+	check("hint: loadstring on", runLuauOff(publicStatus, { loadstring = true, access = "ok" }) == false)
+end
+
+print(`dev access: {passed} passed, {failed} failed`)
 if failed > 0 then
 	process.exit(1)
 end
