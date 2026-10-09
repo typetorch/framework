@@ -100,5 +100,12 @@ check("errorsText: seen, kinds, sent, waiting, dropped", H.errorsText(reports, N
 check("errorsText: not posted without settings; missing module", has(H.errorsText({ enabled = false, kinds = 1, seen = { server = 1, client = 0 } }, NOW), "not posted") and has(H.errorsText({ enabled = false, missing = true }, NOW), "not mapped"))
 check("errorsFailing", H.errorsFailing({ enabled = true, failures = 2 }) and not H.errorsFailing(reports))
 
+-- Kernel 0.4.2: the Status page's TPS line (status().perf, the last minute) next to memory.
+local perf = { a = 59.94, m = 52, p = 60, s = 60 }
+check("perfText: average, slowest second, physics", H.perfText(perf, "0.4.2") == "59.9 avg, 52.0 min, physics 60", H.perfText(perf, "0.4.2"))
+check("perfText: no physics reading", H.perfText({ a = 45, m = 8.3, s = 12 }, "0.4.2") == "45.0 avg, 8.3 min", H.perfText({ a = 45, m = 8.3, s = 12 }, "0.4.2"))
+check("perfText: an older kernel doesn't measure it; a new server has nothing yet", H.perfText(nil, "0.4.0") == "needs kernel 0.4.2" and H.perfText(nil, "0.4.2") == "-" and H.perfText(nil, "0.5.0") == "-")
+check("perfLow: under 50 TPS on average (the warning colour), not for a slow second alone", H.perfLow({ a = 49.9, m = 40, s = 60 }) and not H.perfLow(perf) and not H.perfLow({ a = 58, m = 12, s = 60 }) and not H.perfLow(nil))
+
 print(`net health: {passed} passed, {failed} failed`)
 process.exit(if failed == 0 then 0 else 1)

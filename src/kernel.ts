@@ -591,6 +591,19 @@ export interface BudgetSummary {
 	mem: { t?: number; h?: number };
 }
 
+/**
+ * Kernel 0.4.2 `status().perf`: server TPS (RunService.Heartbeat frames a second) over the last minute: `a` the average,
+ * `m` the slowest whole second, `p` the physics FPS (workspace:GetRealPhysicsFPS(); missing when unreadable), `s` the
+ * seconds counted (up to 60). Absent before the first whole second. Fleet heartbeats carry `{ a, m, p }` as `pf`, over
+ * the time since the previous heartbeat. Memory is in `budget.mem` (and `memoryMb`).
+ */
+export interface PerfSummary {
+	a: number;
+	m: number;
+	p?: number;
+	s: number;
+}
+
 /** One bar of the budget view: TypeTorch's requests in the last 60 s, the limit, and (DataStore) the budget left. */
 export interface BudgetRow {
 	name: string;
@@ -741,6 +754,8 @@ export interface KernelStatus {
 	errors?: ErrorReportsStatus;
 	/** Kernel 0.4.0: the budget summary (the heartbeat's `bu`); the full view is `budget()`. */
 	budget?: BudgetSummary;
+	/** Kernel 0.4.2: server TPS over the last minute (average, slowest second, physics FPS). */
+	perf?: PerfSummary;
 }
 
 /** Kernel 0.3.8: detached jobs on this server (`runDetached`): counters since boot and the running ones. */

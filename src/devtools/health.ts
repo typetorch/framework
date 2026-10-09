@@ -1,7 +1,7 @@
 import { describeFleetError } from "../analytics/hints";
 import type { AnalyticsStats } from "../analytics/schema";
 import type { AssetFacts } from "../assets/manifest";
-import type { DetachedStatus, ErrorReportsStatus, FleetSenderInfo, HealthInfo, KernelStatus, SettingsStatus } from "../kernel";
+import type { DetachedStatus, ErrorReportsStatus, FleetSenderInfo, HealthInfo, KernelStatus, PerfSummary, SettingsStatus } from "../kernel";
 
 /** The newest kernel this framework release knows about. Bump it with every kernel release. */
 export const LATEST_KERNEL = "0.4.0";
@@ -204,6 +204,26 @@ export function errorsText(errors: ErrorReportsStatus, now: number): string {
 /** The error reports are failing to post (kernel 0.4.0). */
 export function errorsFailing(errors: ErrorReportsStatus): boolean {
 	return errors.enabled && (errors.failures ?? 0) > 0;
+}
+
+/** The kernel that measures server TPS (`status().perf`). */
+export const PERF_KERNEL = "0.4.2";
+/** Below this average TPS the Status page shows the TPS in the warning colour (a healthy server runs at 60). */
+export const LOW_TPS = 50;
+
+/**
+ * The Status page's TPS line (kernel 0.4.2 `status().perf`, the last minute): "59.9 avg, 52.0 min, physics 60". An older
+ * kernel doesn't measure it; a new server has nothing before its first whole second.
+ */
+export function perfText(perf: PerfSummary | undefined, kernelVersion: string): string {
+	if (perf === undefined) return versionLess(kernelVersion, PERF_KERNEL) ? `needs kernel ${PERF_KERNEL}` : "-";
+	const physics = perf.p !== undefined ? `, physics ${"%.0f".format(perf.p)}` : "";
+	return `${"%.1f".format(perf.a)} avg, ${"%.1f".format(perf.m)} min${physics}`;
+}
+
+/** The server runs slow: its average TPS over the last minute is under LOW_TPS. */
+export function perfLow(perf: PerfSummary | undefined): boolean {
+	return perf !== undefined && perf.a < LOW_TPS;
 }
 
 /**

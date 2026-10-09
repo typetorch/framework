@@ -60,7 +60,7 @@ import { Layout, newLayout, sanitizeLayout } from "./layout";
 import { createWindowManager, PaneHost, PaneTab, PickItem, WindowManager } from "./panes";
 import { describeState } from "./state";
 import type { ArtifactNotes } from "./artifact-notes";
-import { analyticsText, badgeLevel, checkHealth, detachedText, errorsFailing, errorsText, fleetFailing, fleetText, HealthIssue, HealthLevel, healthLimitsText, ServerFacts, settingsText } from "./health";
+import { analyticsText, badgeLevel, checkHealth, detachedText, errorsFailing, errorsText, fleetFailing, fleetText, HealthIssue, HealthLevel, healthLimitsText, perfLow, perfText, ServerFacts, settingsText } from "./health";
 import { renderBudgetTab } from "./budget-ui";
 import { NEEDS_KERNEL_AB } from "./ab";
 import {
@@ -928,6 +928,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				}
 			}
 			body.field("Players", `${status.players}/${status.maxPlayers}`);
+			// Kernel 0.4.2: server TPS over the last minute (average, slowest second), next to memory; warn below 50.
+			body.field("TPS", perfText(status.perf, str(status.kernelVersion)), perfLow(status.perf) ? COLORS.warn : COLORS.text);
 			body.field("Memory", typeIs(status.memoryMb, "number") ? "%.0f MB".format(status.memoryMb) : "-");
 			body.field("Lua heap", typeIs(status.luaHeapKb, "number") ? "%.1f MB".format(status.luaHeapKb / 1024) : "-");
 			body.field("Registry seq", str(status.appliedSeq));
