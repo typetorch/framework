@@ -145,7 +145,11 @@ const UPLOAD_ERRORS: Record<string, string> = {
 	needs_pairing: "Pair in the Claude tab first",
 	not_connected: "Pair in the Claude tab first",
 	not_allowed: "Pair in the Claude tab first",
-	prod_channel: "Dev servers only",
+	// claude-access.ts ClaudeRefusal (prod_channel: a server generation before 0.4.1).
+	dev_branch_only: "Dev branch only",
+	owner_switch_only: "Owner-switched servers only",
+	owners_only: "Owners only on public servers",
+	prod_channel: "Dev branch only",
 	rate_limited: "Slow down",
 	player_gone: "That player left",
 	no_reply: "No reply from that player",

@@ -1,6 +1,6 @@
 import { AssetService, CollectionService, HttpService, Workspace } from "@rbxts/services";
 import { $print, $warn } from "rbxts-transform-debug";
-import type { Channel } from "../kernel";
+import type { ClaudeRefusal } from "./claude-access";
 import { resolveGamePath, toJson } from "./claude-tools";
 import type { ClaudeToolboxApproval, ClaudeToolboxInsert, ClaudeToolboxOptions, ClaudeToolboxTile, ClaudeToolboxType } from "./protocol";
 import { leftovers, sanitizeAsset, scanAsset, type AssetScan } from "./toolbox-sanitize";
@@ -12,7 +12,8 @@ declare const SecurityCapabilities: SecurityCapabilitiesConstructor;
  * Creator Store inserts into the requesting dev's live server (plans/14 "toolbox_insert"), run by claude.ts for a
  * game-tool request of the dev machine. Server only.
  *
- *   1. dev channel only (prod servers never get runtime third-party content from a chat);
+ *   1. only where the requesting dev may use Claude (claude-access.ts: dev rules, or an owner on a public server an
+ *      owner switched to a dev branch); prod servers never get runtime third-party content from a chat;
  *   2. the prompt must be one this server forwarded with the "Toolbox" chip (ToolboxGate.isAllowed), and the asset id
  *      must be in a toolbox_results event this server relayed for the conversation (ToolboxGate.fromSearch);
  *   3. load into nothing: Models and MeshParts through AssetService:LoadAssetAsync (sandboxed, no capabilities; needs
@@ -383,10 +384,11 @@ export interface ToolboxAsk {
 export interface ToolboxInsertDeps {
 	gate: ToolboxGate;
 	store: ToolboxStore;
-	channel: () => Channel;
+	/** Why `player` may not use Claude here (claude-access.ts), or undefined. */
+	refusal: (player: Player) => ClaudeRefusal | undefined;
 	/** Shows the approval card to the requesting dev and yields: "insert" | "deny" | "timeout", with the card's options. */
 	ask: (player: Player, card: ToolboxAsk) => LuaTuple<[decision: string, options: ClaudeToolboxOptions | undefined]>;
-	/** The requester is still in this server, still a dev, and the server still dev-channel. */
+	/** The requester is still in this server, still a dev, and still allowed to use Claude here. */
 	stillAllowed: (player: Player) => boolean;
 	/** Tests and spikes: replaces AssetService:LoadAssetAsync. */
 	load?: (id: number) => Instance | undefined;
@@ -410,7 +412,10 @@ function warningsFor(args: InsertArgs, scan: AssetScan | undefined): string[] {
  */
 export function toolboxInsert(player: Player, request: Record<string, unknown>, deps: ToolboxInsertDeps): ToolboxAnswer {
 	const started = os.clock();
-	if (deps.channel() !== "dev") return { ok: false, error: "prod_channel: inserts happen only on dev-channel servers." };
+	const refused = deps.refusal(player);
+	if (refused !== undefined) {
+		return { ok: false, error: `${refused}: inserts happen only where this developer may use Claude (dev rules, or an owner on a public server an owner switched to a dev branch).` };
+	}
 	const promptId = request.promptId;
 	if (!isServerId(promptId) || !deps.gate.isAllowed(promptId)) {
 		return { ok: false, error: "toolbox_not_selected: Toolbox is not selected for this message. Ask the developer to pick Toolbox in the + menu and send again." };
@@ -498,9 +503,9 @@ export function toolboxInsert(player: Player, request: Record<string, unknown>, 
 		$print(`[claude] toolbox_insert ${args.id} for ${player.Name} ${decision === "timeout" ? "timed out" : "denied"}`);
 		return { ok: false, denied: true, error: decision === "timeout" ? "no answer within 60 s" : "denied", output: [] };
 	}
-	if (!deps.stillAllowed(player) || deps.channel() !== "dev") {
+	if (!deps.stillAllowed(player) || deps.refusal(player) !== undefined) {
 		root.Destroy();
-		return { ok: false, error: "the developer is no longer a dev in this server" };
+		return { ok: false, error: "the developer may no longer use Claude in this server" };
 	}
 	const anchor = options ? options.anchor : args.anchor;
 	const keepScripts = options?.keepScripts === true && scan !== undefined && scan.keepableCount > 0;
@@ -584,9 +589,9 @@ function findInsert(insertId: string): Instance | undefined {
 	return undefined;
 }
 
-/** Op "claude.toolboxRemove": only the dev who inserted it, only on a dev-channel server. */
-export function removeToolboxInsert(player: Player, insertId: unknown, store: ToolboxStore, channel: Channel): { ok: boolean; error?: string } {
-	if (channel !== "dev") return { ok: false, error: "prod_channel" };
+/** Op "claude.toolboxRemove": only the dev who inserted it, only where they may use Claude (`refusal` undefined). */
+export function removeToolboxInsert(player: Player, insertId: unknown, store: ToolboxStore, refusal: ClaudeRefusal | undefined): { ok: boolean; error?: string } {
+	if (refusal !== undefined) return { ok: false, error: refusal };
 	if (!typeIs(insertId, "string") || insertId.size() > 32 || insertId.match("^%x+$")[0] === undefined) return { ok: false, error: "bad_request" };
 	const record = store.inserts.find((insert) => insert.insertId === insertId);
 	if (!record || record.user !== player.UserId) return { ok: false, error: "not_found" };

@@ -1,7 +1,7 @@
 import { DataStoreService, HttpService, MessagingService, Players, TeleportService, TextService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
-import { branchChannelOf, normalRole, type Channel, type NewServerReport, type Role, type ServerKernel, type ServerType } from "../kernel";
+import { branchChannelOf, devRoleOf, type Channel, type NewServerReport, type Role, type ServerKernel, type ServerType } from "../kernel";
 import { countBudget } from "../budget";
 import { RateLimiter } from "../net/limits";
 import { AB_KERNEL, AbReply, kernelHasExperiments, NEEDS_KERNEL_AB, PIN_JOBS_PER_MESSAGE, PIN_TOPIC, PinMessage } from "./ab";
@@ -299,11 +299,7 @@ export function registerAdminOps(
 	const jobLabel = game.JobId !== "" ? game.JobId : "studio";
 	const jobKey = game.JobId !== "" ? game.JobId.gsub("-", "")[0].sub(1, 24) : "studio";
 
-	const roleOf = (player: Player): AdminRole | undefined => {
-		const [ok, info] = pcall(() => kernel.devInfo(player));
-		if (!ok || !typeIs(info, "table") || info.dev !== true) return undefined;
-		return normalRole(info.role);
-	};
+	const roleOf = (player: Player): AdminRole | undefined => devRoleOf(kernel, player);
 
 	const actorOf = (player: Player): Actor => {
 		// The dispatcher checks this too; re-checked so these ops stay dev-only wherever they are registered.

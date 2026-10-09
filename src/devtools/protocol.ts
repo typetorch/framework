@@ -87,6 +87,11 @@ export interface ClaudeSessionView {
 	/** First 8 characters of the session id. */
 	label: string;
 	requests: ClaudeRequestView[];
+	/**
+	 * Framework 0.4.1: why this player may not use Claude here (claude-access.ts ClaudeRefusal: "dev_branch_only",
+	 * "owner_switch_only", "owners_only"); absent when they may.
+	 */
+	refused?: string;
 }
 
 /** live: act on this server (run_luau with approval), no file edits; code: edit the branch, deploy after approval. */

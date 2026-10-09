@@ -35,13 +35,15 @@ import type {
 	DevOp,
 } from "./protocol";
 import { CLAUDE_IMAGE_CHUNK, MAX_STROKES_JSON, cleanAttachmentIds, cleanCrop, cleanImageMeta, cleanStrokes, decodeImageChunk } from "./claude-images";
+import { ClaudeGate } from "./claude-access";
 import { ToolboxGate, cleanTiles, insertsFor, newToolboxStore, removeToolboxInsert, toolboxInsert, type ToolboxAsk, type ToolboxStore } from "./toolbox-server";
 import { CODE_ALPHABET, CODE_LENGTH, CODE_SECRET_LENGTH, codeFingerprint, sha256 } from "./sha256";
 import { FRAMEWORK_VERSION } from "../version";
 
 /**
  * Game side of `typetorch remote-claude` (plans/11). A dev's machine announces a session over MessagingService; this
- * server keeps it only when its effective channel is "dev" and its branch is the session branch, and forwards prompts.
+ * server keeps it only when Claude may work here (claude-access.ts: dev rules, or a public server an owner switched to
+ * a dev branch, where only owners use it) and its branch is the session branch, and forwards prompts.
  *
  * AUTH (pairing, no Roblox Secrets Store): a dev pastes the pairing code printed by typetorch-dev-server into the
  * Claude tab (op `claude.pair`). The server trades it at `POST {url}/v1/token` `{grant: "code", sid, user, job,
@@ -60,9 +62,9 @@ import { FRAMEWORK_VERSION } from "../version";
  *
  * GAME TOOLS: Claude's game tools (run_luau, game_logs, inspect, find, game_status) act on the server that sent the
  * prompt. The dev machine publishes a wake message on TypeTorch/tool {v, s, j, x, u} (no code); this server also
- * polls GET /v1/game/pending while a dev's prompt runs. A request is served only when: this server's effective channel
- * is "dev", j is this server's JobId, s is the session, u is in the session's users, is in this server, is still a
- * dev and is paired here. The request itself is fetched with that user's token (the dev machine checks user AND job).
+ * polls GET /v1/game/pending while a dev's prompt runs. A request is served only when: Claude may work here for u
+ * (claude-access.ts), j is this server's JobId, s is the session, u is in the session's users, is in this server, is
+ * still a dev and is paired here. The request itself is fetched with that user's token (the dev machine checks user AND job).
  *
  * TRANSPORT (2026-10-04): one HTTP long-poll per paired dev, GET /v1/game/poll?since=<cursor> (held up to 20 s by the
  * dev machine), carries the streamed events of the prompts this server sent plus the tool requests for this JobId.
@@ -408,6 +410,13 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	const pairings = store.pairings;
 	if (store.toolbox === undefined) store.toolbox = newToolboxStore();
 	const toolboxStore = store.toolbox;
+	/** Who may use Claude here (claude-access.ts): every gate below asks it. */
+	const gate = new ClaudeGate(kernel);
+	/** The refusal for `player` as a dev op failure, or undefined when they may use Claude here. */
+	const refused = (player: Player): Failure | undefined => {
+		const why = gate.refusal(player);
+		return why !== undefined ? fail(why) : undefined;
+	};
 	/** Gate 2 of plans/14: prompts this server sent with the Toolbox chip, and the ids their searches returned. */
 	const toolboxGate = new ToolboxGate(toolboxStore);
 	/** Remembers the asset ids of relayed toolbox_results events for the prompt's conversation. */
@@ -453,10 +462,23 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	};
 
 	const usable = (session: Session | undefined): session is Session =>
-		session !== undefined && kernel.channel === "dev" && session.branch === kernel.branch;
+		session !== undefined && gate.serverOpen() && session.branch === kernel.branch;
 
-	// A session for another branch (the server switched branches) or a prod-channel generation is dropped.
+	/** An owner in this server may use Claude here and holds a pairing for session sid. */
+	const ownerPairedTo = (sid: string) => {
+		for (const [userId, pairing] of pairings) {
+			if (pairing.sid !== sid) continue;
+			const player = Players.GetPlayerByUserId(userId);
+			if (player !== undefined && gate.refusal(player) === undefined) return true;
+		}
+		return false;
+	};
+
+	// A session for another branch (the server switched branches) or a server Claude can't work on is dropped.
 	if (store.session && !usable(store.session)) store.session = undefined;
+	// A public server an owner switched to a dev branch keeps a session across swaps only while an owner here is paired
+	// to it (the next announcement or the shared copy brings it back otherwise).
+	if (store.session && gate.ownersOnly() && !ownerPairedTo(store.session.sid)) store.session = undefined;
 	// A session kept by an older generation: only a tunnel URL, and its sid stays bound to that URL.
 	if (store.session && cleanUrl(store.session.url) === undefined) store.session = undefined;
 	if (store.session && !boundUrls.has(store.session.sid)) boundUrls.set(store.session.sid, store.session.url);
@@ -507,8 +529,8 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		const branch = message.b;
 		const exp = message.exp;
 		if (!typeIs(branch, "string") || branch.size() > 64 || !typeIs(exp, "number") || url === undefined) return;
-		// Only dev-channel servers on the session branch keep it; everyone else drops it unread.
-		if (kernel.channel !== "dev" || branch !== kernel.branch || exp <= os.time()) return;
+		// Only servers Claude may work on, on the session branch, keep it; everyone else drops it unread.
+		if (!gate.serverOpen() || branch !== kernel.branch || exp <= os.time()) return;
 		if (!typeIs(message.u, "table")) return;
 		// A session id keeps the first URL heard for it: a re-announcement with another URL is ignored, never followed.
 		const bound = boundUrls.get(sid);
@@ -545,7 +567,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		if (fresh && fromBroadcast) shareSession({ v: 1, s: sid, b: branch, u: users, url, exp });
 	};
 
-	if (kernel.channel === "dev") {
+	if (gate.serverOpen()) {
 		let stopped = false;
 		let connection: RBXScriptConnection | undefined;
 		trove.add(() => {
@@ -746,7 +768,12 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	};
 
 	// Ops -------------------------------------------------------------------------------------------------------------
+	// Whether the player may use Claude here: the tab asks first when the rules aren't dev (claude-ui.ts).
+	ops.set("claude.access", (player) => refused(player) ?? { ok: true });
+
 	ops.set("claude.session", (player): ClaudeSessionView => {
+		const why = gate.refusal(player);
+		if (why !== undefined) return { available: false, allowed: false, branch: kernel.branch, label: "", requests: [], refused: why };
 		lastSeen.set(player.UserId, os.clock());
 		const session = activeSession();
 		if (!session) {
@@ -772,7 +799,8 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 
 	// Pairing: trade the code printed by typetorch-dev-server for this player's tokens. The code is never logged.
 	ops.set("claude.pair", (player, payload) => {
-		if (kernel.channel !== "dev") return fail("prod_channel");
+		const refusal = refused(player);
+		if (refusal) return refusal;
 		let session = activeSession();
 		if (!session) return fail("not_connected");
 		if (!session.users.includes(player.UserId)) return fail("not_allowed");
@@ -833,7 +861,8 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	});
 
 	ops.set("claude.prompt", (player, payload) => {
-		if (kernel.channel !== "dev") return fail("prod_channel");
+		const refusal = refused(player);
+		if (refusal) return refusal;
 		const session = activeSession();
 		if (!session) return fail("not_connected");
 		if (!session.users.includes(player.UserId)) return fail("not_allowed");
@@ -922,7 +951,6 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 
 	// The requester's Deploy / Discard for a code change (the dev machine checks the requester and the proposal).
 	ops.set("claude.deploy", (player, payload) => {
-		if (kernel.channel !== "dev") return fail("prod_channel");
 		const session = chatSession(player);
 		if (isFailure(session)) return session;
 		const request = (typeIs(payload, "table") ? payload : {}) as { id?: unknown; decision?: unknown };
@@ -935,6 +963,8 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	});
 
 	ops.set("claude.status", (player, payload) => {
+		const refusal = refused(player);
+		if (refusal) return refusal;
 		const session = activeSession();
 		if (!session) return fail("not_connected");
 		if (!session.users.includes(player.UserId)) return fail("not_allowed");
@@ -948,7 +978,8 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	});
 
 	ops.set("claude.cancel", (player, payload) => {
-		if (kernel.channel !== "dev") return fail("prod_channel");
+		const refusal = refused(player);
+		if (refusal) return refusal;
 		const session = activeSession();
 		if (!session) return fail("not_connected");
 		const record = find(session, payload);
@@ -963,6 +994,8 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	});
 	// Chat ------------------------------------------------------------------------------------------------------------
 	const chatSession = (player: Player): Session | Failure => {
+		const refusal = refused(player);
+		if (refusal) return refusal;
 		const session = activeSession();
 		if (!session) return fail("not_connected");
 		if (!session.users.includes(player.UserId)) return fail("not_allowed");
@@ -1142,7 +1175,6 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	// downloaded there). `strokes` are the dev's marks (claude-images.ts cleanStrokes: counts, finite 0..1, rounded), at
 	// most MAX_STROKES_JSON of JSON; the dev machine draws them onto the capture before the crop.
 	ops.set("claude.attach", (player, payload) => {
-		if (kernel.channel !== "dev") return fail("prod_channel");
 		const session = chatSession(player);
 		if (isFailure(session)) return session;
 		lastSeen.set(player.UserId, os.clock());
@@ -1186,7 +1218,6 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	// An image Claude showed: fetched from the dev machine in chunks and pushed only to this player (CLAUDE_IMAGE_CHUNK,
 	// paced). The dev machine serves it only to the prompt's requester on this server (the token's user and job).
 	ops.set("claude.image", (player, payload) => {
-		if (kernel.channel !== "dev") return fail("prod_channel");
 		const session = chatSession(player);
 		if (isFailure(session)) return session;
 		const id = typeIs(payload, "table") ? (payload as { id?: unknown }).id : payload;
@@ -1287,11 +1318,11 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		return { ok: true };
 	});
 
-	// The inserted card's Remove: only the dev who inserted it, only on a dev-channel server.
+	// The inserted card's Remove: only the dev who inserted it, only where they may use Claude.
 	ops.set("claude.toolboxRemove", (player, payload) => {
 		const request = (typeIs(payload, "table") ? payload : {}) as { insertId?: unknown };
 		if (!kernel.isDev(player)) return fail("not_allowed");
-		return removeToolboxInsert(player, request.insertId, toolboxStore, kernel.channel);
+		return removeToolboxInsert(player, request.insertId, toolboxStore, gate.refusal(player));
 	});
 
 	// Client-realm requests to the dev's own client (inspect / find on their DataModel).
@@ -1438,14 +1469,15 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 			return { ok: true, data: HttpService.JSONEncode({ captureTime: math.floor(shot.captureTime), localId, placeId: game.PlaceId }) };
 		}
 		if (tool === "toolbox_insert") {
-			// Creator Store insert (plans/14): chip-gated prompt, id from this conversation's relayed search, dev channel,
-			// a per-insert approval card (no "always"), load into nothing, sanitize, then parent (toolbox-server.ts).
+			// Creator Store insert (plans/14): chip-gated prompt, id from this conversation's relayed search, Claude allowed
+			// here for the dev (claude-access.ts), a per-insert approval card (no "always"), load into nothing, sanitize,
+			// then parent (toolbox-server.ts).
 			return toolboxInsert(player, request, {
 				gate: toolboxGate,
 				store: toolboxStore,
-				channel: () => kernel.channel,
+				refusal: (target) => gate.refusal(target),
 				ask: (target, card) => askToolbox(target.UserId, card),
-				stillAllowed: (target) => target.Parent !== undefined && kernel.isDev(target) && kernel.channel === "dev",
+				stillAllowed: (target) => target.Parent !== undefined && kernel.isDev(target) && gate.refusal(target) === undefined,
 			});
 		}
 		if (tool === "run_luau") {
@@ -1466,7 +1498,9 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 				}
 			}
 			// The requester may have left or lost dev access while deciding.
-			if (player.Parent === undefined || !kernel.isDev(player) || kernel.channel !== "dev") return { ok: false, error: "the developer is no longer a dev in this server" };
+			if (player.Parent === undefined || !kernel.isDev(player) || gate.refusal(player) !== undefined) {
+				return { ok: false, error: "the developer may no longer use Claude in this server" };
+			}
 			// Only `player`: no kernel, no persist store (refresh tokens live there), and a guarded game (claude-tools.ts).
 			const result = runLuau(code, { player }, timeoutSeconds);
 			$print(`[claude] run_luau for ${player.Name}: ${description} -> ${result.ok ? "ok" : "error"} (${result.ms} ms)`);
@@ -1496,11 +1530,15 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		answerRequest(session, player, fetched.data as Record<string, unknown>);
 	};
 
-	/** Who may use the game tools here right now: the session's user, in this server, a dev, paired here. */
+	/**
+	 * Who may use the game tools here right now: the session's user, in this server, a dev, allowed to use Claude here
+	 * (an owner on a public server an owner switched; claude-access.ts), paired here. The long-polls and the wake
+	 * messages serve only such players.
+	 */
 	const toolPlayer = (session: Session, userId: number): Player | undefined => {
-		if (kernel.channel !== "dev" || !session.users.includes(userId)) return undefined;
+		if (!gate.serverOpen() || !session.users.includes(userId)) return undefined;
 		const player = Players.GetPlayerByUserId(userId);
-		if (!player || !kernel.isDev(player) || !isPaired(session, userId)) return undefined;
+		if (!player || !kernel.isDev(player) || gate.refusal(player) !== undefined || !isPaired(session, userId)) return undefined;
 		return player;
 	};
 
@@ -1584,13 +1622,14 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 	};
 
 	// Logs > Upload (no Claude, no prompt quota): the logs a dev sees go to the paired dev PC, which saves them as
-	// <repo>/.typetorch/logs/<time>-<branch>-<job8>-<kind>.log (POST /v1/logs). The chat's pairing, so dev-channel
-	// servers only. Server: this server's log ring; client: the dev's own client logs (sent by that client, capped again
+	// <repo>/.typetorch/logs/<time>-<branch>-<job8>-<kind>.log (POST /v1/logs). The chat's pairing, so only where the
+	// dev may use Claude. Server: this server's log ring; client: the dev's own client logs (sent by that client, capped again
 	// here); player: another player's client logs through the Logs > Others path. Log text is untrusted (names, chat):
 	// never printed here; the dev machine writes it to the file only.
 	const uploads = new Map<number, number[]>();
 	ops.set("logs.upload", (player, payload) => {
-		if (kernel.channel !== "dev") return fail("prod_channel");
+		const refusal = refused(player);
+		if (refusal) return refusal;
 		const session = activeSession();
 		if (!session) return fail("not_connected");
 		if (!session.users.includes(player.UserId)) return fail("not_allowed");
@@ -1639,7 +1678,7 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 		return { ok: true, lines: shortNumber(reply.lines) };
 	});
 
-	if (kernel.channel === "dev") {
+	if (gate.serverOpen()) {
 		let stopped = false;
 		let toolConnection: RBXScriptConnection | undefined;
 		trove.add(() => {

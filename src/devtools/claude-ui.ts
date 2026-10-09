@@ -1,6 +1,7 @@
 import { GuiService, HttpService, Players, TextService, UserInputService } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import type { ClientKernel } from "../kernel";
+import { branchChannelOf, rulesOf } from "../kernel";
 import { popIn, popOut } from "../ui";
 import type {
 	ClaudeApproval,
@@ -105,7 +106,11 @@ const ERRORS: Record<string, string> = {
 	code_busy: "Another code change is pending",
 	already_decided: "Already decided",
 	not_allowed: "Not on the session's user list",
-	prod_channel: "Claude works on dev-channel servers only",
+	// Who may use Claude here (claude-access.ts ClaudeRefusal); prod_channel: a server generation before 0.4.1.
+	dev_branch_only: "Claude: dev branch only",
+	owner_switch_only: "Claude: owner-switched servers only",
+	owners_only: "Claude: owners only on public servers",
+	prod_channel: "Claude: dev branch only",
 	busy: "Wait for the running prompt",
 	rate_limited: "Too many tries, wait a bit",
 	empty: "Write a message first",
@@ -778,12 +783,39 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		content.Visible = true;
 	});
 
-	if (kernel.channel !== "dev") {
-		const note = label(errorText("prod_channel"), COLORS.dim, SMALL, false);
+	// Who may use Claude here (claude-access.ts): under dev rules every dev, as before. Under prod rules only a public
+	// server on a dev branch an owner switched to, for owners: the server says (op "claude.access") and re-checks every
+	// op. Everything else is refused here at once.
+	if (rulesOf(kernel) !== "dev") {
+		const askServer = branchChannelOf(kernel) === "dev" && kernel.serverType === "public";
+		const note = label(askServer ? "Checking..." : errorText("dev_branch_only"), COLORS.dim, SMALL, false);
 		pad(note, 12, 12);
 		note.Parent = host;
+		if (!askServer) return;
+		let closed = false;
+		trove.add(() => {
+			closed = true;
+		});
+		trove.add(
+			task.spawn(() => {
+				const [ok, reply] = call("claude.access");
+				if (closed) return;
+				const answer = (typeIs(reply, "table") ? reply : {}) as { ok?: boolean; error?: unknown };
+				if (ok && answer.ok === true) {
+					note.Destroy();
+					buildClaudeChat(tab, deps, host, state);
+				} else note.Text = errorText(ok ? answer.error : reply);
+			}),
+		);
 		return;
 	}
+	buildClaudeChat(tab, deps, host, state);
+}
+
+/** The chat itself, once Claude may be used here (renderClaudeChat). */
+function buildClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps, host: Frame, state: ChatState) {
+	const { kernel, call } = deps;
+	const trove = tab.trove;
 
 	/** Runs `work` in its own thread (dev ops yield), inside the tab's trove. */
 	let notify: (text: string, color?: Color3) => void = () => {};
@@ -2410,7 +2442,11 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		}
 		const session = reply as ClaudeSessionView;
 		paired = session.available && session.allowed && session.paired === true;
-		if (!session.available && session.searching) {
+		if (session.refused !== undefined) {
+			// No longer allowed here (an owner lost the role, or the server left its owner-switched dev branch).
+			status.Text = errorText(session.refused);
+			status.TextColor3 = COLORS.warn;
+		} else if (!session.available && session.searching) {
 			status.Text = "Looking for the dev server...";
 			status.TextColor3 = COLORS.dim;
 		} else if (!session.available) {
@@ -2431,7 +2467,8 @@ export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 		newButton.Visible = paired;
 		statusChevron.Visible = paired;
 		if (!paired) chats.Visible = false;
-		if (!session.available && !session.searching) notify(errorText("not_connected"), COLORS.warn);
+		if (session.refused !== undefined) notify(errorText(session.refused), COLORS.warn);
+		else if (!session.available && !session.searching) notify(errorText("not_connected"), COLORS.warn);
 		else if (!session.available) notify("");
 		else if (!session.allowed) notify(errorText("not_allowed"), COLORS.warn);
 		else if (notice.Text === errorText("not_connected") || notice.Text === errorText("not_allowed")) notify("");

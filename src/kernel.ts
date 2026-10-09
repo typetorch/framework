@@ -170,6 +170,16 @@ export function normalRole(role: unknown): Role | undefined {
 	return typeIs(role, "string") ? "dev" : undefined;
 }
 
+/**
+ * A player's role as the kernel decides it now (server): undefined unless a dev. Manage (admin-server.ts) and Claude
+ * (claude-access.ts) ask through this one check; a failing devInfo counts as no role.
+ */
+export function devRoleOf(kernel: { devInfo(player: Player): DevInfo }, player: Player): Role | undefined {
+	const [ok, info] = pcall(() => kernel.devInfo(player));
+	if (!ok || !typeIs(info, "table") || info.dev !== true) return undefined;
+	return normalRole(info.role);
+}
+
 export interface DevInfo {
 	dev: boolean;
 	/** Why: "studio", "owner", "member", "badge", "revoked", "none". */
