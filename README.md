@@ -152,8 +152,14 @@ export class CoinService extends Module implements OnStart {
 - **Dev menu:** devs (Studio, project members, dev badge) get a DEV button, `Ctrl+Shift+D` and `/tt dev`: artifact
   (with how long the server and client generations have run, the server's uptime and the build's age), server status,
   logs (server, own client, other players' clients), client and server dex, network stats, module state, a branch and
-  build picker (Server > Branch) and a Claude prompt. Prod-channel servers are read-only. The window can be dragged by
-  its header and resized from its corner (double-tap the header to reset).
+  build picker (Server > Branch) and a Claude prompt. The sidebar, top to bottom: Server, Network, Modules, Manage,
+  Artifact, Logs, Dex, Claude. The window can be dragged by its header and resized from its corner (double-tap the
+  header to reset).
+- **Dev-only tools (framework 0.4.1, `devtools/access.ts`):** Claude, Logs > Upload, Dex edits on the server, Network
+  packet blocking and the hot-swap sound work under dev rules (private, reserved and Studio servers on a dev branch)
+  for every dev, and on a public server an owner switched to a dev branch (Server > Branch) for owners only. Everywhere
+  else the menu is read-only, with a short reason: "Dev branch only", "Owners only on public servers", "Owner-switched
+  servers only". The rules themselves don't change (`TypeTorch.channel`, signatures, owner-only rollbacks).
 - **Panes and windows (dev menu):** every page shows in a pane with a small header: tap the title to pick another
   page, or use Split right, Split down, Open in new window and Close. Drag the line between two panes to resize them.
   The sidebar opens pages in the focused pane (the highlighted one; tap a pane to focus it). Floating windows move by
@@ -171,8 +177,8 @@ export class CoinService extends Module implements OnStart {
   strings (cut), numbers, booleans, nil, datatypes through `tostring`, an Instance as its full path, a Player as its
   name, `function`, `thread`, buffer sizes. Nothing is ever called (raw reads only: no metamethods, no getters); a
   value that is its own ancestor shows as a cycle. A key filter (open nodes stay listed), Refresh and Auto (every 2 s).
-  Server state comes from the op `state.inspect` (rate-limited, size-capped): devs on dev-channel servers, owners only
-  on prod-effective servers, since server state can hold player data.
+  Server state comes from the op `state.inspect` (rate-limited, size-capped): owners everywhere, other devs where the
+  dev-only tools are open to them, since server state can hold player data.
 - **Logs > Upload:** sends the logs shown (Server: this server's log ring; Client: your own client's; Others: the
   picked player's client) to the dev PC paired in the Claude tab, which saves them under `<repo>/.typetorch/logs/`.
   No Claude run, no prompt quota. Not paired: "Pair in the Claude tab first".
@@ -182,11 +188,12 @@ export class CoinService extends Module implements OnStart {
   verified head). A public switch lasts for that server's lifetime and is never stored, so new servers still boot the
   signed prod head. Others see "Join", which moves only them to a reserved server. Manage > Servers "Load a build..."
   does the same for this server, the ticked servers or a share of one branch (A/B pins), with one status line under
-  the list.
+  the list. A public server an owner switched to a dev branch opens the dev-only tools (Claude too) to owners.
 - **Owners and devs:** two roles (no admins: an older kernel's or typetorch.json's "admin" counts as a dev). The Manage
   group (Players, Servers, Bans) is for owners only.
-- **Remote Claude** (dev-channel servers only): while `typetorch remote-claude` (`@typetorch/dev-server`) runs on a dev's machine, allowlisted
-  devs prompt Claude Code from the Claude tab. Each dev pairs once by pasting the pairing code printed by
+- **Remote Claude** (a dev-only tool: dev rules, or owners on a public server an owner switched to a dev branch):
+  while `typetorch remote-claude` (`@typetorch/dev-server`) runs on a dev's machine, allowlisted devs prompt Claude
+  Code from the Claude tab. Each dev pairs once by pasting the pairing code printed by
   typetorch-dev-server; the game server keeps the session URL and the tokens in memory and never sends them to clients.
   No Roblox secret is needed.
 
