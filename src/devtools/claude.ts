@@ -63,8 +63,8 @@ import { FRAMEWORK_VERSION } from "../version";
  * GAME TOOLS: Claude's game tools (run_luau, game_logs, inspect, find, game_status) act on the server that sent the
  * prompt. The dev machine publishes a wake message on TypeTorch/tool {v, s, j, x, u} (no code); this server also
  * polls GET /v1/game/pending while a dev's prompt runs. A request is served only when: Claude may work here for u
- * (access.ts), j is this server's JobId, s is the session, u is in the session's users, is in this server, is
- * still a dev and is paired here. The request itself is fetched with that user's token (the dev machine checks user AND job).
+ * (access.ts), j is this server's JobId, s is the session, u is in the session's users, is in this server, is still a
+ * dev and is paired here. The request itself is fetched with that user's token (the dev machine checks user AND job).
  *
  * TRANSPORT (2026-10-04): one HTTP long-poll per paired dev, GET /v1/game/poll?since=<cursor> (held up to 20 s by the
  * dev machine), carries the streamed events of the prompts this server sent plus the tool requests for this JobId.
@@ -1622,9 +1622,9 @@ export function registerRemoteClaude(kernel: ServerKernel, trove: Trove, ops: Ma
 
 	// Logs > Upload (no Claude, no prompt quota): the logs a dev sees go to the paired dev PC, which saves them as
 	// <repo>/.typetorch/logs/<time>-<branch>-<job8>-<kind>.log (POST /v1/logs). The chat's pairing, so only where the
-	// dev may use Claude. Server: this server's log ring; client: the dev's own client logs (sent by that client, capped again
-	// here); player: another player's client logs through the Logs > Others path. Log text is untrusted (names, chat):
-	// never printed here; the dev machine writes it to the file only.
+	// dev may use Claude (access.ts). Server: this server's log ring; client: the dev's own client logs (sent by that
+	// client, capped again here); player: another player's client logs through the Logs > Others path. Log text is
+	// untrusted (names, chat): never printed here; the dev machine writes it to the file only.
 	const uploads = new Map<number, number[]>();
 	ops.set("logs.upload", (player, payload) => {
 		const refusal = refused(player);
