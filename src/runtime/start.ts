@@ -24,6 +24,7 @@ import { bindTypeTorch, closeTypeTorch, startedTypeTorch, swapOutTypeTorch, Type
 import { addModuleInstance, createLazy, isLazyTypeId, LAZY_PARAMETER, nameOfId, setModulePhase } from "./dependency";
 import { bindPlayerStates, playerState as openPlayerState } from "./player-state";
 import { persistKeys, RegisteredModule, registered, runningModules } from "./registry";
+import { cleanTrove, stopStep } from "./safe-clean";
 
 export interface StartOptions {
 	/** Folders whose ModuleScripts are required (recursively) so their @Service / @Controller classes register. */
@@ -204,10 +205,21 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 				const [ok, err] = pcall(() => (running.instance as OnStop).onStop());
 				if (!ok) $warn(`${running.name}.onStop threw: ${err}`);
 			}
-			root.remove(running.trove);
+			// Object by object, each pcalled: a cleanup that throws (e.g. trove.remove inside a cleanup) can't skip the
+			// rest of this module, the modules after it, or the rest of the stop.
+			cleanTrove(running.trove, running.name);
+			stopStep(`${running.name} trove`, () => root.remove(running.trove));
 		}
 		runningModules.clear();
 		setModulePhase("stopped");
+	};
+	/** Every step runs even when an earlier one throws (each warns), so a bad cleanup can't keep a dead generation alive. */
+	const stopGeneration = () => {
+		stopStep("stopping modules", stopModules);
+		stopStep("stopping the network", stopNetwork);
+		stopStep("unbinding TypeTorch", unbindTypeTorch);
+		cleanTrove(root, "TypeTorch generation");
+		stopStep("destroying the generation trove", () => root.destroy());
 	};
 
 	setModulePhase("constructing");
@@ -243,10 +255,7 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 		}
 	});
 	if (!initialized) {
-		stopModules();
-		stopNetwork();
-		unbindTypeTorch();
-		root.destroy();
+		stopGeneration();
 		error(`TypeTorch ${realm} failed to start: ${initError}`, 0);
 	}
 
@@ -299,11 +308,8 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 
 	return (info?: SwapOutInfo) => {
 		// TypeTorch.onSwapOut first, while every module still runs (so they can save into persist).
-		swapOutTypeTorch(info);
-		stopModules();
-		stopNetwork();
-		unbindTypeTorch();
-		root.destroy();
+		stopStep("onSwapOut", () => swapOutTypeTorch(info));
+		stopGeneration();
 	};
 }
 

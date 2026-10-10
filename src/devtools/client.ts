@@ -417,6 +417,28 @@ export interface DevtoolsClient {
 }
 
 /**
+ * The channel in a Builds group heading: the branch's own channel, not its newest artifact's. A promoted prod artifact
+ * keeps channel "prod" on a dev branch, and the heading used to say "(prod)" until the next dev deploy flipped it back.
+ * This server's branch: `branchChannel` from its status (kernel 0.3.9); another branch: the branch list's
+ * `branchChannel` (kernel 0.5.2), else its `channel`. "dev, prod artifact" when the newest artifact differs.
+ */
+function buildsHeadingChannel(
+	branchName: string,
+	artifactChannel: Channel,
+	branches: BranchInfo[],
+	status: { branch?: string; channel?: Channel; rules?: Channel; branchChannel?: Channel } | undefined,
+): string {
+	let channel: Channel | undefined;
+	if (status !== undefined && status.branch === branchName && status.branchChannel !== undefined) channel = status.branchChannel;
+	if (channel === undefined) {
+		const info = branches.find((branch) => branch.name === branchName);
+		channel = info?.branchChannel ?? info?.channel;
+	}
+	if (channel === undefined || channel === artifactChannel) return artifactChannel;
+	return `${channel}, ${artifactChannel} artifact`;
+}
+
+/**
  * Kernel 0.3.9: "dev" for a dev branch, plus the rules when they are stricter ("dev (prod rules)": a dev branch on a
  * public server, read-only for non-owners). Older kernels report only the rules.
  */
@@ -432,7 +454,28 @@ function channelText(source: { channel?: Channel; rules?: Channel; branchChannel
  * removes it; the open state, tab, sub-tab, window rectangle and options survive the swap through the kernel persist
  * store.
  */
+const DEV_GUI_NAME = "TypeTorchDev";
+/** The client generation that built a dev menu gui (an attribute on the ScreenGui). */
+const DEV_GUI_GENERATION = "TypeTorchGeneration";
+
+/**
+ * Destroys dev menus an older generation left behind. Its trove should have removed them, but a generation whose stop
+ * was cut short (a throwing cleanup, before framework 0.5.2) left its menu on screen, dead, over the new one.
+ * Menus without the attribute come from a framework before 0.5.2: always older, since this generation hasn't built one.
+ */
+function sweepStaleMenus(playerGui: Instance, generation: number) {
+	for (const child of playerGui.GetChildren()) {
+		if (child.Name !== DEV_GUI_NAME || !child.IsA("ScreenGui")) continue;
+		const built = child.GetAttribute(DEV_GUI_GENERATION);
+		if (typeIs(built, "number") && built >= generation) continue;
+		pcall(() => child.Destroy());
+	}
+}
+
 export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDispatcher, trove: Trove): DevtoolsClient {
+	// Before anything else, so a leaked menu goes away even for players who never get the dev menu.
+	const startGui = Players.LocalPlayer.FindFirstChildOfClass("PlayerGui");
+	if (startGui) sweepStaleMenus(startGui, kernel.generation);
 	const state = kernel.persist<MenuState>(PERSIST_KEY, () => ({ open: false, tab: "Artifact" }));
 	if (state.sub === undefined) state.sub = {};
 	const subs = state.sub;
@@ -539,7 +582,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				if (tool === "screenshot") {
 					// What the dev sees, without the dev menu; only the capture time leaves this client (the dev machine
 					// picks the file up on its PC).
-					const devGui = Players.LocalPlayer.FindFirstChildOfClass("PlayerGui")?.FindFirstChild("TypeTorchDev");
+					const devGui = Players.LocalPlayer.FindFirstChildOfClass("PlayerGui")?.FindFirstChild(DEV_GUI_NAME);
 					const taken = takeScreenshot(devGui !== undefined && devGui.IsA("ScreenGui") ? [devGui] : []);
 					if (!taken.ok) error(taken.error, 0);
 					return HttpService.JSONEncode({ captureTime: taken.value.captureTime, localId: taken.value.localId });
@@ -1474,7 +1517,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			}
 			for (const branchName of order) {
 				const group = groups.get(branchName)!;
-				const heading = body.text(`${branchName}  (${group[0].channel})`, COLORS.text);
+				const heading = body.text(`${branchName}  (${buildsHeadingChannel(branchName, group[0].channel, data.branches, status)})`, COLORS.text);
 				heading.Font = Enum.Font.BuilderSansBold;
 				const showAll = expanded.has(branchName);
 				group.forEach((entry, index) => {
@@ -1761,9 +1804,10 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	let open: () => void;
 	const build = (): Ui => {
 		const playerGui = Players.LocalPlayer.WaitForChild("PlayerGui");
+		sweepStaleMenus(playerGui, kernel.generation);
 		const gui = trove.add(
 			make("ScreenGui", {
-				Name: "TypeTorchDev",
+				Name: DEV_GUI_NAME,
 				ResetOnSpawn: false,
 				// Above the kernel's holding screen (which covers every game UI), so the menu opens while "Starting..." shows.
 				DisplayOrder: DEV_MENU_DISPLAY_ORDER,
@@ -1771,6 +1815,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 				ZIndexBehavior: Enum.ZIndexBehavior.Sibling,
 			}),
 		);
+		gui.SetAttribute(DEV_GUI_GENERATION, kernel.generation);
 		const toggle = style(make("TextButton", { Name: "Toggle", AutoButtonColor: true, Visible: false }, gui), "DEV", 16);
 		toggle.Font = Enum.Font.BuilderSansBold;
 		toggle.TextXAlignment = Enum.TextXAlignment.Center;

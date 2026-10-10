@@ -380,7 +380,10 @@ export interface ArtifactEntry {
 
 export interface BranchInfo {
 	name: string;
+	/** The head artifact's channel when the settings don't configure the branch (a promoted prod build: "prod"). */
 	channel: Channel;
+	/** Kernel 0.5.2: what the branch is ("prod": the default branch or one configured prod; else "dev"). */
+	branchChannel?: Channel;
 	artifactId?: string;
 	/** Kernel 0.2+. */
 	assetId?: number;
