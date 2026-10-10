@@ -1048,6 +1048,62 @@ do
 	end
 end
 
+-- A cleanup that throws doesn't cut the generation stop short ---------------------------------------------------------
+-- `trove.remove(x)` inside a cleanup throws ("Cannot call trove.remove() while cleaning"); before framework 0.5.2 that
+-- aborted the stop: later troves, the network, unbind and the root trove never ran (a dead generation stayed alive).
+
+do
+	local gen4 = newGeneration("server")
+	local cleaned = {}
+	local swappedOut = false
+	addModule(gen4, "DataService", ids.data, {}, function()
+		return {
+			onInit = function(self)
+				self.trove:add(function()
+					table.insert(cleaned, "data")
+				end)
+			end,
+		}
+	end)
+	addModule(gen4, "FlightService", ids.shop, {}, function()
+		return {
+			onInit = function(self)
+				self.flight = self.trove:extend()
+				self.flight:add(function()
+					table.insert(cleaned, "flight")
+				end)
+				self.trove:add(function()
+					self.trove:remove(self.flight)
+				end)
+				self.trove:add(function()
+					table.insert(cleaned, "after the throw")
+				end)
+				gen4.fw.TypeTorch:onSwapOut(function()
+					swappedOut = true
+				end)
+			end,
+		}
+	end)
+	local ok4, err4 = start(gen4, 4)
+	check("gen 4: starts", ok4, err4)
+	local warningsBefore = #warnings
+	local stopErr = catch(gen4.stop, { reason = "deploy" })
+	realTask.wait()
+	check("a throwing cleanup: the stop doesn't throw", stopErr == nil, stopErr)
+	check("a throwing cleanup: onSwapOut ran first", swappedOut)
+	check("a throwing cleanup: the rest of that module's trove is cleaned", table.find(cleaned, "flight") ~= nil and table.find(cleaned, "after the throw") ~= nil, table.concat(cleaned, ", "))
+	check("a throwing cleanup: the modules before it in the stop order are cleaned too", table.find(cleaned, "data") ~= nil, table.concat(cleaned, ", "))
+	local warned = false
+	for index = warningsBefore + 1, #warnings do
+		warned = warned or (has(warnings[index], "FlightService cleanup threw") and has(warnings[index], "while cleaning"))
+	end
+	check("a throwing cleanup: one warning names the module and the error", warned, warnings[#warnings])
+	check("a throwing cleanup: the generation still unbinds (no module is running)", #gen4.registry.runningModules == 0)
+	check("a throwing cleanup: TypeTorch.module<T>() after the stop says stopped", has(catch(function()
+		return gen4.fw.TypeTorch:module(ids.data)
+	end), "stopped"))
+end
+
 -- Client generation: Dependency on the client, emit, invokeWithTimeout ------------------------------------------------
 
 local me = newPlayer("Me", true)

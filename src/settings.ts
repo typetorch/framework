@@ -141,7 +141,8 @@ class LiveConfigHandle<T> implements LiveConfig<T> {
 	get(): T {
 		const current = binding;
 		if (current?.realm === "client") error(`TypeTorch.liveConfig("${this.key}") is server-only`, 2);
-		if (current?.kernel !== undefined && !settingsSupported()) {
+		// `typetorch test --cloud` runs a stub kernel with no signed settings at all: the default is expected there.
+		if (current?.kernel !== undefined && current.kernel.test !== true && !settingsSupported()) {
 			warnOnce(
 				`old:${this.key}`,
 				`TypeTorch.liveConfig("${this.key}") needs kernel ${SETTINGS_KERNEL} (signed settings; this server runs ${current.kernelVersion}): using the default`,
