@@ -104,6 +104,13 @@ export interface ExperimentOverride {
 	weights?: number[];
 	/** Everyone gets this variant (must be one of the game's variants). */
 	variant?: string;
+	/**
+	 * Per-player forced variants, keyed by UserId (`"123456"`) or pid (32 hex): wins over `active`, `variant` and
+	 * `weights` for that player (QA, support). Server-only: a client gets only its own entry, as `player`.
+	 */
+	players?: Record<string, string>;
+	/** This player's forced variant (resolved from `players` by `playerOverride`; what a client's hello carries). */
+	player?: string;
 }
 
 /** The sink settings: the signed settings' `analytics` (kernel 0.3.8, server-only), or `new AnalyticsEngine({ settings })`. */

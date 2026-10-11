@@ -30,6 +30,16 @@ function clampNumber(value: unknown, fallback: number, low: number, high: number
 	return math.clamp(value, low, high);
 }
 
+/** Per-player overrides one experiment may hold (`players`). */
+export const EXPERIMENT_PLAYERS_MAX = 200;
+
+/** A `players` key: a UserId (digits) or a pid (32 lowercase hex). */
+function isPlayerKey(key: unknown): key is string {
+	if (!typeIs(key, "string")) return false;
+	if (key.size() >= 1 && key.size() <= 19 && key.match("^%d+$")[0] !== undefined) return true;
+	return key.size() === 32 && key.match("^[0-9a-f]+$")[0] !== undefined;
+}
+
 function parseExperiments(value: unknown, errors: string[]): Map<string, ExperimentOverride> {
 	const result = new Map<string, ExperimentOverride>();
 	if (value === undefined) return result;
@@ -67,6 +77,20 @@ function parseExperiments(value: unknown, errors: string[]): Map<string, Experim
 			}
 			if (ok && weights.size() > 0) override.weights = weights;
 			else errors.push(`experiments.${name}.weights must be a list of numbers >= 0`);
+		}
+		if (entry.players !== undefined) {
+			const players: Record<string, string> = {};
+			let ok = typeIs(entry.players, "table");
+			let count = 0;
+			if (ok) {
+				for (const [key, variant] of pairs(entry.players as object)) {
+					count += 1;
+					if (!isPlayerKey(key) || !typeIs(variant, "string") || variant.size() < 1 || variant.size() > 32) ok = false;
+					else players[key] = variant;
+				}
+			}
+			if (ok && count <= EXPERIMENT_PLAYERS_MAX) override.players = players;
+			else errors.push(`experiments.${name}.players must map UserIds or pids to variant names (at most ${EXPERIMENT_PLAYERS_MAX})`);
 		}
 		result.set(name, override);
 	}

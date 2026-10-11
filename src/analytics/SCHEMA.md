@@ -142,7 +142,7 @@ repo's `bun run local` does it). Every new signed copy applies at once, so dials
   "flushSeconds": 15,
   "recordShare": 1,
   "techEvery": 60,
-  "experiments": { "onboarding": { "active": true, "weights": [1, 1], "variant": "short" } }
+  "experiments": { "onboarding": { "active": true, "weights": [1, 1], "variant": "short", "players": { "123456": "long" } } }
 }
 ```
 
@@ -155,7 +155,7 @@ repo's `bun run local` does it). Every new signed copy applies at once, so dials
 | `flushSeconds` | 15 | 5..300 |
 | `recordShare` | 1 | 0..1, share of new players recorded (stable per pid) |
 | `techEvery` | 60 | 15..3600 seconds between tech samples |
-| `experiments` | none | Per experiment: `active: false` (everyone gets the first variant, not stamped), `weights` (per variant, in the game's order), `variant` (force one) |
+| `experiments` | none | Per experiment: `active: false` (everyone gets the first variant, not stamped), `weights` (per variant, in the game's order), `variant` (force one), `players` (`{ [UserId or pid]: variant }`, at most 200: forces one player's variant over everything else, stamped `forced`; each client's hello gets only its own entry). The CLI writes them: `typetorch experiment` |
 | `identity` | the settings' `fleet` url + `/v1/identity` | basin: where identity rows go (below); none and no `fleet` in the settings: not sent. duckdb: unused |
 | `identityToken` | the settings' `fleet` token | basin: the token for `identity`. Never logged |
 

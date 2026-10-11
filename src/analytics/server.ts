@@ -17,7 +17,7 @@ import { currentSettings, onSettings, settingsSupported } from "../settings";
 import { closeHooksSupported, onGenerationClose, TypeTorch, type GenerationScope } from "../typetorch";
 import { toBase64 } from "./codec";
 import { encodeProps, scrubNames } from "./props";
-import { assignVariant, inShare, isExperimentName, isVariantList } from "./experiments";
+import { assignVariant, inShare, isExperimentName, isVariantList, playerOverride } from "./experiments";
 import {
 	CHANNEL,
 	CHUNK_MAX_BYTES,
@@ -509,9 +509,10 @@ export class ServerAnalytics {
 
 	// Experiments ------------------------------------------------------------------------------------------------------
 
-	private overrides(): Record<string, ExperimentOverride> {
+	/** The overrides as this player sees them (their own `players` entry only; hello). */
+	private overrides(player: Player, session: PlayerSession): Record<string, ExperimentOverride> {
 		const result: Record<string, ExperimentOverride> = {};
-		if (this.settings) for (const [name, override] of this.settings.experiments) result[name] = override;
+		if (this.settings) for (const [name, override] of this.settings.experiments) result[name] = playerOverride(override, player.UserId, session.pid)!;
 		return result;
 	}
 
@@ -531,7 +532,7 @@ export class ServerAnalytics {
 			this.warn(`experiment("${name}") not assigned: a session holds at most ${EXPERIMENTS_MAX} experiments`);
 			return control;
 		}
-		const assignment = assignVariant(session.pid, name, variants, this.settings?.experiments.get(name));
+		const assignment = assignVariant(session.pid, name, variants, playerOverride(this.settings?.experiments.get(name), player.UserId, session.pid));
 		const current = session.exp.get(name);
 		if (assignment.active && current !== assignment.variant) {
 			session.exp.set(name, assignment.variant);
@@ -936,7 +937,7 @@ export class ServerAnalytics {
 			newp: session.newp,
 			rec: session.rec.on && !session.rec.ended && this.options.recording !== false,
 			tech: this.settings?.techEvery ?? DEFAULT_TECH_EVERY,
-			exps: this.overrides(),
+			exps: this.overrides(player, session),
 		};
 		dispatcher.kernel.send(player, CHANNEL, "hi", hello);
 	}

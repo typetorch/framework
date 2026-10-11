@@ -440,7 +440,13 @@ for page = 1, 12 do
 end
 
 local options = {
-	settings = { backend = "duckdb", events = "https://a.example.com/ingest", token = "TKN-secret", flushSeconds = 5 },
+	settings = {
+		backend = "duckdb",
+		events = "https://a.example.com/ingest",
+		token = "TKN-secret",
+		flushSeconds = 5,
+		experiments = { qa = { active = false, players = { ["2"] = "b" } } },
+	},
 	zones = false,
 }
 local trove1 = Trove.new()
@@ -459,6 +465,9 @@ local hiReg = hiFor(regular)
 check("hi: new player", hiNew ~= nil and hiNew.pid == newbiePid and hiNew.newp == true and hiNew.rec == true, hiNew and hiNew.pid)
 check("hi: returning player", hiReg ~= nil and hiReg.newp == false and hiReg.rec == false)
 check("hi: tech interval", hiNew.tech == 60)
+-- Per-player overrides: each hello carries only its own player's entry, never the others' ids.
+check("hi: own forced variant only", hiReg.exps.qa ~= nil and hiReg.exps.qa.player == "b" and hiReg.exps.qa.players == nil and hiReg.exps.qa.active == false)
+check("hi: no entry, no player", hiNew.exps.qa ~= nil and hiNew.exps.qa.player == nil and hiNew.exps.qa.players == nil)
 task.wait(0.6) -- joins wait for the device
 
 local joins = rowsNamed(store().events.rows, "session", "join")
@@ -524,6 +533,11 @@ check("state stamped", afterExp and afterExp.state == "activity:round", afterExp
 check("experiment row", #rowsNamed(rows, "experiment", "onboarding") == 1)
 core1:experiment(newbie, "onboarding", { "short", "long" })
 check("experiment row once", #rowsNamed(store().events.rows, "experiment", "onboarding") == 1)
+-- qa is stopped, but the regular (UserId 2) is forced into "b": stamped and forced; the newbie gets the control.
+check("per-player: forced over stop", core1:experiment(regular, "qa", { "a", "b" }) == "b")
+local qaRow = rowsNamed(store().events.rows, "experiment", "qa")[1]
+check("per-player: row forced", qaRow and serde.decode("json", qaRow.props).forced == true, qaRow and qaRow.props)
+check("per-player: others keep the override", core1:experiment(newbie, "qa", { "a", "b" }) == "a" and #rowsNamed(store().events.rows, "experiment", "qa") == 1)
 
 -- Client events: valid, server-only kinds (session, purchase, currency), bad JSON, a screen change.
 raw["__tt/an"](newbie, "ev", {
