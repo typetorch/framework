@@ -48,12 +48,15 @@ function usableWeights(weights: unknown, count: number): number[] | undefined {
 /**
  * The variant of experiment `name` for player `pid`. The first variant is the control: everyone gets it while the
  * experiment is switched off (`active: false`). `weights` split players unevenly (`[9, 1]`: 10% get the second);
- * `variant` forces one for everyone. The point in [0, 1) is unitHash(`<name>:<pid>`), so changing weights moves as few
+ * `variant` forces one for everyone; `player` (one player's entry of `players`, see `playerOverride`) forces one for
+ * this player and wins over the rest. The point in [0, 1) is unitHash(`<name>:<pid>`), so changing weights moves as few
  * players as possible.
  */
 export function assignVariant(pid: string, name: string, variants: string[], override?: ExperimentOverride): Assignment {
 	const control = variants[0] ?? "";
 	if (variants.size() === 0) return { variant: "", active: false, forced: false };
+	const mine = override?.player;
+	if (typeIs(mine, "string") && variants.includes(mine)) return { variant: mine, active: true, forced: true };
 	if (override?.active === false) return { variant: control, active: false, forced: false };
 	const forced = override?.variant;
 	if (typeIs(forced, "string") && variants.includes(forced)) return { variant: forced, active: true, forced: true };
@@ -75,6 +78,21 @@ export function assignVariant(pid: string, name: string, variants: string[], ove
 		if (weights[index] > 0) return { variant: variants[index], active: true, forced: false };
 	}
 	return { variant: control, active: true, forced: false };
+}
+
+/**
+ * One player's view of an override: `players` resolved to `player` (by UserId, else pid) and dropped, so a client's
+ * hello never carries other players' ids.
+ */
+export function playerOverride(override: ExperimentOverride | undefined, userId: number | undefined, pid: string): ExperimentOverride | undefined {
+	if (override === undefined) return undefined;
+	const result: ExperimentOverride = { active: override.active, weights: override.weights, variant: override.variant };
+	const players = override.players;
+	if (players !== undefined) {
+		const mine = (userId !== undefined ? players[tostring(userId)] : undefined) ?? players[pid];
+		if (mine !== undefined) result.player = mine;
+	}
+	return result;
 }
 
 /** Whether player `pid` is in the recorded share (0..1) of new players. Stable per player. */

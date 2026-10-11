@@ -101,6 +101,15 @@ local forced = E.assignVariant("p1", "onboarding", { "short", "long" }, { varian
 check("forced variant", forced.variant == "long" and forced.forced and forced.active)
 check("forced unknown variant ignored", E.assignVariant("p1", "x", { "a", "b" }, { variant = "zzz" }).forced == false)
 check("no variants", E.assignVariant("p1", "x", {}).variant == "")
+local mine = E.assignVariant("p1", "onboarding", { "short", "long" }, { active = false, variant = "short", player = "long" })
+check("per-player wins over stop and settle", mine.variant == "long" and mine.forced and mine.active)
+check("per-player unknown variant ignored", E.assignVariant("p1", "x", { "a", "b" }, { active = false, player = "zzz" }).variant == "a")
+local shared = { weights = { 1, 3 }, players = { ["123"] = "b", ["0123456789abcdef0123456789abcdef"] = "a" } }
+local byUser = E.playerOverride(shared, 123, "ffffffffffffffffffffffffffffffff")
+check("playerOverride: by UserId, players dropped", byUser.player == "b" and byUser.players == nil and byUser.weights[2] == 3)
+check("playerOverride: by pid", E.playerOverride(shared, 9, "0123456789abcdef0123456789abcdef").player == "a")
+check("playerOverride: nobody", E.playerOverride(shared, 9, "ffffffffffffffffffffffffffffffff").player == nil)
+check("playerOverride: none", E.playerOverride(nil, 9, "x") == nil)
 local share30 = 0
 for _, pid in pids do
 	if E.inShare(pid, 0.3) then
@@ -165,6 +174,10 @@ for _, message in leaky.errors do
 end
 check("errors never contain the token", not leaked)
 check("bad experiment entry", #S.parseSettings({ backend = "basin", events = "https://a.b", experiments = { x = 5 } }, decode).errors == 1)
+local withPlayers = S.parseSettings('{"backend":"duckdb","events":"https://a.b","experiments":{"x":{"players":{"123":"b","0123456789abcdef0123456789abcdef":"a"}}}}', decode)
+check("players parsed", #withPlayers.errors == 0 and withPlayers.settings.experiments.x.players["123"] == "b", table.concat(withPlayers.errors, "; "))
+local badPlayers = S.parseSettings('{"backend":"duckdb","events":"https://a.b","experiments":{"x":{"players":{"Roblox":"b"},"weights":[1,1]}}}', decode)
+check("bad players: error, rest kept", #badPlayers.errors == 1 and badPlayers.settings.experiments.x.players == nil and #badPlayers.settings.experiments.x.weights == 2)
 
 -- Queue ----------------------------------------------------------------------------------------------------------------
 local state = Q.newQueueState()
