@@ -279,7 +279,30 @@ local kernel = {
 
 -- 0.3.8: the signed settings (src/settings.ts) as the kernel would hand them over; off unless a check turns it on.
 local settingsMock = { supported = false, current = nil, listeners = {} }
+-- Hot assets: the real (pure) manifest module, and AssetSync's report as a server on the upload path sees it.
+local manifestModule = luau.load(fs.readFile(base .. "assets/manifest.luau"), { debugName = "assets/manifest" })()
+local assetReportMock = {
+	manifest = "ok",
+	place = "differs",
+	manifestPlaceVersion = 10246,
+	placeVersion = 10247,
+	errors = {},
+	running = false,
+	ms = 3000,
+	timedOut = true,
+	unmanaged = {},
+	entries = {
+		{ key = "uis", id = 1, wanted = 2, live = true, source = "loaded" },
+		{ key = "effects", id = 3, wanted = 4, live = true, source = "failed", error = "timed out" },
+	},
+}
 local internals = {
+	["assets/manifest"] = manifestModule,
+	["assets/sync"] = {
+		assetReport = function()
+			return assetReportMock
+		end,
+	},
 	settings = {
 		settingsSupported = function()
 			return settingsMock.supported
@@ -514,6 +537,10 @@ for _, row in device do
 end
 check("device row: the device class once per session, in props and the column", deviceDevs.phone == "phone" and deviceDevs.desktop == "desktop")
 check("load row", #rowsNamed(store().events.rows, "tech", "load") == 1)
+local assetRows = rowsNamed(store().events.rows, "tech", "assets")
+local assetProps = if #assetRows == 1 then serde.decode("json", assetRows[1].props) else {}
+check("assets row: once per generation, with the place match and counts", #assetRows == 1, #assetRows)
+check("assets row: props", assetProps.place == "differs" and assetProps.loaded == 1 and assetProps.failed == 1 and assetProps.mpv == 10246 and assetProps.pv == 10247 and assetProps.first == "effects: timed out", assetRows[1] and assetRows[1].props)
 
 core1:track(newbie, "custom", "quest_done", { quest = "tutorial" })
 core1:track(nil, "custom", "server_thing", nil)

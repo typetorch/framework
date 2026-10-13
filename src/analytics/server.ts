@@ -15,6 +15,8 @@ import { maybeServerDispatcher } from "../net/runtime";
 import { observePlayers } from "../players";
 import { currentSettings, onSettings, settingsSupported } from "../settings";
 import { closeHooksSupported, onGenerationClose, TypeTorch, type GenerationScope } from "../typetorch";
+import { assetCounts } from "../assets/manifest";
+import { assetReport } from "../assets/sync";
 import { toBase64 } from "./codec";
 import { encodeProps, scrubNames } from "./props";
 import { assignVariant, inShare, isExperimentName, isVariantList, playerOverride } from "./experiments";
@@ -900,6 +902,12 @@ export class ServerAnalytics {
 				);
 			} else {
 				this.emit(undefined, "tech", "start", encodeProps({ gen: generation, kernel: TypeTorch.kernelVersion, load: start.loadSeconds }));
+			}
+			// Hot assets: how this generation's AssetSync went (it ran before the modules loaded), so "every new server
+			// loads its hot assets from uploads" shows in the events table (2026-10-13 incident).
+			const assets = assetReport();
+			if (assets.manifest !== "none" || assets.errors.size() > 0) {
+				this.emit(undefined, "tech", "assets", encodeProps({ gen: generation, boot: start.kind !== "swap", ...assetCounts(assets) }));
 			}
 		}
 		this.trove.add(

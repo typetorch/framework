@@ -65,6 +65,7 @@ First-ever-session detail, one row per packed chunk.
 | tech | `load` (src client) | `secs`: from the client starting to the engine starting (first client generation only) |
 | tech | `error` | Server or client (src). `msg` (first 300 chars, player names replaced by `<player>`), `n` (times in the window). At most 10 per tech tick (server), 5 per 30 s and 100 per session (client) |
 | tech | `start` | First generation of a server that runs the engine: `gen`, `kernel`, `load?` |
+| tech | `assets` | Each generation whose artifact has hot assets (or an unusable manifest), at its start: `gen`, `boot` (the server's first generation), `manifest` (`ok`, `invalid`, `unread`), `place?` (`same`: the manifest names this place version; `vouched`: the place's backup vouches for it; `differs`: keys without a matching baked copy load from their uploads; `unknown`), `mpv?` (the manifest's place version), `pv?` (game.PlaceVersion), `keys`, `kept`, `baked`, `loaded`, `failed`, `loading` (keys per AssetSync source), `missing` (keys with nothing live), `late` (loaded after the start-up wait), `timedOut`, `ms?`, `first?` (the first failure or manifest error) |
 | tech | `swap` / `rollback` | A generation started by a hot swap (`rollback` for rollback reasons), 5 s after it started: `reason`, `from?` (previous artifact id), `gen`, `load?`, `stop?`, `swap?` (seconds), `players` |
 | tech | `swap_out` | Just before a generation stops: `reason`, `next?` (next artifact id), `players` |
 | zone | `enter` | `zone`, `from` (previous zone or `""`) |
