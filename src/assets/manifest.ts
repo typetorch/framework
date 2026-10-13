@@ -325,6 +325,8 @@ export interface AssetStatus {
 	ms?: number;
 	/** Loaded after the start-up wait ran out. */
 	late?: boolean;
+	/** CollectionService tags a loaded copy got back from the place's copy (restoreTags). */
+	tags?: number;
 }
 
 export interface AssetSyncReport {

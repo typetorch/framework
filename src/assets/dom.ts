@@ -1,5 +1,5 @@
 import { CollectionService } from "@rbxts/services";
-import { assetTag, ATTR_PATH, pathSegments } from "./manifest";
+import { ASSET_TAG_PREFIX, assetTag, ATTR_PATH, pathSegments } from "./manifest";
 
 /** Hot assets: instance helpers shared by AssetSync (server) and the handles (both realms). */
 
@@ -50,6 +50,39 @@ export function isLiveCopy(instance: Instance): boolean {
 	const path = stringAttribute(instance, ATTR_PATH);
 	const parent = instance.Parent;
 	return path !== undefined && parent !== undefined && resolveParent(path, false) === parent;
+}
+
+/**
+ * Copies the CollectionService tags of `from` and its descendants onto the instances at the same place in `to` (matched
+ * by name, and by order among siblings of the same name); AssetSync's own `__typetorch_asset:` tags stay out. A loaded
+ * hot-asset version arrives without the tags its place copy has (2026-10-13: a game that finds its UI by tag lost it
+ * on every server that loaded the uploads), so the load gives them back from the place's copy before it goes live.
+ * Returns how many tags were added.
+ */
+export function restoreTags(from: Instance, to: Instance): number {
+	let added = 0;
+	const visit = (source: Instance, target: Instance) => {
+		for (const tag of source.GetTags()) {
+			if (tag.sub(1, ASSET_TAG_PREFIX.size()) === ASSET_TAG_PREFIX || target.HasTag(tag)) continue;
+			target.AddTag(tag);
+			added += 1;
+		}
+		const byName = new Map<string, Instance[]>();
+		for (const child of target.GetChildren()) {
+			const list = byName.get(child.Name);
+			if (list === undefined) byName.set(child.Name, [child]);
+			else list.push(child);
+		}
+		const seen = new Map<string, number>();
+		for (const child of source.GetChildren()) {
+			const index = seen.get(child.Name) ?? 0;
+			seen.set(child.Name, index + 1);
+			const match = byName.get(child.Name)?.[index];
+			if (match !== undefined) visit(child, match);
+		}
+	};
+	visit(from, to);
+	return added;
 }
 
 /** The live copies tagged for `key` (normally one; two for a moment while a new version replaces the old). */

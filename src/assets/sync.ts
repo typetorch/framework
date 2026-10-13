@@ -2,7 +2,7 @@ import { CollectionService, HttpService, InsertService, ServerStorage } from "@r
 import type { Trove } from "@rbxts/trove";
 import { $print, $warn } from "rbxts-transform-debug";
 import type { ServerKernel } from "../kernel";
-import { liveCopies, numberAttribute, resolveParent, stringAttribute } from "./dom";
+import { liveCopies, numberAttribute, resolveParent, restoreTags, stringAttribute } from "./dom";
 import {
 	AssetEntry,
 	AssetFacts,
@@ -284,6 +284,16 @@ function syncEntry(entry: AssetEntry, status: AssetStatus, placeMatches: boolean
 				const [ok, err] = pcall(() => {
 					const target = resolveParent(entry.path, true);
 					if (target === undefined) error(`no ${entry.path.split("/")[0]} service`, 0);
+					// The uploaded version has no CollectionService tags: the place's copy (on a hot swap, the copy being
+					// replaced, which got them the same way) gives them back (restoreTags).
+					let source = fallback !== undefined && fallback.Parent !== undefined ? fallback : baked.find((candidate) => candidate.Parent !== undefined);
+					for (let index = tagged.size() - 1; source === undefined && index >= 0; index--) {
+						if (tagged[index].Parent !== undefined) source = tagged[index];
+					}
+					if (source !== undefined) {
+						const restored = restoreTags(source, copy);
+						if (restored > 0) status.tags = restored;
+					}
 					stamp(copy, entry, entry.ver);
 					copy.Parent = target;
 				});
