@@ -307,6 +307,41 @@ shop.Parent = nil
 check("live: unparented is not", not dom.isLiveCopy(shop))
 check("attributes", dom.numberAttribute(nil, "x") == nil and dom.stringAttribute(clone, M.ATTR_KEY) == "ui/shop" and dom.numberAttribute(clone, M.ATTR_KEY) == nil)
 
+-- restoreTags: a loaded version (no tags) gets the place copy's tags back, by name and sibling order --------------
+local function tree(withTags)
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "MainScreenGui"
+	local frameA = Instance.new("Frame")
+	frameA.Name = "Item"
+	frameA.Parent = gui
+	local frameB = Instance.new("Frame")
+	frameB.Name = "Item"
+	frameB.Parent = gui
+	local bar = Instance.new("Frame")
+	bar.Name = "StaminaBar"
+	bar.Parent = frameB
+	if withTags then
+		gui:AddTag("Element:MainGui")
+		gui:AddTag(M.assetTag("mainscreengui"))
+		frameB:AddTag("Element:Second")
+		bar:AddTag("Element:StaminaBar")
+	end
+	return gui, frameA, frameB, bar
+end
+local placeGui = tree(true)
+local loadedGui, loadedA, loadedB, loadedBar = tree(false)
+local extra = Instance.new("Frame")
+extra.Name = "OnlyInUpload"
+extra.Parent = loadedGui
+local restored = dom.restoreTags(placeGui, loadedGui)
+check("restoreTags: count", restored == 3, restored)
+check("restoreTags: root", loadedGui:HasTag("Element:MainGui"))
+check("restoreTags: not AssetSync's own tag", not loadedGui:HasTag(M.assetTag("mainscreengui")))
+check("restoreTags: second of same-named siblings", loadedB:HasTag("Element:Second") and not loadedA:HasTag("Element:Second"))
+check("restoreTags: nested", loadedBar:HasTag("Element:StaminaBar"))
+check("restoreTags: unmatched child untouched", #extra:GetTags() == 0)
+check("restoreTags: again adds nothing", dom.restoreTags(placeGui, loadedGui) == 0)
+
 print(`hot assets: {passed} passed, {failed} failed`)
 if failed > 0 then
 	process.exit(1)
