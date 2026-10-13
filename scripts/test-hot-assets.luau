@@ -158,6 +158,38 @@ check("assets capped at 1000", #capped.manifest.entries == 1000, #capped.manifes
 check("cap noted", #capped.errors == 1, list(capped.errors))
 check("too long", parse(string.rep(" ", 600 * 1024)).errors[1] == "Assets is too long")
 
+-- placeMatchesManifest (the 2026-10-13 incident: a backup refresh published the place) ------------------------------
+check("place: no manifest version", M.placeMatchesManifest(nil, 10247, nil) == "unknown")
+check("place: same version", M.placeMatchesManifest(10246, 10246, nil) == "same")
+check("place: another version", M.placeMatchesManifest(10246, 10247, nil) == "differs")
+check("place: vouched by the backup", M.placeMatchesManifest(10246, 10247, { placeVersion = 10246, savedAs = 10247 }) == "vouched")
+check("place: a later publish ends the claim", M.placeMatchesManifest(10246, 10248, { placeVersion = 10246, savedAs = 10247 }) == "differs")
+check("place: a claim for another lock", M.placeMatchesManifest(10200, 10247, { placeVersion = 10246, savedAs = 10247 }) == "differs")
+check("place: an empty backup", M.placeMatchesManifest(10246, 10247, {}) == "differs")
+
+-- assetCounts (the tech / assets analytics row) ----------------------------------------------------------------------
+local counted = M.assetCounts({
+	manifest = "ok",
+	place = "differs",
+	manifestPlaceVersion = 10246,
+	placeVersion = 10247,
+	errors = {},
+	running = false,
+	ms = 3012,
+	timedOut = true,
+	unmanaged = {},
+	entries = {
+		{ key = "uis", id = 1, wanted = 2, live = true, source = "loaded", late = true },
+		{ key = "effects", id = 3, wanted = 4, live = true, source = "failed", error = "timed out" },
+		{ key = "box", id = 5, wanted = 6, live = false, source = "failed", error = "HTTP 403" },
+		{ key = "jobs", id = 7, wanted = 8, live = true, source = "baked" },
+	},
+})
+check("counts: per source", counted.loaded == 1 and counted.failed == 2 and counted.baked == 1 and counted.kept == 0 and counted.loading == 0)
+check("counts: missing, late, keys", counted.missing == 1 and counted.late == 1 and counted.keys == 4)
+check("counts: place and versions", counted.place == "differs" and counted.mpv == 10246 and counted.pv == 10247 and counted.timedOut == true)
+check("counts: the first failure", counted.first == "effects: timed out", counted.first)
+
 -- decideAsset (indexes are 0-based, as in the TypeScript) -----------------------------------------------------------
 local entry = { key = "ui/shop", id = 1, ver = 100, hash = "aabbccddeeff", realm = "replicated", path = "ReplicatedStorage/Assets/UI" }
 local d = M.decideAsset(entry, { { version = 99 }, { version = 100 } }, {}, false)

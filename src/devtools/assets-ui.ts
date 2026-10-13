@@ -68,6 +68,11 @@ function drawServer(target: Page, report: AssetSyncReport) {
 		target.field("Manifest", ok ? `${report.entries.size()} keys${report.from !== undefined ? `  (${report.from})` : ""}` : report.manifest, ok ? COLORS.text : COLORS.warn);
 		const sync = report.running ? "Running" : report.ms !== undefined ? `${report.ms} ms${report.timedOut === true ? "  timed out" : ""}` : "-";
 		target.field("Sync", sync, report.timedOut === true ? COLORS.warn : COLORS.text);
+		if (report.place !== undefined) {
+			const versions = `manifest v${report.manifestPlaceVersion ?? "?"}, place v${report.placeVersion ?? "?"}`;
+			const place = report.place === "differs" ? `differs (${versions}): keys load from uploads` : report.place === "vouched" ? `vouched by the backup (${versions})` : report.place;
+			target.field("Place", place, report.place === "differs" ? COLORS.warn : COLORS.text);
+		}
 		for (const why of report.errors) target.text(why, COLORS.warn);
 		let shown = 0;
 		for (const status of report.entries) {

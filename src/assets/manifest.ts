@@ -25,6 +25,15 @@ export const ATTR_VERSION = "TypeTorchAssetVersion";
  */
 export const ATTR_PATH = "TypeTorchAssetPath";
 
+/**
+ * The place's backup build (ServerStorage.TypeTorchBackup) vouches for the place's hot-asset copies after the CLI's
+ * backup refresh published the place (cli commands/backup.ts, kernelpatch-task step 4b): `HotAssetsPlaceVersion` is the
+ * lockfile placeVersion the copies match, `HotAssetsSavedAs` the place version that save became.
+ */
+export const BACKUP_NAME = "TypeTorchBackup";
+export const ATTR_BACKUP_PLACE_VERSION = "HotAssetsPlaceVersion";
+export const ATTR_BACKUP_SAVED_AS = "HotAssetsSavedAs";
+
 export const MAX_KEY_LENGTH = 64;
 const MAX_ASSETS = 1000;
 const MAX_ERRORS = 20;
@@ -233,6 +242,28 @@ export interface AssetDecision {
 	fallbackBaked?: number;
 }
 
+/**
+ * Whether this server's place holds exactly the copies the manifest was exported from:
+ * - same: the manifest names this place version;
+ * - vouched: it names another one, but the place's backup says this version is a save of that one that changed nothing
+ *   outside the kernel slots (`backup` = its HotAssetsPlaceVersion / HotAssetsSavedAs);
+ * - differs: neither (new servers load every key whose baked copy has no matching hash);
+ * - unknown: the manifest names no place version.
+ */
+export type PlaceMatch = "same" | "vouched" | "differs" | "unknown";
+
+export interface BackupVouch {
+	placeVersion?: number;
+	savedAs?: number;
+}
+
+export function placeMatchesManifest(manifestVersion: number | undefined, placeVersion: number, backup?: BackupVouch): PlaceMatch {
+	if (manifestVersion === undefined) return "unknown";
+	if (manifestVersion === placeVersion) return "same";
+	if (backup !== undefined && backup.placeVersion === manifestVersion && backup.savedAs === placeVersion) return "vouched";
+	return "differs";
+}
+
 function indexes(count: number, except?: number): number[] {
 	const list = new Array<number>();
 	for (let index = 0; index < count; index++) {
@@ -301,6 +332,11 @@ export interface AssetSyncReport {
 	manifest: "none" | "ok" | "invalid" | "unread";
 	/** Where the manifest was found: "mount", "Server" (the payload's Server folder) or "payload" (re-read). */
 	from?: string;
+	/** placeMatchesManifest: whether the place's copies are the manifest's ("differs": the upload path). */
+	place?: PlaceMatch;
+	/** The manifest's placeVersion and this server's game.PlaceVersion. */
+	manifestPlaceVersion?: number;
+	placeVersion?: number;
 	errors: string[];
 	/** AssetSync is still holding the generation's start. */
 	running: boolean;
@@ -310,6 +346,33 @@ export interface AssetSyncReport {
 	entries: AssetStatus[];
 	/** Tagged keys this manifest doesn't name: left as they are. */
 	unmanaged: string[];
+}
+
+/** Keys per source, and the rest of what the `tech` / `assets` analytics row carries (SCHEMA.md). */
+export function assetCounts(report: AssetSyncReport): Record<string, unknown> {
+	const counts: Record<string, number> = { kept: 0, baked: 0, loaded: 0, failed: 0, loading: 0 };
+	let missing = 0;
+	let late = 0;
+	let first: string | undefined;
+	for (const status of report.entries) {
+		counts[status.source] = (counts[status.source] ?? 0) + 1;
+		if (!status.live) missing += 1;
+		if (status.late === true) late += 1;
+		if (status.source === "failed" && first === undefined) first = `${status.key}: ${status.error ?? "failed"}`;
+	}
+	return {
+		manifest: report.manifest,
+		place: report.place,
+		mpv: report.manifestPlaceVersion,
+		pv: report.placeVersion,
+		keys: report.entries.size(),
+		...counts,
+		missing,
+		late,
+		timedOut: report.timedOut === true,
+		ms: report.ms,
+		first: first ?? report.errors[0],
+	};
 }
 
 /** What Server > Status needs (devtools ServerFacts.assets). */

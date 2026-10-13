@@ -1,4 +1,4 @@
-import { CollectionService, HttpService, InsertService } from "@rbxts/services";
+import { CollectionService, HttpService, InsertService, ServerStorage } from "@rbxts/services";
 import type { Trove } from "@rbxts/trove";
 import { $print, $warn } from "rbxts-transform-debug";
 import type { ServerKernel } from "../kernel";
@@ -14,10 +14,14 @@ import {
 	ATTR_ID,
 	ATTR_KEY,
 	ATTR_PATH,
+	ATTR_BACKUP_PLACE_VERSION,
+	ATTR_BACKUP_SAVED_AS,
 	ATTR_VERSION,
+	BACKUP_NAME,
 	decideAsset,
 	keyOfTag,
 	parseManifest,
+	placeMatchesManifest,
 	summarizeAssets,
 } from "./manifest";
 
@@ -159,6 +163,13 @@ function readManifest(kernel: ServerKernel, deadline: number): ManifestSource {
 	if (!outcome.done) return { error: "reading the manifest timed out" };
 	if (!outcome.ok) return { error: `reading the manifest failed: ${shortError(outcome.value)}` };
 	return outcome.value === undefined ? {} : { raw: outcome.value, from: "payload" };
+}
+
+/** What the place's backup build says about its hot-asset copies (BackupVouch), if anything. */
+function backupVouch() {
+	const backup = ServerStorage.FindFirstChild(BACKUP_NAME);
+	if (backup === undefined) return undefined;
+	return { placeVersion: numberAttribute(backup, ATTR_BACKUP_PLACE_VERSION), savedAs: numberAttribute(backup, ATTR_BACKUP_SAVED_AS) };
 }
 
 /** Marks `instance` as the live copy of `entry` (attributes first, so they replicate with the tag). */
@@ -334,7 +345,18 @@ function run(kernel: ServerKernel, deadline: number, ownEpoch: number, threads: 
 	}
 	setManifest(manifest);
 	report.manifest = "ok";
-	const placeMatches = manifest.placeVersion !== undefined && manifest.placeVersion === game.PlaceVersion;
+	// A publish that changed nothing outside the kernel slots (the CLI's backup refresh) doesn't move servers to the
+	// upload path: the backup vouches for the version it saved (2026-10-13 incident).
+	const place = placeMatchesManifest(manifest.placeVersion, game.PlaceVersion, backupVouch());
+	report.place = place;
+	report.manifestPlaceVersion = manifest.placeVersion;
+	report.placeVersion = game.PlaceVersion;
+	const placeMatches = place === "same" || place === "vouched";
+	if (place === "differs") {
+		$warn(
+			`hot assets: the manifest is for place v${manifest.placeVersion}, this server runs v${game.PlaceVersion}: keys without a matching baked copy load from their uploaded versions (typetorch assets sync --deploy <branch> fixes it)`,
+		);
+	}
 
 	const loads = new Array<PendingLoad>();
 	for (const entry of manifest.entries) {
@@ -392,6 +414,6 @@ export function syncHotAssets(kernel: ServerKernel, trove: Trove) {
 		const parts = new Array<string>();
 		for (const [source, count] of counts) parts.push(`${count} ${source}`);
 		parts.sort();
-		$print(`hot assets: ${parts.join(", ")} in ${report.ms} ms`);
+		$print(`hot assets: ${parts.join(", ")} in ${report.ms} ms (place ${report.place ?? "?"})`);
 	}
 }
