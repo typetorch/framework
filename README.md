@@ -1,3 +1,5 @@
+<img src="https://raw.githubusercontent.com/typetorch/docs/main/brand/typetorch.svg" width="64" alt="TypeTorch logo">
+
 # @typetorch/framework
 
 The roblox-ts framework of [TypeTorch](https://github.com/typetorch): hot-swappable modules (dependency injection,
