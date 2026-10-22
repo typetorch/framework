@@ -9,6 +9,21 @@ It ships **inside every artifact**, so each generation runs its own fresh copy a
 code. It needs the TypeTorch kernel in the place (`@typetorch/kernel`), which calls your `Server/boot` and
 `Client/boot` modules.
 
+### How it fits with the other TypeTorch packages
+
+| Package | Role | Where it runs |
+|---|---|---|
+| `@typetorch/kernel` | Baked into the place. Picks the branch, loads the payload, calls `boot(kernel)`, swaps generations, owns the stable remotes, `persist`, roles, settings and the health window. | the place (server and client) |
+| `@typetorch/framework` (this) | Modules, DI, lifecycle, troves, network, hot assets, analytics and the dev menu, on top of the kernel API (`src/kernel.ts` types it). | inside every payload |
+| `@typetorch/transformer` | roblox-ts compiler plugin: constructor dependency ids, network guards, `Dependency<T>()` / `Lazy<T>` / `TypeTorch.module<T>()` ids and user macros. Its `runtime-kit/` is copied here as `src/reflection/`. | your compile (Node) |
+| `@typetorch/cli` (`typetorch`, alias `tt`) | Builds the payload (`typetorch build`), deploys and hot-swaps it, rolls back, syncs hot assets, writes the signed settings (`liveConfig`, analytics, experiments), migrates Flamework games. | your machine / CI |
+| `@typetorch/dev-server` | `remote-claude`: the dev menu's Claude tab and Logs > Upload talk to it. | a dev's machine |
+
+The framework never talks to the CLI directly: the CLI builds and signs payloads and settings, the kernel loads them,
+and the framework reads what the kernel hands it. Features that need a newer kernel check `TypeTorch.features` and say
+"needs kernel x.y.z" on older ones; the dev menu flags kernels older than `LATEST_KERNEL` (`src/devtools/health.ts`,
+now 0.5.3) with a Migrate issue.
+
 ## Install
 
 ```sh
@@ -84,7 +99,7 @@ mapping.
 ```ts
 // src/server/boot.ts
 import { startServer, type ServerKernel } from "@typetorch/framework";
-import { BUILD } from "../shared/build";
+import { BUILD } from "../shared/build"; // written by `typetorch build`
 export function boot(kernel: ServerKernel) {
 	return startServer(kernel, { modules: [script.Parent!.FindFirstChild("services")!], build: BUILD });
 }
@@ -96,6 +111,10 @@ interface ServerToClient { coins: { changed(total: number): void } }
 export const network = createNetwork<ClientToServer, ServerToClient>();
 
 // src/server/services/coin.service.ts
+import { Module, Service, type OnStart } from "@typetorch/framework";
+import { network } from "../../shared/net";
+import { ScoreService } from "./score.service";
+
 @Service()
 export class CoinService extends Module implements OnStart {
 	constructor(private readonly score: ScoreService) { // injected
@@ -103,13 +122,22 @@ export class CoinService extends Module implements OnStart {
 	}
 	onStart() {
 		this.trove.add(network.server.coins.collect.on((player, coinId) => this.score.add(player, 1)));
+		this.trove.add(network.server.coins.balance.handle((player) => [this.score.get(player)]));
 	}
 }
 ```
 
+`startClient(kernel, options)` is the same for `src/client/boot.ts` with your controllers folder. `StartOptions`:
+`modules` (folders whose ModuleScripts are required, recursively, so their decorators register), `build` (the
+generated build info, shown in the dev menu) and `devtools` (default `true`; `false` leaves the dev menu out). Both
+return the generation's stop function, which the kernel calls on a swap.
+
 - **Modules:** `@Service()` (server) and `@Controller()` (client) classes extending `Module`. Constructor parameters
   are other modules, injected by type. Lifecycle: `OnInit` (sequential, dependencies first), `OnStart` (spawned),
   `OnStop` (reverse order), `OnTick`, `OnPhysics`, `OnRender`, `OnPlayerAdded` (replays players already in the server).
+  `@Service({ loadOrder: -1 })` breaks ties between modules with no dependency relation (lower first, default 0).
+  `this.ctx` has the realm, artifact, branch, channel, generation, build info, the raw kernel, `persist` and
+  `playerState`. `observePlayers(trove, (player, playerTrove) => ...)` is `OnPlayerAdded` for code outside a module.
 - **Modules outside the constructor:** `Dependency<T>()` (or `TypeTorch.module<T>()`) returns the running module of
   type T from anywhere: a method, a plain class a module built, a command handler. `TypeTorch.tryModule<T>()` returns
   undefined instead of throwing. They work once every module is constructed (from onInit on); in a constructor, a
@@ -198,10 +226,19 @@ export class CoinService extends Module implements OnStart {
 - **Owners and devs:** two roles (no admins: an older kernel's or typetorch.json's "admin" counts as a dev). The Manage
   group (Players, Servers, Bans) is for owners only.
 - **Remote Claude** (a dev-only tool: dev rules, or owners on a public server an owner switched to a dev branch):
-  while `typetorch remote-claude` (`@typetorch/dev-server`) runs on a dev's machine, allowlisted devs prompt Claude
-  Code from the Claude tab. Each dev pairs once by pasting the pairing code printed by
+  while `typetorch remote-claude` (alias `typetorch dev`; it runs `@typetorch/dev-server`) runs on a dev's machine,
+  allowlisted devs prompt Claude Code from the Claude tab. The allowlist is `--users`; without it the dev-server uses
+  the owners in the game's `typetorch.json`. Each dev pairs once by pasting the pairing code printed by
   typetorch-dev-server; the game server keeps the session URL and the tokens in memory and never sends them to clients.
-  No Roblox secret is needed.
+  No Roblox secret is needed. (The Studio plugin's Claude tab, with Apply / Deploy to dev / Discard, is a separate
+  client of the same dev-server, started by `typetorch serve --claude`; it doesn't go through the framework.)
+- **Remote debug (framework 0.5.0, kernel 0.5.0, `devtools/remote-debug.ts`):** owners can read a fleet server from
+  the backend's explorer (`/servers/<JobId>`). The kernel polls the backend, checks the op, the rate and that the
+  caller is an owner, then hands the framework's ops to the handler installed through `kernel.onRemoteDebug`. Read-only,
+  with the dev menu's own readers and limits: `modules`, `state` (Modules > State queries, rate-limited per caller),
+  `assets` (the last hot-asset sync), `network` (per-remote counters, no packet capture), `dex.children` (8 nodes, 200
+  rows each at most) and `dex.props`. There are no edit ops. Older kernels don't have the hook, so nothing is
+  installed. It is part of the devtools server, so `devtools: false` leaves it out too.
 
 ## Runtime API: `TypeTorch`
 
@@ -358,10 +395,15 @@ rebuild(shop.get());
 - **AssetSync** is a server built-in. It runs on every generation start, before any module loads (top-level code
   included). For each manifest key:
   1. it keeps the live copy that already has the manifest's version;
-  2. else it adopts the place's own copy, if its `TypeTorchAssetHash` matches (or if the manifest's optional
-     `placeVersion` is this server's place version);
-  3. else it runs `InsertService:LoadAssetVersion(ver)` (all loads in parallel), strips any scripts, places the copy
-     at its path (creating missing Folders), tags it, then destroys the copy it replaces.
+  2. else it adopts the place's own copy, if its `TypeTorchAssetHash` matches, or if the place holds exactly the
+     copies the manifest was exported from: the manifest's optional `placeVersion` is this server's place version, or
+     the place's backup build (`ServerStorage.TypeTorchBackup`, attributes `HotAssetsPlaceVersion` /
+     `HotAssetsSavedAs`) vouches that this place version is a save of that one which changed nothing outside the
+     kernel slots (the CLI's backup refresh);
+  3. else it runs `InsertService:LoadAssetVersion(ver)` (all loads in parallel), strips any scripts, gives back the
+     CollectionService tags the place's copy has (uploaded versions arrive without them, so a game that finds its UI
+     by tag keeps working), places the copy at its path (creating missing Folders), tags it, then destroys the copy it
+     replaces.
 
   It holds the start for at most 8 s. Loads still running after that keep going, swap in when done and fire
   `changed`. A failed load keeps the old copy (on a new server, the place's copy) and shows under Server > Status >
@@ -373,7 +415,8 @@ rebuild(shop.get());
   `TypeTorchAssetPath` (stamped by AssetSync) is the live one. So a template cloned into PlayerGui never shows up in
   `get()`, and AssetSync never destroys it.
 - **Dev menu:** Modules > Assets (Server | Client) lists each key's source (kept, baked, loaded, failed), version,
-  load time and last error.
+  load time and last error. With analytics on, each generation also sends one `tech` / `assets` row (the place match
+  and the counts per source; `src/analytics/SCHEMA.md`).
 
 ## Analytics: `AnalyticsEngine`
 
@@ -420,7 +463,9 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
 - **Experiments:** `experiment(...)` is deterministic per player and name (they keep their variant in every session),
   may yield briefly the first time (until the player's id loads), and stamps the variant on the player's later events.
   The settings turn one off (`active: false`: everyone gets the first variant), sets `weights` or forces a
-  `variant`, live.
+  `variant`, live. `players` (framework 0.5.3+) forces a variant for single players, keyed by UserId or pid, over
+  everything else (QA, support); a client only ever gets its own entry. The CLI writes these with `typetorch
+  experiment weights | settle | stop | resume | clear | force | unforce`.
 - **First-ever session:** for new players (a share of them, `recordShare`), the client records character and camera
   about 10 times a second, every input (never while a TextBox or the chat has focus; text boxes only say which box was
   used), buttons pressed and hovered, screens, prompts and deaths, from the join until 60 s after the first input.
@@ -493,8 +538,11 @@ bun install
 bun run build   # rbxtsc --type package -> out/
 ```
 
-- **Runtime of the transformer:** `src/reflection/` (`Reflect`, `Modding`, `t`) is a copy of
-  `@typetorch/transformer`'s `runtime-kit/`; keep the two identical.
+- **Runtime of the transformer:** `src/reflection/reflect.ts` and `modding.ts` are copies of
+  `@typetorch/transformer`'s `runtime-kit/` (the source of truth); keep them identical. The framework compiles itself
+  without the transformer (only `rbxts-transform-debug`): it declares macros, which expand in the game's compile.
+- **Versions:** bump `src/version.ts` (`FRAMEWORK_VERSION`, shown in uploaded log headers) with package.json, and
+  `LATEST_KERNEL` in `src/devtools/health.ts` when the framework starts relying on a newer kernel.
 - **Tests (Lune, offline):** `scripts/test-*.luau`; each file's header has its command (Lune is pinned in the
   kernel's and the template's `rokit.toml`). `scripts/test-generations.luau` takes a game's built payload:
   `cd ../template && bun run payload && lune run ../framework/scripts/test-generations.luau build/payload.rbxm` boots
@@ -522,13 +570,37 @@ bun run build   # rbxtsc --type package -> out/
   retries, a NetFail streak and its one log line a minute, a swap with a request in flight, shutdown; the recorder,
   screens, batching). `scripts/test-net-health.luau` checks the dev menu's Fleet API / Analytics status lines and
   Attention issues.
-- **Publishing:** `npm publish` runs `prepublishOnly` (clean + build). The package ships only `out/` (no
-  `.tsbuildinfo`), `README.md` and `LICENSE`; check with `bun pm pack --dry-run`.
-
+  The others, each on the compiled `out/`: `test-hot-assets` (manifest parser, AssetSync decisions incl. the backup
+  vouch, live-copy rules), `test-messaging` (messaging and the server list), `test-settings` (`liveConfig` and the
+  settings lines), `test-detached` (`runDetached`), `test-dev-access` (the dev-only tools rule and every gate through
+  it), `test-remote-debug` (the remote debug ops and their limits), `test-net-inspect` (packet capture),
+  `test-explorer-core` (Dex), `test-toolbox-sanitize` (the Creator Store sanitizer) and `test-sha256` (the pairing-code
+  fingerprint). `node scripts/check-self-calls.mjs out` flags compiled functions that call themselves on their first
+  lines (after `bun run build`).
+- **Package contents:** only `out/` (no `.tsbuildinfo`), `README.md` and `LICENSE`; check with `bun pm pack --dry-run`.
 - **Explorer class icons:** `assets/class-icons.png` (kept locally, not in the repo: it is Roblox's own texture) is
   the client's `content/textures/ClassImages.PNG` (a 2352x16 strip) repacked into a 32-column grid, because live
   clients downscale textures wider than 1024 px:
   `ffmpeg -i ClassImages.PNG -vf "untile=147x1,tile=32x5:color=0x00000000" class-icons.png`. It is uploaded as image
   `rbxassetid://97389585475400`; `scripts/gen-explorer-icons.ts` generates the index table.
+
+## Release
+
+Publishing is tag-only, from CI (`.github/workflows/publish.yml`), with npm trusted publishing (OIDC, provenance):
+
+```sh
+# first commit src/version.ts set to the new version (npm version needs a clean tree)
+npm version 0.5.6 -m "release %s"
+git push origin main --follow-tags
+```
+
+The workflow runs on a `v*` tag, checks that the tag matches package.json and that the version isn't on npm yet, then
+`npm publish --provenance` (which runs `prepublishOnly`: a clean `rbxtsc --type package` into `out/`) and creates the
+GitHub release with generated notes. A prerelease version (`x.y.z-next.0`) goes to the `next` dist-tag and a GitHub
+prerelease; anything else to `latest`. Trusted publishing is set on npmjs.com (@typetorch/framework > Settings >
+Trusted publishing: this repo, workflow `publish.yml`, environment `npm`); an `NPM_TOKEN` repo secret is the fallback.
+Don't run `npm publish` by hand. Games pick the new version up with `bun update @typetorch/framework` and their next
+deploy, since the framework ships inside the payload.
+
 
 MIT licensed.
