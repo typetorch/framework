@@ -3,8 +3,6 @@ import { Trove } from "@rbxts/trove";
 import { $print, $warn } from "rbxts-transform-debug";
 import { bindHotAssets } from "../assets/hot-asset";
 import { syncHotAssets } from "../assets/sync";
-import { startDevtoolsClient } from "../devtools/client";
-import { startDevtoolsServer } from "../devtools/server";
 import type { ClientKernel, ServerKernel, SwapOutInfo } from "../kernel";
 import type {
 	BuildInfo,
@@ -21,6 +19,7 @@ import { ClientDispatcher, ServerDispatcher, setClientDispatcher, setServerDispa
 import { observePlayers } from "../players";
 import { Reflect } from "../reflection/reflect";
 import { bindTypeTorch, closeTypeTorch, startedTypeTorch, swapOutTypeTorch, TypeTorch, unbindTypeTorch } from "../typetorch";
+import { loadDevtoolsClient, loadDevtoolsServer } from "./devtools-loader";
 import { addModuleInstance, createLazy, isLazyTypeId, LAZY_PARAMETER, nameOfId, setModulePhase } from "./dependency";
 import { bindPlayerStates, playerState as openPlayerState } from "./player-state";
 import { persistKeys, RegisteredModule, registered, runningModules } from "./registry";
@@ -169,7 +168,7 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 		setServerDispatcher(dispatcher);
 		serverKernel.onMessage(dispatcher.dispatch);
 		root.connect(Players.PlayerRemoving, (player) => dispatcher.forget(player));
-		if (options.devtools !== false) startDevtoolsServer(serverKernel, dispatcher, root.extend());
+		if (options.devtools !== false) loadDevtoolsServer(serverKernel, dispatcher, root.extend());
 		stopNetwork = () => setServerDispatcher(undefined);
 	} else {
 		const clientKernel = kernel as ClientKernel;
@@ -182,7 +181,7 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 		}
 		// The server queues what it sends this player until this (0.3.0).
 		dispatcher.hello();
-		if (options.devtools !== false) onStarted = startDevtoolsClient(clientKernel, dispatcher, root.extend()).started;
+		if (options.devtools !== false) onStarted = loadDevtoolsClient(clientKernel, dispatcher, root.extend());
 		stopNetwork = () => {
 			dispatcher.stop();
 			setClientDispatcher(undefined);

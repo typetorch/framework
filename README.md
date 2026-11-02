@@ -189,6 +189,11 @@ return the generation's stop function, which the kernel calls on a swap.
   last minute's average, its slowest second and the physics FPS (`59.9 avg, 52.0 min, physics 60`; the warning colour
   under 50 on average). Older kernels show `needs kernel 0.4.2`. The same numbers ride on fleet heartbeats (the
   explorer's fleet table).
+- **Devtools reach devs only (kernel 0.5.6+):** the kernel leaves `devtools` off the shared client tree of a framework
+  with `devtools/on-demand.ts`. `runtime/devtools-loader.ts` then clones the folder, minus the server-only modules, into
+  each dev's PlayerGui (join, each generation, dev status changes), and that client copies it into its own tree and
+  starts it. On older kernels the folder stays in the tree as before. A failure costs a dev the menu, with a warning, and
+  never the generation.
 - **Dev-only tools (framework 0.4.1, `devtools/access.ts`):** Claude, Logs > Upload, Dex edits on the server, Network
   packet blocking and the hot-swap sound work under dev rules (private, reserved and Studio servers on a dev branch)
   for every dev, and on a public server an owner switched to a dev branch (Server > Branch) for owners only. Everywhere
