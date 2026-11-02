@@ -1,7 +1,7 @@
 import { HttpService, MessagingService, Players } from "@rbxts/services";
 import type { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
-import { isJobId, ROLL_CALL_TOPIC, RollCall, type RollCallRow } from "./devtools/roll-call";
+import { isJobId, ROLL_CALL_TOPIC, RollCall, type RollCallRow } from "./roll-call";
 import type { Channel, ServerKernel, ServerType } from "./kernel";
 import { countBudget } from "./budget";
 import { isCloudTest, jsonProblem } from "./messaging";
@@ -9,7 +9,7 @@ import { Relay } from "./runtime/relay";
 
 /**
  * The universe's live servers for game code: `TypeTorch.servers()` and `TypeTorch.setServerInfo()` (server only;
- * plans/19 item 19). Built on the framework's roll call (devtools/roll-call.ts; the same one Manage > Servers uses): no
+ * plans/19 item 19). Built on the framework's roll call (roll-call.ts; the same one Manage > Servers uses): no
  * MemoryStore, no heartbeat writes.
  *
  * - One roll call per generation, owned here and shared with the dev menu. Every server answers asks with its row: the

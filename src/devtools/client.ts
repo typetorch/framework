@@ -32,6 +32,7 @@ import {
 	viewerIsOwner,
 } from "./build-actions";
 import type { ClientDispatcher, LeafStats } from "../net/runtime";
+import { DEV_GUI_GENERATION, DEV_GUI_NAME, sweepStaleMenus } from "../runtime/dev-gui";
 import { runningModules } from "../runtime/registry";
 import { bump, popIn, popOut } from "../ui";
 import { ExplorerPersist, mountExplorer } from "./explorer";
@@ -454,28 +455,7 @@ function channelText(source: { channel?: Channel; rules?: Channel; branchChannel
  * removes it; the open state, tab, sub-tab, window rectangle and options survive the swap through the kernel persist
  * store.
  */
-const DEV_GUI_NAME = "TypeTorchDev";
-/** The client generation that built a dev menu gui (an attribute on the ScreenGui). */
-const DEV_GUI_GENERATION = "TypeTorchGeneration";
-
-/**
- * Destroys dev menus an older generation left behind. Its trove should have removed them, but a generation whose stop
- * was cut short (a throwing cleanup, before framework 0.5.2) left its menu on screen, dead, over the new one.
- * Menus without the attribute come from a framework before 0.5.2: always older, since this generation hasn't built one.
- */
-function sweepStaleMenus(playerGui: Instance, generation: number) {
-	for (const child of playerGui.GetChildren()) {
-		if (child.Name !== DEV_GUI_NAME || !child.IsA("ScreenGui")) continue;
-		const built = child.GetAttribute(DEV_GUI_GENERATION);
-		if (typeIs(built, "number") && built >= generation) continue;
-		pcall(() => child.Destroy());
-	}
-}
-
 export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDispatcher, trove: Trove): DevtoolsClient {
-	// Before anything else, so a leaked menu goes away even for players who never get the dev menu.
-	const startGui = Players.LocalPlayer.FindFirstChildOfClass("PlayerGui");
-	if (startGui) sweepStaleMenus(startGui, kernel.generation);
 	const state = kernel.persist<MenuState>(PERSIST_KEY, () => ({ open: false, tab: "Artifact" }));
 	if (state.sub === undefined) state.sub = {};
 	const subs = state.sub;

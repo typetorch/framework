@@ -1,6 +1,6 @@
 --!nocheck
 -- Offline test of the compiled game messaging and server list (out/messaging.luau, out/servers.luau, with
--- out/runtime/relay.luau and out/devtools/roll-call.luau) under Lune, against stub kernels: topic and data rules, the
+-- out/runtime/relay.luau and out/roll-call.luau) under Lune, against stub kernels: topic and data rules, the
 -- `from` filter, one kernel listener per topic, the relay, "needs kernel 0.3.8" on older kernels, the cloud test no-op,
 -- edit-mode loopback, server-only errors, publish errors (too big, bad data, queue full); the shared roll call on kernel
 -- 0.3.8 (onRollCall) and before (its own subscription), rows with `pv` and `i`, setServerInfo caps, servers() filters,
@@ -121,7 +121,7 @@ local Instance = {
 
 local env
 local modules = {}
-local PATHS = { relay = "out/runtime/relay.luau", ["roll-call"] = "out/devtools/roll-call.luau", messaging = "out/messaging.luau", servers = "out/servers.luau", budget = "out/budget.luau" }
+local PATHS = { relay = "out/runtime/relay.luau", ["roll-call"] = "out/roll-call.luau", messaging = "out/messaging.luau", servers = "out/servers.luau", budget = "out/budget.luau" }
 local function loadModule(name)
 	if modules[name] then
 		return modules[name]

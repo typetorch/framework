@@ -970,14 +970,14 @@ do
 	check("net: and every new request until the swap", later:getStatus() == "Rejected" and #clientSent == 2)
 end
 
--- Admin > Servers' roll call (0.2.1, devtools/roll-call.ts) over a fake MessagingService: three servers, an injected
+-- Admin > Servers' roll call (0.2.1, roll-call.ts) over a fake MessagingService: three servers, an injected
 -- clock, waits 20x shorter.
 do
 	local model = convert(roblox.deserializeModel(bytes)[1], nil)
 	inner[model].Name = "payload#rollcall"
 	local TS = requireModule(model.include.RuntimeLib)
 	local frameworkOut = model.include.node_modules["@typetorch"].framework.out
-	local module = TS.import(model.Server, frameworkOut, "devtools", "roll-call")
+	local module = TS.import(model.Server, frameworkOut, "roll-call")
 	local topics, published = {}, {}
 	local clock = 100
 	local function bus(jobId: string, entry)
