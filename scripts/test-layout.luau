@@ -305,6 +305,27 @@ do
 	check("too many windows cut to 6", #L.sanitizeLayout(many, known, single, "Artifact").windows == 6)
 end
 
+-- paneActions: what a pane's header buttons and the command palette's pane commands may do ---------------------------------
+do
+	local layout = L.newLayout("Artifact")
+	local only = L.paneActions(layout, 1, DESKTOP)
+	check("paneActions: the main panel's only pane splits and pops out, can't close", only.right and only.down and only.window and not only.close)
+	local phone = L.paneActions(layout, 1, PHONE)
+	check("paneActions: phones split down only", not phone.right and phone.down)
+	local right = L.splitLeaf(layout, 1, "row", "Logs", DESKTOP)
+	check("paneActions: two panes close", L.paneActions(layout, right.id, DESKTOP).close)
+	local win = L.popOut(layout, right.id, "Artifact", DESKTOP)
+	local inWindow = L.paneActions(layout, right.id, DESKTOP)
+	check("paneActions: a window's only pane closes (the window goes) but doesn't pop out again", inWindow.close and not inWindow.window)
+	check("paneActions: a window's pane splits within the window limit", inWindow.right and inWindow.down)
+	check("paneActions: unknown leaf: nothing", not L.paneActions(layout, 999, DESKTOP).close and not L.paneActions(layout, 999, DESKTOP).right)
+	for index = 1, 5 do
+		L.popOut(layout, L.splitLeaf(layout, 1, "column", "Logs", DESKTOP).id, "Artifact", DESKTOP)
+	end
+	check("paneActions: the window limit stops pop out", #layout.windows == 6 and not L.paneActions(layout, 1, DESKTOP).window, #layout.windows)
+	check("paneActions: window kept", win ~= nil)
+end
+
 print(`test-layout: {passed} passed, {failed} failed`)
 if failed > 0 then
 	process.exit(1)

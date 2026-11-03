@@ -64,6 +64,24 @@ export function buildLabel(action: BuildAction): string {
 	return action === "join" ? "Join" : "Load here";
 }
 
+/**
+ * The "pin" op's payload for a build the viewer may pin (`buildAction` "pin"): an A/B experiment pin when an owner pins
+ * on an unsigned public server whose kernel has experiments (0.2.3+), else the plain asset id. The Branch tab and the
+ * command palette both send this.
+ */
+export function pinPayload(ctx: PickerContext, assetId: number): number | { assetId: number; experiment: true } {
+	const abInPlace = ctx.serverType === "public" && ctx.isOwner && ctx.experiments && !ctx.signedOnly;
+	return abInPlace ? { assetId, experiment: true } : assetId;
+}
+
+/**
+ * Whether an action swaps what runs on THIS server (every player on it): the owner's switch or load ("here"), the stored
+ * switch and the dev pin. "join" moves only you. The command palette makes all of them two-step.
+ */
+export function swapsServer(action: BranchAction | BuildAction): boolean {
+	return action === "here" || action === "stored" || action === "pin";
+}
+
 /** Kernels before 0.3.4 on prod servers: in-game loads can't reach them, only `typetorch pin`. */
 export function showCliNote(ctx: PickerContext): boolean {
 	return !ctx.switchKernel && ctx.signedOnly && (ctx.isOwner || ctx.serverType !== "public");

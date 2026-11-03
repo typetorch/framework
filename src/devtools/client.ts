@@ -25,6 +25,7 @@ import {
 	buildLabel,
 	buildName,
 	PickerContext,
+	pinPayload,
 	requestSwitch,
 	showCliNote,
 	switchedText,
@@ -52,7 +53,10 @@ import {
 import { CLAUDE_IMAGE_CHUNK, ImageInbox, takeScreenshot } from "./claude-images";
 import { CLAUDE_TOOL_REQUEST, CLAUDE_TOOL_RESPONSE, findTool, formatLogHistory, inspectTool } from "./claude-tools";
 import { renderClaudeChat } from "./claude-ui";
-import { adminTabs, migrateControl } from "./admin-ui";
+import { adminTabs, migrateControl, PlayerFocus } from "./admin-ui";
+import { isPaletteHotkey, sanitizeRecent } from "./commands";
+import { createPalette, Palette } from "./palette";
+import { paletteCommands } from "./palette-commands";
 import { renderNetworkInspector } from "./network-inspector";
 import { renderAssetsTab } from "./assets-ui";
 import { renderStateTab, StateExplorerPersist } from "./state-ui";
@@ -267,6 +271,8 @@ interface MenuState {
 	openGroups?: string[];
 	/** Panes and floating windows (layout.ts); undefined = one pane on `tab`/`sub` (a fresh join). */
 	layout?: Layout;
+	/** The command palette's recent command ids, newest first (commands.ts). */
+	recentCommands?: string[];
 }
 
 // Formatting --------------------------------------------------------------------------------------------------------
@@ -1480,7 +1486,6 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			if (artifacts.size() === 0) body.text("None yet", COLORS.dim);
 			// Kernels before 0.3.4: a prod server takes only CLI-signed pins, so nothing loads in place there.
 			if (showCliNote(ctx)) body.text("Use the CLI: typetorch pin", COLORS.dim);
-			const abInPlace = ctx.serverType === "public" && isOwner && ctx.experiments && !ctx.signedOnly;
 			if (ctx.serverType === "public" && isOwner && !ctx.experiments && !ctx.signedOnly && !switchKernel) {
 				body.text("A/B needs kernel 0.2.3", COLORS.dim);
 			}
@@ -1561,7 +1566,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 								if (isPublic) setResult(`Everyone on this server runs ${short}`, COLORS.warn);
 								return;
 							}
-							act(`Loading ${short}`, "pin", abInPlace ? { assetId: entry.assetId, experiment: true } : entry.assetId);
+							act(`Loading ${short}`, "pin", pinPayload(ctx, entry.assetId));
 						},
 					});
 					expandable(loadRow, entry.assetId);
@@ -1608,6 +1613,9 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	// Claude: a Claude Code style chat (devtools/claude-ui.ts); "Dex path" sends the explorer's selection.
 	const renderClaude = (tab: TabContext) => renderClaudeChat(tab, { kernel, call, dexSelection: () => dexSelection, copyText, imageInbox });
 
+	/** The command palette's player lookup into Manage > Players (admin-ui.ts). */
+	const playerFocus = new PlayerFocus();
+
 	/** Keys: a tab name, or "Tab/Sub" for tabs with sub-tabs. */
 	const RENDER: Record<string, (tab: TabContext) => void> = {
 		Artifact: renderArtifact,
@@ -1617,7 +1625,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		"Server/Status": renderServer,
 		"Server/Branch": renderBranch,
 		"Server/Budget": (tab) => renderBudgetTab(tab, { call }),
-		...adminTabs({ kernel, call }),
+		...adminTabs({ kernel, call, playerFocus }),
 		Logs: renderLogs,
 		Dex: renderDex,
 		"Network/Packets": (tab) =>
@@ -1630,6 +1638,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 
 	let ui: Ui | undefined;
 	let wm: WindowManager | undefined;
+	/** The command palette (Ctrl+K, palette.ts), built with the menu. */
+	let palette: Palette | undefined;
 	let isOpen = false;
 	let dev = false;
 	/** This player is an owner (framework 0.3.2: the Manage group shows only for owners). */
@@ -1775,6 +1785,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		if (!ui || !isOpen) return;
 		isOpen = false;
 		state.open = false;
+		palette?.close();
 		wm?.fadeOut();
 		popOut(ui.window, () => {
 			if (!isOpen) wm?.unmount();
@@ -1782,6 +1793,19 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 	};
 
 	let open: () => void;
+	let openPalette: () => void;
+	const commands = paletteCommands({
+		kernel,
+		call,
+		wm: () => wm,
+		pages: () => paneHost.picks(),
+		owner: () => owner,
+		playerFocus,
+		swapText,
+		serverText,
+		report: (text, color) => palette?.report(text, color),
+		refresh: () => palette?.refresh(),
+	});
 	const build = (): Ui => {
 		const playerGui = Players.LocalPlayer.WaitForChild("PlayerGui");
 		sweepStaleMenus(playerGui, kernel.generation);
@@ -1846,7 +1870,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		);
 		subtitle.TextWrapped = false;
 		subtitle.TextTruncate = Enum.TextTruncate.AtEnd;
-		subtitle.Size = new UDim2(1, -170, 1, 0);
+		subtitle.Size = new UDim2(1, -212, 1, 0);
 		subtitle.Position = UDim2.fromOffset(114, 0);
 		const closeButton = style(make("TextButton", { AutoButtonColor: true }, header), "X", 16);
 		closeButton.Font = Enum.Font.BuilderSansBold;
@@ -1857,6 +1881,42 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		closeButton.Size = UDim2.fromOffset(34, 34);
 		corner(closeButton, 6);
 		closeButton.Activated.Connect(close);
+		// The command palette's button (touch has no Ctrl+K): a magnifier drawn from Frames (no glyphs).
+		const searchButton = make(
+			"TextButton",
+			{
+				Name: "Search",
+				Text: "",
+				AutoButtonColor: true,
+				BackgroundColor3: COLORS.button,
+				BorderSizePixel: 0,
+				AnchorPoint: new Vector2(1, 0.5),
+				Position: new UDim2(1, -50, 0.5, 0),
+				Size: UDim2.fromOffset(34, 34),
+			},
+			header,
+		);
+		corner(searchButton, 6);
+		const lens = make(
+			"Frame",
+			{ BackgroundTransparency: 1, Position: UDim2.fromOffset(9, 8), Size: UDim2.fromOffset(12, 12) },
+			searchButton,
+		);
+		corner(lens, 6);
+		make("UIStroke", { Color: COLORS.text, Thickness: 2, ApplyStrokeMode: Enum.ApplyStrokeMode.Border }, lens);
+		make(
+			"Frame",
+			{
+				BackgroundColor3: COLORS.text,
+				BorderSizePixel: 0,
+				AnchorPoint: new Vector2(0.5, 0.5),
+				Position: UDim2.fromOffset(23, 23),
+				Size: UDim2.fromOffset(8, 2),
+				Rotation: 45,
+			},
+			searchButton,
+		);
+		searchButton.Activated.Connect(() => openPalette());
 
 		// Sidebar (script-free ScrollingFrame): tabs, and for tabs with sub-tabs an indented group of children right
 		// under them (visible while that tab is selected). Clicking a group header opens its first child.
@@ -1992,7 +2052,26 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		}
 
 		gui.Parent = playerGui;
-		wm = createWindowManager({ gui, mainWindow: window, mainHost: host, trove, layout: () => layout, host: paneHost });
+		wm = createWindowManager({
+			gui,
+			mainWindow: window,
+			mainHost: host,
+			trove,
+			layout: () => layout,
+			host: paneHost,
+			covered: () => palette?.isOpen() === true,
+		});
+		palette = createPalette({
+			gui,
+			trove,
+			registry: commands.registry,
+			context: commands.context,
+			recent: () => sanitizeRecent(state.recentCommands),
+			setRecent: (list) => {
+				state.recentCommands = list;
+			},
+			opened: commands.load,
+		});
 
 		// Placement: drag by the header, resize by the grip, double-tap the header to reset. Saved across swaps.
 		const viewport = (): Vector2 => {
@@ -2086,6 +2165,14 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		wm?.show();
 	};
 
+	/** Ctrl+K / Cmd+K and the header's search button: the command palette (opens the menu first). */
+	openPalette = () => {
+		if (!dev) return;
+		open();
+		if (!isOpen) return;
+		palette?.open();
+	};
+
 	const setDev = (value: boolean) => {
 		if (value === dev) return;
 		dev = value;
@@ -2158,6 +2245,20 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		if (!ctrl || !shift) return;
 		if (isOpen) close();
 		else open();
+	});
+	// Ctrl+K (Cmd+K on a Mac: Super / Meta). Never while typing in chat or a TextBox (`processed`).
+	trove.connect(UserInputService.InputBegan, (input, processed) => {
+		if (!dev) return;
+		const held =
+			UserInputService.IsKeyDown(Enum.KeyCode.LeftControl) ||
+			UserInputService.IsKeyDown(Enum.KeyCode.RightControl) ||
+			UserInputService.IsKeyDown(Enum.KeyCode.LeftSuper) ||
+			UserInputService.IsKeyDown(Enum.KeyCode.RightSuper) ||
+			UserInputService.IsKeyDown(Enum.KeyCode.LeftMeta) ||
+			UserInputService.IsKeyDown(Enum.KeyCode.RightMeta);
+		if (!isPaletteHotkey(input.KeyCode.Name, held, processed)) return;
+		if (palette?.isOpen()) palette.close();
+		else openPalette();
 	});
 
 	return {

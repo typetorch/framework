@@ -765,10 +765,26 @@ interface Message {
 
 // The tab -------------------------------------------------------------------------------------------------------------
 
+function chatState(kernel: ClientKernel): ChatState {
+	return kernel.persist<ChatState>(PERSIST_KEY, () => ({ draft: "", attachPath: false, attachErrors: false }));
+}
+
+/** The open Claude tab's message box (one at most: Claude is a single page), for setClaudeDraft. */
+let showDraft: ((text: string) => void) | undefined;
+
+/**
+ * The command palette's "Ask Claude": replaces the draft with `text` (kept in the persist store like typing) and, when
+ * the Claude tab is open, shows it in its message box with the caret at the end. Nothing is sent.
+ */
+export function setClaudeDraft(kernel: ClientKernel, text: string) {
+	chatState(kernel).draft = text;
+	showDraft?.(text);
+}
+
 export function renderClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps) {
 	const { kernel, call } = deps;
 	const trove = tab.trove;
-	const state = kernel.persist<ChatState>(PERSIST_KEY, () => ({ draft: "", attachPath: false, attachErrors: false }));
+	const state = chatState(kernel);
 
 	// The chat takes the content's place in the window body (like the explorer).
 	const content = tab.content;
@@ -1097,6 +1113,15 @@ function buildClaudeChat(tab: ClaudeChatTab, deps: ClaudeChatDeps, host: Frame, 
 		state.draft = text;
 	});
 	fitBox();
+	const myShowDraft = (text: string) => {
+		box.Text = text;
+		box.CaptureFocus();
+		box.CursorPosition = text.size() + 1;
+	};
+	showDraft = myShowDraft;
+	trove.add(() => {
+		if (showDraft === myShowDraft) showDraft = undefined;
+	});
 
 	// The actions row draws above the message box (the "+" menu hangs over it).
 	const actions = make("Frame", { BackgroundTransparency: 1, Size: new UDim2(1, 0, 0, ROUND), LayoutOrder: 3, ZIndex: 5 }, composer);

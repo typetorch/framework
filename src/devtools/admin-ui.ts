@@ -137,6 +137,49 @@ export interface AdminDeps {
 	kernel: ClientKernel;
 	/** Sends one dev op and yields for the answer (client.ts `call`). */
 	call: (op: string, payload?: unknown) => [ok: boolean, result: unknown];
+	/** The command palette's player lookup (client.ts): who Manage > Players shows next. */
+	playerFocus?: PlayerFocus;
+}
+
+/** How long a palette request waits for Manage > Players to load (seconds). */
+const FOCUS_WAIT = 15;
+
+/** What the command palette asked Manage > Players for: show this player, and open Kick or Ban for them. */
+export interface PlayerFocusRequest {
+	userId: number;
+	action?: "kick" | "ban";
+	at: number;
+}
+
+/**
+ * The command palette's way into Manage > Players (one per client generation, client.ts): `request` remembers a player
+ * and tells an open Players tab; a tab that mounts later takes it after its first load. The Kick and Ban cards are the
+ * tab's own (reason, duration, armed button); the server re-checks every action.
+ */
+export class PlayerFocus {
+	private pending?: PlayerFocusRequest;
+	private readonly listeners = new Set<() => void>();
+
+	request(userId: number, action?: "kick" | "ban") {
+		this.pending = { userId, action, at: os.clock() };
+		for (const listener of this.listeners) task.spawn(listener);
+	}
+
+	/** The waiting request (dropped after FOCUS_WAIT s), taken once. */
+	take(): PlayerFocusRequest | undefined {
+		const pending = this.pending;
+		this.pending = undefined;
+		return pending !== undefined && os.clock() - pending.at <= FOCUS_WAIT ? pending : undefined;
+	}
+
+	waiting(): boolean {
+		return this.pending !== undefined;
+	}
+
+	listen(trove: Trove, listener: () => void) {
+		this.listeners.add(listener);
+		trove.add(() => this.listeners.delete(listener));
+	}
 }
 
 /** The Manage sub-tabs, keyed like client.ts RENDER ("Tab/Sub"). */
@@ -688,6 +731,7 @@ function renderPlayers(tab: AdminTab, deps: AdminDeps) {
 	const list = page.group(4);
 	const rows = new Map<number, PlayerRow>();
 	let busy = false;
+	let loaded = false;
 
 	const act = (label: string, op: string, userId: number, doneText: string) => {
 		if (busy) return;
@@ -873,6 +917,36 @@ function renderPlayers(tab: AdminTab, deps: AdminDeps) {
 		return row;
 	};
 
+	// The command palette's player lookup: scroll to the player and flash their row, or open Kick / Ban for them.
+	const applyFocus = () => {
+		const focus = deps.playerFocus;
+		if (!focus || !loaded || !focus.waiting()) return;
+		const want = focus.take();
+		if (!want) return;
+		const row = rows.get(want.userId);
+		if (!row) {
+			setResult("Not in this server", COLORS.warn);
+			return;
+		}
+		const content = tab.content;
+		const top = row.frame.AbsolutePosition.Y - content.AbsolutePosition.Y + content.CanvasPosition.Y;
+		content.CanvasPosition = new Vector2(0, math.max(0, top - 8));
+		row.frame.BackgroundColor3 = COLORS.button;
+		bump(row.frame);
+		trove.add(
+			task.delay(1.5, () => {
+				if (row.frame.Parent) row.frame.BackgroundColor3 = COLORS.row;
+			}),
+		);
+		const data = row.data;
+		if (want.action === "kick") {
+			if (data.can.kick) openKick(data);
+			else setResult(`Can't kick ${data.displayName}`, COLORS.bad);
+		} else if (want.action === "ban") {
+			if (data.can.ban) openBan(data);
+			else setResult(`Can't ban ${data.displayName}`, COLORS.bad);
+		}
+	};
 	const refresh = () => {
 		const [ok, reply] = deps.call("admin.players");
 		if (!ok || !typeIs(reply, "table")) {
@@ -913,7 +987,11 @@ function renderPlayers(tab: AdminTab, deps: AdminDeps) {
 			row.frame.Destroy();
 			rows.delete(userId);
 		}
+		loaded = true;
+		applyFocus();
 	};
+
+	deps.playerFocus?.listen(trove, applyFocus);
 	every(trove, PLAYERS_REFRESH, refresh);
 }
 
