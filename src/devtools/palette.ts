@@ -78,6 +78,8 @@ export function createPalette<C>(options: PaletteOptions<C>): Palette {
 	let rows = new Array<RowView<C>>();
 	const armed: ArmedCommand = { at: -math.huge };
 	let statusToken = 0;
+	/** When the palette last opened (the hotkey's "k" can arrive in the box right after). */
+	let openedAt = -math.huge;
 
 	const root = trove.add(
 		make(
@@ -307,6 +309,10 @@ export function createPalette<C>(options: PaletteOptions<C>): Palette {
 
 	trove.connect(box.GetPropertyChangedSignal("Text"), () => {
 		if (!shown) return;
+		if (os.clock() - openedAt < 0.25 && box.Text.lower() === "k") {
+			box.Text = "";
+			return;
+		}
 		selected = 0;
 		armed.id = undefined;
 		list.CanvasPosition = Vector2.zero;
@@ -339,6 +345,7 @@ export function createPalette<C>(options: PaletteOptions<C>): Palette {
 		open: (query) => {
 			if (!shown) {
 				shown = true;
+				openedAt = os.clock();
 				selected = 0;
 				armed.id = undefined;
 				root.Visible = true;
