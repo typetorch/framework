@@ -185,6 +185,16 @@ return the generation's stop function, which the kernel calls on a swap.
   build picker (Server > Branch) and a Claude prompt. The sidebar, top to bottom: Artifact, Server, Network, Modules,
   Manage, Logs, Dex, Claude. The window can be dragged by its header and resized from its corner (double-tap the
   header to reset).
+- **Command palette (`Ctrl+K`, `Cmd+K` on a Mac, or the search button in the menu header):** opens the dev menu if it
+  is closed and searches every command the dev may run now (fuzzy: `swb` finds *Switch branch*). Up / Down pick,
+  Enter runs, Shift+Enter opens a page in a split, Escape closes; recent commands come first on an empty query. Never
+  fires while typing in chat or a text box. Commands: open any page; split right / down, open the pane in a new window,
+  close it, dock all windows; Reload, Roll back, switch branch, load a build here, join a server on a branch or build
+  (the Branch tab's rules and words, `devtools/build-actions.ts`), New server and Join a listed server (owners); find a
+  player by name, display name or UserId and open them in Manage > Players or their Kick / Ban card (owners); copy the
+  job id, artifact id, commit, branch or place version (the copy popup); "Ask Claude: ..." puts the query in the Claude
+  draft. Anything that swaps what runs on the server takes a second Enter or tap to confirm. The kernel and the server
+  re-check every request. Core: `devtools/commands.ts` (pure, Lune-tested by `scripts/test-commands.luau`).
 - **Server TPS (framework 0.4.2, kernel 0.4.2):** Server > Status has a *TPS* line next to Memory and Lua heap: the
   last minute's average, its slowest second and the physics FPS (`59.9 avg, 52.0 min, physics 60`; the warning colour
   under 50 on average). Older kernels show `needs kernel 0.4.2`. The same numbers ride on fleet heartbeats (the

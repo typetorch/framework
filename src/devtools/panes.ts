@@ -3,25 +3,25 @@ import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
 import { bump, popIn, popOut } from "../ui";
 import {
-	canSplit,
 	closeLeaf,
 	closeWindow,
-	countLeaves,
 	dockWindow,
 	FloatWindow,
 	Layout,
 	LayoutNode,
 	LeafNode,
 	leavesOf,
+	leavesWithPage,
 	limitsFor,
 	openPage,
+	PaneActions,
+	paneActions,
 	popOut as popOutLeaf,
 	raise,
 	repairFocus,
 	splitLeaf,
 	SplitDir,
 	SplitNode,
-	treeOf,
 	windowOf,
 	WindowRect,
 	clampRatio,
@@ -122,6 +122,8 @@ export interface WindowManagerOptions {
 	/** The layout, kept in the client persist store and changed in place. */
 	readonly layout: () => Layout;
 	readonly host: PaneHost;
+	/** An overlay (the command palette) has the pointer: presses don't focus panes or raise windows under it. */
+	readonly covered?: () => boolean;
 }
 
 export interface WindowManager {
@@ -137,6 +139,22 @@ export interface WindowManager {
 	readonly focusedPage: () => string | undefined;
 	/** Re-points panes: `map` returns a new page key, or undefined to keep it (non-owners lose Manage pages). */
 	readonly replacePages: (map: (page: string) => string | undefined) => void;
+	/**
+	 * The command palette (palette.ts): what the focused pane's header buttons may do now (layout.ts paneActions, plus
+	 * room for two panes for the splits) and how many floating windows are open. Undefined while the menu is closed.
+	 */
+	readonly focusedActions: () => (PaneActions & { windows: number }) | undefined;
+	/**
+	 * Splits the focused pane like its header button. `page` goes in the new pane (default: the same page, or the
+	 * fallback for a singleton); a singleton already open is focused instead. Returns a short reason when it can't.
+	 */
+	readonly splitFocused: (dir: SplitDir, page?: string) => string | undefined;
+	/** "Open in new window" on the focused pane. Returns a short reason when it can't. */
+	readonly popOutFocused: () => string | undefined;
+	/** Closes the focused pane. Returns a short reason when it can't. */
+	readonly closeFocused: () => string | undefined;
+	/** Docks every floating window into the main panel (like their dock buttons); stops at the first that doesn't fit. */
+	readonly dockAll: () => string | undefined;
 }
 
 interface PaneView {
@@ -554,14 +572,11 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
 	};
 
 	paintButtons = (view: PaneView) => {
-		const current = layout();
-		const limit = limits();
-		const tree = treeOf(current, view.owner);
-		const count = tree ? countLeaves(tree) : 1;
+		const can = paneActions(layout(), view.leaf.id, limits());
 		const right = view.buttons.get("right")!;
 		const down = view.buttons.get("down")!;
-		right.Visible = canSplit(current, view.owner, "row", limit);
-		down.Visible = canSplit(current, view.owner, "column", limit);
+		right.Visible = can.right;
+		down.Visible = can.down;
 		for (const [button, dir] of [
 			[right, "row"],
 			[down, "column"],
@@ -571,10 +586,9 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
 			const holder = button.FindFirstChild("Icon");
 			if (holder) paintIcon(holder, COLORS.dim, fits ? 0 : 0.65);
 		}
-		// A window's only pane already has a window of its own.
-		view.buttons.get("window")!.Visible = !(view.owner !== 0 && count === 1) && current.windows.size() < limit.windows;
-		// The main panel keeps at least one pane.
-		view.buttons.get("close")!.Visible = !(view.owner === 0 && count === 1);
+		// A window's only pane already has a window of its own; the main panel keeps at least one pane (layout.ts).
+		view.buttons.get("window")!.Visible = can.window;
+		view.buttons.get("close")!.Visible = can.close;
 	};
 
 	const paintFocus = () => {
@@ -1023,6 +1037,7 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
 		if (!shown) return;
 		if (input.KeyCode === Enum.KeyCode.Escape) return closeMenu();
 		if (!isPointer(input) || input.UserInputState !== Enum.UserInputState.Begin) return;
+		if (options.covered?.() === true) return;
 		const point = pointOf(input);
 		if (menu) {
 			// Either reading of the position inside the picker or its button keeps it open (the button toggles it).
@@ -1099,6 +1114,68 @@ export function createWindowManager(options: WindowManagerOptions): WindowManage
 		unmount,
 		open: (page) => openIn(layout().focus, page),
 		focusedPage,
+		focusedActions: () => {
+			if (!shown) return undefined;
+			const current = layout();
+			const can = paneActions(current, current.focus, limits());
+			const view = panes.get(current.focus);
+			if (view) {
+				can.right = can.right && splitFits(view, "row");
+				can.down = can.down && splitFits(view, "column");
+			}
+			return { ...can, windows: current.windows.size() };
+		},
+		splitFocused: (dir, page) => {
+			if (!shown) return "Menu closed";
+			const current = layout();
+			const view = panes.get(current.focus);
+			if (!view) return "No pane";
+			if (page === undefined) {
+				if (!paneActions(current, view.leaf.id, limits())[dir === "row" ? "right" : "down"]) return "No room for another pane";
+				split(view, dir);
+				return undefined;
+			}
+			// A singleton already open somewhere: focus it (the sidebar's rule).
+			if (host.single(page) && leavesWithPage(current, page).size() > 0) {
+				openIn(current.focus, page);
+				return undefined;
+			}
+			if (!splitFits(view, dir) || splitLeaf(current, view.leaf.id, dir, page, limits()) === undefined) return "No room for another pane";
+			relayout();
+			return undefined;
+		},
+		popOutFocused: () => {
+			if (!shown) return "Menu closed";
+			const current = layout();
+			const view = panes.get(current.focus);
+			if (!view || !paneActions(current, view.leaf.id, limits()).window) return "Can't open another window";
+			toWindow(view);
+			return undefined;
+		},
+		closeFocused: () => {
+			if (!shown) return "Menu closed";
+			const current = layout();
+			const view = panes.get(current.focus);
+			if (!view || !paneActions(current, view.leaf.id, limits()).close) return "The main panel keeps one pane";
+			closePane(view);
+			return undefined;
+		},
+		dockAll: () => {
+			if (!shown) return "Menu closed";
+			const current = layout();
+			if (current.windows.size() === 0) return "No windows";
+			let full = false;
+			for (const win of [...current.windows]) {
+				const found = findLeaf(current, current.focus);
+				const target = found && found[1] === 0 ? found[0].id : leavesOf(current.main)[0].id;
+				if (dockWindow(current, win.id, target, "row", limits()) === "full") {
+					full = true;
+					noteWindow(win.id, "Close a pane first");
+				}
+			}
+			relayout();
+			return full ? "Close a pane first" : undefined;
+		},
 		replacePages: (map) => {
 			let changed = false;
 			for (const leaf of leavesOf(layout().main)) {

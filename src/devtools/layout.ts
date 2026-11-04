@@ -184,6 +184,31 @@ export function canSplit(layout: Layout, owner: number, dir: SplitDir, limits: L
 	return countLeaves(tree) < (owner === 0 ? limits.main : limits.window);
 }
 
+/** What pane `id`'s header buttons (and the command palette's pane commands) may do now. */
+export interface PaneActions {
+	/** "Split right" / "Split down" (the limits; the pane's room for two is the window manager's own check). */
+	right: boolean;
+	down: boolean;
+	/** "Open in new window": a window's only pane already has one; the window limit. */
+	window: boolean;
+	/** "Close": the main panel keeps at least one pane. */
+	close: boolean;
+}
+
+export function paneActions(layout: Layout, id: number, limits: Limits): PaneActions {
+	const found = findLeaf(layout, id);
+	if (!found) return { right: false, down: false, window: false, close: false };
+	const owner = found[1];
+	const tree = treeOf(layout, owner);
+	const count = tree ? countLeaves(tree) : 1;
+	return {
+		right: canSplit(layout, owner, "row", limits),
+		down: canSplit(layout, owner, "column", limits),
+		window: !(owner !== 0 && count === 1) && layout.windows.size() < limits.windows,
+		close: !(owner === 0 && count === 1),
+	};
+}
+
 /**
  * Splits leaf `id`: the new pane shows `page` and goes right of it ("row") or under it ("column"). Returns the new leaf,
  * or undefined (unknown leaf, or the tree is full).
