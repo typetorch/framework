@@ -651,7 +651,7 @@ export interface MigrateInfo {
 }
 
 /** Mirrors admin.migrate (cosmetic; the server decides): owners on public servers, any dev elsewhere. */
-function mayMigrate(role: Role | undefined, serverType: string): boolean {
+export function mayMigrate(role: Role | undefined, serverType: string): boolean {
 	if (serverType === "public") return role === "owner";
 	return role !== undefined;
 }
