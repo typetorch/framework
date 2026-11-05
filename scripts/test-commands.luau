@@ -279,6 +279,35 @@ do
 	check("swapsServer: join doesn't", BA.swapsServer("join") == false and BA.swapsServer("here") and BA.swapsServer("stored") and BA.swapsServer("pin"))
 end
 
+-- The dev branch shortcut and the player commands ---------------------------------------------------------------------
+do
+	local owner = R.branchOffers(ctx(), "main", BRANCHES)
+	local dev = R.devBranchOffer(owner, BRANCHES)
+	check("dev shortcut: switch to the branch named dev, two-step", dev ~= nil and dev.title == "Switch to dev branch" and dev.kind == "switch" and dev.branch == "dev" and dev.confirm and dev.id == "server.devBranch")
+	check("dev shortcut: the offer itself is untouched", owner[1].id == "branch.switch:dev" and owner[1].title == "Switch to dev")
+	local joiner = R.devBranchOffer(R.branchOffers(ctx({ isOwner = false }), "main", BRANCHES), BRANCHES)
+	check("dev shortcut: devs join", joiner ~= nil and joiner.title == "Join a dev branch server" and not joiner.confirm)
+	check("dev shortcut: none on the dev branch itself", R.devBranchOffer(R.branchOffers(ctx(), "dev", BRANCHES), BRANCHES) == nil)
+	local named = { { name = "main", branchChannel = "prod" }, { name = "staging", branchChannel = "dev" } }
+	local staging = R.devBranchOffer(R.branchOffers(ctx(), "main", named), named)
+	check("dev shortcut: the only dev-channel branch", staging ~= nil and staging.branch == "staging")
+	local two = { { name = "main" }, { name = "a", branchChannel = "dev" }, { name = "b", branchChannel = "dev" } }
+	check("dev shortcut: several dev branches, none named dev: none", R.devBranchOffer(R.branchOffers(ctx(), "main", two), two) == nil)
+
+	local function titles(list)
+		local out = {}
+		for _, action in list do
+			table.insert(out, action.title)
+		end
+		return table.concat(out, "|")
+	end
+	local all = { tp = true, bring = true, respawn = true }
+	check("players: tp, bring, respawn", titles(R.playerActions(all, "Bob", false)) == "Player: Teleport to Bob|Player: Bring Bob|Player: Respawn Bob")
+	check("players: ops", R.playerActions(all, "Bob", false)[2].op == "admin.bring" and R.playerActions(all, "Bob", false)[1].op == "admin.tp")
+	check("players: yourself: respawn me only", titles(R.playerActions(all, "Me", true)) == "Player: Respawn me")
+	check("players: the server's can", titles(R.playerActions({ tp = true, bring = false, respawn = false }, "Owner", false)) == "Player: Teleport to Owner")
+end
+
 print(`test-commands: {passed} passed, {failed} failed`)
 if failed > 0 then
 	process.exit(1)

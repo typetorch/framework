@@ -9,6 +9,8 @@ import { branchAction, branchLabel, buildAction, buildLabel, buildName, buildTit
 /** A branch as the palette needs it (BranchInfo). */
 export interface BranchFact {
 	name: string;
+	/** Kernel 0.5.2: what the branch is (BranchInfo.branchChannel). */
+	branchChannel?: string;
 }
 
 /** A build as the palette needs it (ArtifactEntry). */
@@ -101,4 +103,61 @@ export function confirmText(offer: ServerOffer, players: number): string {
 	const name = offer.build !== undefined ? buildName(offer.build) : offer.branch;
 	if (offer.crossChannel === true) return `Load dev build ${name} on this prod server (${who})?`;
 	return `Load ${name} on this server (${who})?`;
+}
+
+/**
+ * The "dev branch" shortcut: the offer for the branch named "dev", else for the only branch the kernel calls dev
+ * (`branchChannel`), retitled "Switch to dev branch" / "Join a dev branch server". Undefined when there's no such
+ * offer (this server already runs it, or several dev branches and none named "dev").
+ */
+export function devBranchOffer(offers: ServerOffer[], branches: BranchFact[]): ServerOffer | undefined {
+	let name: string | undefined;
+	if (branches.some((branch) => branch.name === "dev")) name = "dev";
+	else {
+		const dev = branches.filter((branch) => branch.branchChannel === "dev");
+		if (dev.size() === 1) name = dev[0].name;
+	}
+	if (name === undefined) return undefined;
+	const offer = offers.find((candidate) => candidate.branch === name);
+	if (offer === undefined) return undefined;
+	const join = offer.kind === "joinBranch";
+	return {
+		...offer,
+		id: "server.devBranch",
+		title: join ? "Join a dev branch server" : "Switch to dev branch",
+	};
+}
+
+/** What Manage > Players allows on one player (AdminCan's movement half). */
+export interface PlayerCan {
+	tp: boolean;
+	bring: boolean;
+	respawn: boolean;
+}
+
+/** One movement command on a player: the Manage op, its title and the line once it worked. */
+export interface PlayerAction {
+	key: "tp" | "bring" | "respawn";
+	op: string;
+	title: string;
+	busy: string;
+	done: string;
+}
+
+/**
+ * The player commands Manage > Players' menu has for this player (same permissions: the server's `can`, and it
+ * re-checks): "Player: Teleport to X", "Player: Bring X", "Player: Respawn X" ("Respawn me" for yourself).
+ */
+export function playerActions(can: PlayerCan, who: string, you: boolean): PlayerAction[] {
+	const list = new Array<PlayerAction>();
+	if (can.tp && !you) list.push({ key: "tp", op: "admin.tp", title: `Player: Teleport to ${who}`, busy: `Going to ${who}`, done: `At ${who}` });
+	if (can.bring && !you) list.push({ key: "bring", op: "admin.bring", title: `Player: Bring ${who}`, busy: `Bringing ${who}`, done: `Brought ${who}` });
+	if (can.respawn) {
+		list.push(
+			you
+				? { key: "respawn", op: "admin.respawn", title: "Player: Respawn me", busy: "Respawning", done: "Respawned" }
+				: { key: "respawn", op: "admin.respawn", title: `Player: Respawn ${who}`, busy: `Respawning ${who}`, done: `Respawned ${who}` },
+		);
+	}
+	return list;
 }
