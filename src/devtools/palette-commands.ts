@@ -2,7 +2,7 @@ import { Players } from "@rbxts/services";
 import type { ArtifactEntry, BranchInfo, ClientKernel, DevInfo, KernelStatus, SwitchRequest } from "../kernel";
 import { normalRole, rulesOf } from "../kernel";
 import type { AdminPlayer, AdminPlayersReply, AdminServer, AdminServersReply } from "./admin-server";
-import { errorText, succeeded, type PlayerFocus } from "./admin-ui";
+import { errorText, mayMigrate, succeeded, type PlayerFocus } from "./admin-ui";
 import { requestSwitch, switchOffered, type PickerContext } from "./build-actions";
 import { setClaudeDraft } from "./claude-ui";
 import { CommandRegistry, type Command } from "./commands";
@@ -17,7 +17,7 @@ import { COLORS, copyText } from "./widgets";
  * - Pages: open any page in the focused pane (Shift+Enter: in a split); singletons focus their pane (panes.ts).
  * - Panes: Split right / down, Open in new window, Close pane, Dock all windows (the window manager's own operations).
  * - Server: Switch to dev branch (the dev branch's Branch-tab offer, pinned), Reload, Rollback (the Branch tab's ops),
- *   New server (Manage > Servers, owners).
+ *   Migrate all players to a new server (Server > Status' Migrate), New server (Manage > Servers, owners).
  * - Branches / Builds: one per Branch-tab row with a button, same rules and words (palette-rules.ts, build-actions.ts).
  * - Servers: Join a listed server (Manage > Servers' Join, owners).
  * - Players: find a player by name, display name or UserId; open them in Manage > Players, or its Kick / Ban cards;
@@ -257,6 +257,36 @@ export function paletteCommands(deps: PaletteDeps): PaletteCommands {
 		keepOpen: true,
 		confirm: (ctx) => `Roll this server (${players(playersHere(ctx))}) back to the previous generation?`,
 		run: () => act("Rolling back", "rollback", undefined, false),
+	});
+	registry.add({
+		id: "server.migrate",
+		title: "Migrate all players to a new server",
+		group: "Server",
+		keywords: ["migrate", "move", "everyone", "reserved", "fresh", "restart", "teleport"],
+		keepOpen: true,
+		// Server > Status' Migrate rule (cosmetic; admin.migrate decides): owners on public servers, any dev elsewhere.
+		when: (ctx) => {
+			const status = ctx.facts?.status;
+			const you = ctx.facts?.you;
+			if (status === undefined || status.serverType === "studio") return false;
+			return mayMigrate(you?.dev === true ? normalRole(you.role) : undefined, status.serverType);
+		},
+		confirm: (ctx) => {
+			const status = ctx.facts?.status;
+			const line = `Move all ${players(playersHere(ctx))} to a new server on ${status?.branch ?? "this branch"}?`;
+			return status?.serverType === "public" ? `${line} They leave public matchmaking.` : line;
+		},
+		run: () => {
+			if (busy) return deps.report("Busy with the last action", COLORS.warn);
+			busy = true;
+			deps.report("Reserving a server...", COLORS.dim);
+			task.spawn(() => {
+				const [ok, reply] = call("admin.migrate");
+				busy = false;
+				if (succeeded(ok, reply)) deps.report("Moving everyone...", COLORS.good);
+				else deps.report(`Failed: ${errorText(reply)}`, COLORS.bad);
+			});
+		},
 	});
 	registry.add({
 		id: "server.new",
