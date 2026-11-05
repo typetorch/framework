@@ -208,14 +208,14 @@ function every(trove: Trove, interval: number, callback: () => void) {
 	});
 }
 
-function errorText(reply: unknown): string {
+export function errorText(reply: unknown): string {
 	if (typeIs(reply, "table")) reply = (reply as { error?: unknown }).error;
 	if (typeIs(reply, "string")) return ERRORS[reply] ?? reply;
 	return "Failed";
 }
 
 /** The op succeeded and its reply isn't `{ ok: false }` (kernel reports). */
-function succeeded(ok: boolean, reply: unknown): boolean {
+export function succeeded(ok: boolean, reply: unknown): boolean {
 	return ok && !(typeIs(reply, "table") && (reply as { ok?: unknown }).ok === false);
 }
 
