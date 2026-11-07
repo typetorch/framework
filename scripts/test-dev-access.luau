@@ -156,6 +156,7 @@ local PATHS = {
 	claude = "out/devtools/claude.luau",
 	["toolbox-server"] = "out/devtools/toolbox-server.luau",
 	sha256 = "out/devtools/sha256.luau",
+	["util/sha256"] = "out/util/sha256.luau",
 }
 local env
 local modules = {}
@@ -178,6 +179,10 @@ local TS = {
 			return services
 		end
 		local parts = { ... }
+		-- devtools/sha256 re-exports util/sha256 (same last name): keep them apart.
+		if parts[#parts - 1] == "util" then
+			return loadModule("util/" .. parts[#parts])
+		end
 		return loadModule(parts[#parts])
 	end,
 }

@@ -1,13 +1,29 @@
--- Offline test of the compiled SHA-256 / HMAC / pairing-code fingerprint (out/devtools/sha256.luau) under Lune.
--- The expected values come from Node's crypto; the fingerprint vector is also checked by dev-server/test/security.test.ts.
+-- Offline test of the compiled SHA-256 / HMAC (out/util/sha256.luau) and the pairing-code fingerprint
+-- (out/devtools/sha256.luau, over the util) under Lune. The expected values come from Node's crypto; the fingerprint
+-- vector is also checked by dev-server/test/security.test.ts.
 -- Run after `bun run build` (Lune is pinned in kernel/rokit.toml):
---   cd ../kernel && lune run ../framework/scripts/test-sha256.luau ../framework/out/devtools/sha256.luau
+--   cd ../kernel && lune run ../framework/scripts/test-sha256.luau ../framework/out/
 local fs = require("@lune/fs")
 local luau = require("@lune/luau")
 local process = require("@lune/process")
 
-local path = process.args[1] or "out/devtools/sha256.luau"
-local sha = luau.load(fs.readFile(path), { debugName = "sha256" })()
+local base = process.args[1] or "out/"
+local util = luau.load(fs.readFile(base .. "util/sha256.luau"), { debugName = "sha256" })()
+-- devtools/sha256 imports util/sha256 through roblox-ts's TS.import: stub it.
+local script = { Name = "sha256", Parent = { Parent = {} } }
+local devtools = luau.load(fs.readFile(base .. "devtools/sha256.luau"), {
+	debugName = "devtools/sha256",
+	environment = setmetatable({
+		script = script,
+		_G = { [script] = {
+			import = function()
+				return util
+			end,
+		} },
+	}, { __index = _G }),
+})()
+-- Hashes from the util, the fingerprint (and the re-exports) from devtools.
+local sha = setmetatable({ codeFingerprint = devtools.codeFingerprint }, { __index = util })
 
 local failures = 0
 local function check(name, got, want)
@@ -33,6 +49,7 @@ check(
 check("hmac", sha.toHex(sha.hmacSha256Raw("key", "The quick brown fox jumps over the lazy dog")), "f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8")
 check("hmac long key", sha.toHex(sha.hmacSha256Raw(string.rep("k", 100), "msg")), "bd56a1782c2830e8abc6ed866a57a1230661e650b84c62f7ee3accc5fa5af491")
 check("fingerprint", sha.codeFingerprint("ABCDEFGHJKLMNPQRSTUV", "abc-def.trycloudflare.com"), "T4SP")
+check("devtools re-exports the util", devtools.sha256 == util.sha256 and devtools.hmacSha256Raw == util.hmacSha256Raw and devtools.toHex == util.toHex, true)
 check("fingerprint lowercases the host", sha.codeFingerprint("ABCDEFGHJKLMNPQRSTUV", "ABC-DEF.trycloudflare.com"), "T4SP")
 
 if failures > 0 then
