@@ -22,7 +22,8 @@ export type EventKind =
 	| "experiment"
 	| "custom"
 	| "recording_meta"
-	| "fleet";
+	| "fleet"
+	| "notify";
 
 export type DeviceKind = "desktop" | "phone" | "tablet" | "console" | "vr" | "unknown";
 
@@ -138,6 +139,8 @@ export interface AnalyticsSettings {
 	identity?: string;
 	/** basin: the token for `identity` (default: the settings' `fleet` token). Never logged. */
 	identityToken?: string;
+	/** Keep the first 32 chars of the game's own launch data on the join row (`launch`); default off (`launch_len` always). */
+	joinLaunchPrefix?: boolean;
 }
 
 /** AnalyticsSettings with every default filled in. */
@@ -152,6 +155,7 @@ export interface ResolvedSettings {
 	experiments: Map<string, ExperimentOverride>;
 	identity?: string;
 	identityToken?: string;
+	joinLaunchPrefix: boolean;
 }
 
 export type AnalyticsValue = string | number | boolean;

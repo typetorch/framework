@@ -17,6 +17,7 @@ import type {
 } from "../module";
 import { ClientDispatcher, ServerDispatcher, setClientDispatcher, setServerDispatcher } from "../net/runtime";
 import { observePlayers } from "../players";
+import { bindNotifications } from "../notifications";
 import { Reflect } from "../reflection/reflect";
 import { bindTypeTorch, closeTypeTorch, startedTypeTorch, swapOutTypeTorch, TypeTorch, unbindTypeTorch } from "../typetorch";
 import { loadDevtoolsClient, loadDevtoolsServer } from "./devtools-loader";
@@ -187,6 +188,9 @@ function start(realm: "server" | "client", kernel: ServerKernel | ClientKernel, 
 			setClientDispatcher(undefined);
 		};
 	}
+
+	// Notifications (plans/29): the server verifies launch data from the first join on, before any module loads.
+	bindNotifications(realm, kernel, root.extend());
 
 	// Hot assets (plans/13): the place matches this artifact's asset manifest before any module loads. Yields up to 8 s
 	// when versions change, never throws; loads still running after that swap in later (hotAsset().changed).

@@ -23,6 +23,7 @@ import type {
 } from "./kernel";
 import { branchChannelOf, normalRole, rulesOf } from "./kernel";
 import type { BuildInfo } from "./module";
+import type { Notifications, NotifyOpen, OptInResult } from "./notifications/api";
 import type { Modding } from "./reflection/modding";
 import { resolveModule, tryResolveModule } from "./runtime/dependency";
 import { playerState, type PlayerState } from "./runtime/player-state";
@@ -261,6 +262,14 @@ export interface TypeTorchApi {
 	 * most 256 at once. Older kernels: throws "needs kernel 0.3.8; use the DataHost job queue". See src/detached.ts.
 	 */
 	runDetached<T>(fn: () => T): Promise<T>;
+
+	// Notifications (plans/29) --------------------------------------------------------------------------------------------
+	/**
+	 * Native Roblox experience notifications through the TypeTorch backend. Server: `want` / `drop` intents (batched,
+	 * swap-safe, offline players by UserId), `onOpen` for players who joined from a verified notification. Client:
+	 * `promptOptIn(where)`. Outside a running generation every call is a no-op. See src/notifications/api.ts.
+	 */
+	notifications(): Notifications;
 }
 
 // State of this generation's binding ------------------------------------------------------------------------------------
@@ -547,7 +556,42 @@ class TypeTorchRuntime implements TypeTorchApi {
 	runDetached<T>(fn: () => T): Promise<T> {
 		return runDetached(fn);
 	}
+
+	notifications(): Notifications {
+		const factory = notificationsFactory;
+		if (factory) {
+			const [ok, core] = pcall(factory);
+			if (ok) return core;
+			$warn(`TypeTorch.notifications() is off in this generation: ${core}`);
+		}
+		return INERT_NOTIFICATIONS;
+	}
 }
+
+// Notifications: notifications/index.ts registers the factory (this module can't import it: the notifications import
+// TypeTorch).
+let notificationsFactory: (() => Notifications) | undefined;
+
+/** Framework-internal (notifications/index.ts): this generation's `notifications()` (undefined: none). */
+export function setNotificationsFactory(factory: (() => Notifications) | undefined) {
+	notificationsFactory = factory;
+}
+
+/** Edit mode (UI Labs stories) and stopped generations: nothing happens. */
+const INERT_NOTIFICATIONS: Notifications = {
+	want() {
+		return false;
+	},
+	drop() {
+		return false;
+	},
+	onOpen(_callback: (player: Player, open: NotifyOpen) => void) {
+		return () => {};
+	},
+	promptOptIn(): OptInResult {
+		return "unavailable";
+	},
+};
 
 /** The runtime API for game code (server and client). See `TypeTorchApi` and the README. */
 export const TypeTorch: TypeTorchApi = new TypeTorchRuntime();
