@@ -541,7 +541,7 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   when the player is alone) intersected with the players there, not a web call per player.
 
 **Settings, framework 0.4.0 / kernel 0.4.0 (plans/21):** the record's `backend` = `{ url, key, analytics?: { flushSeconds,
-recordShare, joinLaunchPrefix } }` (`typetorch backend setup`) is the whole sink: DuckDB at `<url>/v1/ingest` with the one key (Basin
+recordShare, joinLaunchPrefix, joinData } }` (`typetorch backend setup`) is the whole sink: DuckDB at `<url>/v1/ingest` with the one key (Basin
 identities to `<url>/v1/identity`). The old `analytics` value below is read while `backend` is missing, and stays the
 way to a Basin sink. The engine also tells the kernel each player's pid (`setAnalyticsId`: the kernel's error reports
 count affected players by pid, never by name) and counts its own DataStore and HTTP requests for the budget view (dev
@@ -564,6 +564,12 @@ there are no settings unless the game passes `new AnalyticsEngine({ settings })`
   Basin Pipelines Send permission, if the stream requires authentication). Without `recordings` nothing is recorded.
   The streams' schemas must match SCHEMA.md exactly: Basin drops rows that don't, silently.
 - `duckdb`: one `POST <events>` with `{"events":[...],"recordings":[...]}`, gzip, `Authorization: Bearer <token>`.
+- Join row settings (also in `backend.analytics`):
+
+  | Setting | Default | Meaning |
+  |---|---|---|
+  | `joinData` | `"full"` | `"full"`: the join row's summary props plus `jd`, a privacy-safe copy of the whole `GetJoinData()` (at most 1 KB: launch data up to 200 bytes, place / game ids, the join context as text, the TeleportData's size, type and keys but never its content, Members / referrer / followed user as pids or `"other"`, unknown fields by type; plans/30). `"summary"`: no `jd`. `"off"`: no `jd` and only the join props from before plans/29 (`from`, `ctx`, `tp`, `party`, age, prem, country, friends, ret). Anything else warns and means `"full"`. Games that put personal data in launch data should use `"summary"` |
+  | `joinLaunchPrefix` | `false` | `true`: the summary `launch` keeps the first 32 characters of the game's own launch data (`jd.LaunchData` follows `joinData`, not this) |
 - The token is write-only and never logged. Needs **Allow HTTP Requests** (Game Settings > Security). No key: the
   engine collects but keeps only the newest 1,000 rows until settings appear. Removing the key stops sending, live.
 
