@@ -57,7 +57,7 @@ First-ever-session detail, one row per packed chunk.
 
 | kind | name | props |
 |---|---|---|
-| session | `join` | `from`: `direct` (Home, search, sorts: Roblox doesn't say), `teleport` (same game), `teleport_game` (another game), `referral` (invite/referral link), `notification` (a TypeTorch notification's launch data verified), `share` (other launch data), `follow` (followed someone); join metadata (plans/29): `src_place?`, `src_game?` (SourcePlaceId / SourceGameId), `ref?` / `follow?` (the referrer / followed user as their pid when this game knows them, else `"other"`: never a UserId; players in the server are free, others cost one DataStore read each, at most 2 per join and only with read budget to spare), `party?` (players teleported along) + `party_pids?` (the pids of those this game knows, at most 10), `ctx?`, `ctx_item?`, `ctx_asset?`, `ctx_outfit?`, `ctx_asset_type?` (GameJoinContext JoinSource / ItemType / AssetId / OutfitId / AssetType), `launch?` (`notification` + `nid`, `nk` (kind); `tt_bad` + `launch_bad` (`format`, `sig`, `user`, `old`); or the game's own launch data: `launch_len`, plus its first 32 chars in `launch` only with the settings' `joinLaunchPrefix`), `tp?` + `tp_bytes?` (TeleportData present, its JSON size; never the content), `age_days` (exact account age), `locale?`, `verified?` (HasVerifiedBadge), `membership` (MembershipType name); `age` (account age: `<1d`, `1-7d`, `7-30d`, `30-90d`, `90-365d`, `1-3y`, `3y+`); `prem` (Premium); `country?` (ISO code); `friends` (how many of the player's friends are in the server: one friend-list lookup per join, at most 10 pages, `0` when it fails); `ret` (days since the last visit, `-1` first visit or unknown); `late?` (the engine started over 60 s after the join). `t` is the join time |
+| session | `join` | `from`: `direct` (Home, search, sorts: Roblox doesn't say), `teleport` (same game), `teleport_game` (another game), `referral` (invite/referral link), `notification` (a TypeTorch notification's launch data verified), `share` (other launch data), `follow` (followed someone); join metadata (plans/29): `src_place?`, `src_game?` (SourcePlaceId / SourceGameId), `ref?` / `follow?` (the referrer / followed user as their pid when this game knows them, else `"other"`: never a UserId; players in the server are free, others cost one DataStore read each, at most 2 per join and only with read budget to spare), `party?` (players teleported along) + `party_pids?` (the pids of those this game knows, at most 10), `ctx?`, `ctx_item?`, `ctx_asset?`, `ctx_outfit?`, `ctx_asset_type?` (GameJoinContext JoinSource / ItemType / AssetId / OutfitId / AssetType), `launch?` (`notification` + `nid`, `nk` (kind); `tt_bad` + `launch_bad` (`format`, `sig`, `user`, `old`); or the game's own launch data: `launch_len`, plus its first 32 chars in `launch` only with the settings' `joinLaunchPrefix`), `tp?` + `tp_bytes?` (TeleportData present, its JSON size; never the content), `age_days` (exact account age), `locale?`, `verified?` (HasVerifiedBadge), `membership` (MembershipType name); `age` (account age: `<1d`, `1-7d`, `7-30d`, `30-90d`, `90-365d`, `1-3y`, `3y+`); `prem` (Premium); `country?` (ISO code); `friends` (how many of the player's friends are in the server: one friend-list lookup per join, at most 10 pages, `0` when it fails); `ret` (days since the last visit, `-1` first visit or unknown); `late?` (the engine started over 60 s after the join); `jd?` (plans/30, with the settings' `joinData` `"full"`, the default: the raw join data, below). With `joinData` `"off"` only `from`, `ctx`, `tp`, `party`, `age`, `prem`, `country`, `friends`, `ret`, `late` are written. `t` is the join time |
 | session | `device` (src client) | `dev?` (the device class, as the `dev` column; frameworks after 0.4.2, older ones leave it out), `input` (`kbm`, `touch`, `gamepad`, `vr`, `unknown`), `w`, `h` (viewport points), `touch`, `kb`, `mouse`, `pad`, `vr`. Once per session. The class (Roblox gives game scripts no OS): `vr` when VRService.VREnabled; `console` when GuiService:IsTenFootInterface(); touch without a keyboard: `tablet` when the viewport's short side is 600 points or more, else `phone` (the first hello waits up to 2 s for a real viewport); a keyboard or mouse: `desktop` (touch laptops, tablets with a keyboard); else `unknown` |
 | notify | `want`, `drop` | Notifications (plans/29), written by the game server: `k` (kind), `key?` (first 12 hex of SHA-256 of the intent's key; never the key), `at?`, `until?`, `offline` (want: the user isn't in this server; the row then has no pid), `why?` (drop) |
 | notify | `optin_check`, `optin_shown`, `optin_closed` | The client's opt-in prompt, checked and written by the server (at most 3 of each per session): `where`, `can` (check), `err?` (`timeout`, `swap` or the error's first 64 chars), `secs` (closed: how long it was up) |
@@ -162,9 +162,30 @@ repo's `bun run local` does it). Every new signed copy applies at once, so dials
 | `experiments` | none | Per experiment: `active: false` (everyone gets the first variant, not stamped), `weights` (per variant, in the game's order), `variant` (force one), `players` (`{ [UserId or pid]: variant }`, at most 200: forces one player's variant over everything else, stamped `forced`; each client's hello gets only its own entry). The CLI writes them: `typetorch experiment` |
 | `identity` | the settings' `fleet` url + `/v1/identity` | basin: where identity rows go (below); none and no `fleet` in the settings: not sent. duckdb: unused |
 | `identityToken` | the settings' `fleet` token | basin: the token for `identity`. Never logged |
+| `joinData` | `"full"` | `"full"`: the join row carries `jd` (below); `"summary"`: no `jd`; `"off"`: no `jd` and only the pre-plans/29 join props (no pid lookups). Anything else is an error line (warned) and means `"full"`. In `backend.analytics` (or the old `analytics` value) |
 | `joinLaunchPrefix` | false | true: the join row's `launch` keeps the first 32 characters of the game's own launch data (off: only `launch_len`). Set it in `backend.analytics` (or the old `analytics` value) |
 
 Unknown fields are ignored. Settings errors are warned once (never with the token).
+
+## The raw join data (`jd`, plans/30)
+
+The `session` / `join` row's `jd` prop mirrors `Player:GetJoinData()` field by field, privacy-safe, at most 1024 bytes of
+JSON (written by the framework's own encoder, so an empty table stays `{}` where the shape says object):
+
+| field | content |
+|---|---|
+| `keys` | The top-level keys Roblox returned, sorted (each cut to 32 characters) |
+| `LaunchData?`, `LaunchDataLen?` | The launch data cut to 200 bytes at a UTF-8 boundary, and its full byte length; present iff the key is |
+| `SourcePlaceId?`, `SourceGameId?` | Numbers, present iff the keys are |
+| `GameJoinContext?` | Present iff the key is: every field as text (EnumItems by name), `{}` when empty |
+| `TeleportData?` | `{ bytes?, type, keys? }`: its JSON size, type and top-level keys (at most 20, 32 characters each, sorted); never the content |
+| `Members?` | `{ count, pids? }`: each member's pid when this game knows them (players in the server, or one of the join's at most 2 budget-checked DataStore reads shared with the summary props), else `"other"`; the joining player by their own pid |
+| `ReferredByPlayerId?`, `FollowUserId?` | pid or `"other"`; absent for 0 |
+| `other?` | Any other top-level key: its type name only, never the value |
+| `trunc?` | `true` when cut to fit: TeleportData keys first (then the list), Members pids (then the list), LaunchData (shorter), GameJoinContext values (64 each), `other` |
+
+No other player's UserId is ever in `jd`. Example (Roblox dropped a notification's launch data):
+`{"keys":["GameJoinContext","LaunchData"],"LaunchData":"","LaunchDataLen":0,"GameJoinContext":{}}`.
 
 ## Transport
 
