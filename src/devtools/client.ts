@@ -1,4 +1,4 @@
-import { HttpService, Players, ReplicatedStorage, SoundService, UserInputService, Workspace } from "@rbxts/services";
+import { GuiService, HttpService, Players, ReplicatedStorage, SoundService, UserInputService, Workspace } from "@rbxts/services";
 import { Trove } from "@rbxts/trove";
 import { $warn } from "rbxts-transform-debug";
 import type {
@@ -1825,8 +1825,18 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		toggle.TextXAlignment = Enum.TextXAlignment.Center;
 		toggle.TextColor3 = COLORS.dark;
 		toggle.BackgroundColor3 = COLORS.accent;
-		toggle.Size = UDim2.fromOffset(60, 36);
-		toggle.Position = UDim2.fromOffset(12, 70);
+		toggle.Size = UDim2.fromOffset(52, 32);
+		// In Roblox's top bar row, right of its own buttons (GuiService.TopbarInset: the free part of the bar), so it never covers a
+		// game's top-left HUD (2026-11-07: on a phone the old fixed 12, 70 sat on the game's cash chip). No inset (an old top bar or none):
+		// the old spot.
+		const placeToggle = () => {
+			const inset = GuiService.TopbarInset;
+			const height = inset.Max.Y - inset.Min.Y;
+			toggle.Position =
+				inset.Width > 0 && height > 0 ? UDim2.fromOffset(math.floor(inset.Min.X + 8), math.floor(inset.Min.Y + (height - 32) / 2)) : UDim2.fromOffset(12, 70);
+		};
+		placeToggle();
+		trove.add(GuiService.GetPropertyChangedSignal("TopbarInset").Connect(placeToggle));
 		// Above every window (their ZIndex is their stacking order), under the page picker and the copy popup.
 		toggle.ZIndex = 800;
 		corner(toggle, 8);
