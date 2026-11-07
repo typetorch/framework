@@ -1,6 +1,6 @@
 {
 	"name": "@typetorch/framework",
-	"version": "0.5.7",
+	"version": "0.6.0",
 	"description": "TypeTorch framework for roblox-ts: hot-swappable modules (dependency injection, lifecycle, troves), guarded networking, hot assets and the in-game dev menu. Ships inside every TypeTorch artifact.",
 	"license": "MIT",
 	"author": "TypeTorch",
@@ -12,10 +12,21 @@
 	"bugs": {
 		"url": "https://github.com/typetorch/framework/issues"
 	},
-	"keywords": ["roblox", "roblox-ts", "rbxts", "hot-reload", "hot-swap", "dependency-injection", "typetorch"],
+	"keywords": [
+		"roblox",
+		"roblox-ts",
+		"rbxts",
+		"hot-reload",
+		"hot-swap",
+		"dependency-injection",
+		"typetorch"
+	],
 	"main": "out/init.luau",
 	"types": "out/index.d.ts",
-	"files": ["out", "!**/*.tsbuildinfo"],
+	"files": [
+		"out",
+		"!**/*.tsbuildinfo"
+	],
 	"publishConfig": {
 		"access": "public"
 	},
