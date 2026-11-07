@@ -1,13 +1,13 @@
 import { Players } from "@rbxts/services";
 import type { ArtifactEntry, BranchInfo, ClientKernel, DevInfo, KernelStatus, SwitchRequest } from "../kernel";
 import { normalRole, rulesOf } from "../kernel";
-import type { AdminServer, AdminServersReply } from "./admin-server";
-import type { PlayerFocus } from "./admin-ui";
+import type { AdminPlayer, AdminPlayersReply, AdminServer, AdminServersReply } from "./admin-server";
+import { errorText, mayMigrate, succeeded, type PlayerFocus } from "./admin-ui";
 import { requestSwitch, switchOffered, type PickerContext } from "./build-actions";
 import { setClaudeDraft } from "./claude-ui";
 import { CommandRegistry, type Command } from "./commands";
 import type { PaneActions, SplitDir } from "./layout";
-import { branchOffers, buildOffers, confirmText, type ServerOffer } from "./palette-rules";
+import { branchOffers, buildOffers, confirmText, devBranchOffer, playerActions, type ServerOffer } from "./palette-rules";
 import type { PickItem, WindowManager } from "./panes";
 import { COLORS, copyText } from "./widgets";
 
@@ -16,10 +16,12 @@ import { COLORS, copyText } from "./widgets";
  * Groups, in listing order:
  * - Pages: open any page in the focused pane (Shift+Enter: in a split); singletons focus their pane (panes.ts).
  * - Panes: Split right / down, Open in new window, Close pane, Dock all windows (the window manager's own operations).
- * - Server: Reload, Rollback (the Branch tab's ops), New server (Manage > Servers, owners).
+ * - Server: Switch to dev branch (the dev branch's Branch-tab offer, pinned), Reload, Rollback (the Branch tab's ops),
+ *   Migrate all players to a new server (Server > Status' Migrate), New server (Manage > Servers, owners).
  * - Branches / Builds: one per Branch-tab row with a button, same rules and words (palette-rules.ts, build-actions.ts).
  * - Servers: Join a listed server (Manage > Servers' Join, owners).
- * - Players: find a player by name, display name or UserId; open them in Manage > Players, or its Kick / Ban cards.
+ * - Players: find a player by name, display name or UserId; open them in Manage > Players, or its Kick / Ban cards;
+ *   Player: Teleport to / Bring / Respawn (Manage > Players' menu, its permissions; owners).
  * - Copy: job id, artifact id, commit, branch, place version (the copy popup: Roblox has no clipboard API).
  * - Claude: "Ask Claude: <query>" puts the query in the Claude tab's draft.
  * Everything that swaps what runs on this server is two-step. The kernel and the server re-check every request.
@@ -38,6 +40,8 @@ export interface PaletteFacts {
 	branches?: BranchInfo[];
 	artifacts?: ArtifactEntry[];
 	servers?: AdminServer[];
+	/** Owners: Manage > Players' list (what each player allows). */
+	players?: AdminPlayer[];
 }
 
 export interface PaletteContext {
@@ -71,6 +75,9 @@ export interface PaletteCommands {
 	readonly load: () => void;
 }
 
+/** Extra search words per player action ("tp" finds Teleport to). */
+const ACTION_WORDS = { tp: ["tp", "goto", "teleport"], bring: ["bring", "summon", "tp here"], respawn: ["respawn", "reset", "reload character"] };
+
 function players(count: number): string {
 	return `${count} player${count === 1 ? "" : "s"}`;
 }
@@ -92,7 +99,7 @@ export function paletteCommands(deps: PaletteDeps): PaletteCommands {
 			const [statusOk, statusReply] = call("status");
 			const [branchesOk, branchesReply] = call("branches");
 			const [artifactsOk, artifactsReply] = call("artifacts");
-			const fresh: PaletteFacts = { experiments: false, servers: facts?.servers };
+			const fresh: PaletteFacts = { experiments: false, servers: facts?.servers, players: facts?.players };
 			if (statusOk && typeIs(statusReply, "table")) {
 				const reply = statusReply as { server?: KernelStatus; you?: DevInfo; facts?: { experiments?: boolean } };
 				fresh.status = reply.server;
@@ -102,6 +109,10 @@ export function paletteCommands(deps: PaletteDeps): PaletteCommands {
 			if (branchesOk && typeIs(branchesReply, "table")) fresh.branches = branchesReply as BranchInfo[];
 			const artifacts = (typeIs(artifactsReply, "table") ? artifactsReply : {}) as { supported?: boolean; list?: ArtifactEntry[] };
 			if (artifactsOk && artifacts.supported === true) fresh.artifacts = artifacts.list ?? [];
+			if (deps.owner()) {
+				const [playersOk, playersReply] = call("admin.players");
+				if (playersOk && typeIs(playersReply, "table")) fresh.players = (playersReply as AdminPlayersReply).players;
+			} else fresh.players = undefined;
 			if (deps.owner() && os.clock() - serversAt >= SERVERS_TTL) {
 				const [serversOk, serversReply] = call("admin.servers");
 				if (serversOk && typeIs(serversReply, "table")) {
@@ -159,6 +170,18 @@ export function paletteCommands(deps: PaletteDeps): PaletteCommands {
 			loadFacts(true);
 		});
 	};
+	/** A Manage op on one player (Manage > Players' menu): its busy line, then its done line or the error. */
+	const manage = (busyText: string, op: string, userId: number, doneText: string) => {
+		if (busy) return deps.report("Busy with the last action", COLORS.warn);
+		busy = true;
+		deps.report(`${busyText}...`, COLORS.dim);
+		task.spawn(() => {
+			const [ok, reply] = call(op, { userId });
+			busy = false;
+			if (succeeded(ok, reply)) deps.report(doneText, COLORS.good);
+			else deps.report(`Failed: ${errorText(reply)}`, COLORS.bad);
+		});
+	};
 	const playersHere = (ctx: PaletteContext) => ctx.facts?.status?.players ?? Players.GetPlayers().size();
 	const report = (problem: string | undefined) => {
 		if (problem !== undefined) deps.report(problem, COLORS.warn);
@@ -209,7 +232,14 @@ export function paletteCommands(deps: PaletteDeps): PaletteCommands {
 	paneCommand("pane.close", "Close pane", ["remove"], (pane) => pane.close, (wm) => wm.closeFocused());
 	paneCommand("pane.dockAll", "Dock all windows", ["windows", "attach", "merge"], (pane) => pane.windows > 0, (wm) => wm.dockAll());
 
-	// Server: the Branch tab's Reload and Rollback, Manage > Servers' New server ----------------------------------
+	// Server: Switch to dev branch, the Branch tab's Reload and Rollback, Manage > Servers' New server -------------
+	registry.addSource((ctx) => {
+		const [, dev] = devShortcut(ctx);
+		if (dev === undefined) return [];
+		const command = offerCommand(dev, "Server", false);
+		command.keywords = [...(command.keywords ?? []), "dev", "branch", "switch"];
+		return [command];
+	});
 	registry.add({
 		id: "server.reload",
 		title: "Reload this server",
@@ -227,6 +257,36 @@ export function paletteCommands(deps: PaletteDeps): PaletteCommands {
 		keepOpen: true,
 		confirm: (ctx) => `Roll this server (${players(playersHere(ctx))}) back to the previous generation?`,
 		run: () => act("Rolling back", "rollback", undefined, false),
+	});
+	registry.add({
+		id: "server.migrate",
+		title: "Migrate all players to a new server",
+		group: "Server",
+		keywords: ["migrate", "move", "everyone", "reserved", "fresh", "restart", "teleport"],
+		keepOpen: true,
+		// Server > Status' Migrate rule (cosmetic; admin.migrate decides): owners on public servers, any dev elsewhere.
+		when: (ctx) => {
+			const status = ctx.facts?.status;
+			const you = ctx.facts?.you;
+			if (status === undefined || status.serverType === "studio") return false;
+			return mayMigrate(you?.dev === true ? normalRole(you.role) : undefined, status.serverType);
+		},
+		confirm: (ctx) => {
+			const status = ctx.facts?.status;
+			const line = `Move all ${players(playersHere(ctx))} to a new server on ${status?.branch ?? "this branch"}?`;
+			return status?.serverType === "public" ? `${line} They leave public matchmaking.` : line;
+		},
+		run: () => {
+			if (busy) return deps.report("Busy with the last action", COLORS.warn);
+			busy = true;
+			deps.report("Reserving a server...", COLORS.dim);
+			task.spawn(() => {
+				const [ok, reply] = call("admin.migrate");
+				busy = false;
+				if (succeeded(ok, reply)) deps.report("Moving everyone...", COLORS.good);
+				else deps.report(`Failed: ${errorText(reply)}`, COLORS.bad);
+			});
+		},
 	});
 	registry.add({
 		id: "server.new",
@@ -260,10 +320,17 @@ export function paletteCommands(deps: PaletteDeps): PaletteCommands {
 			else act(`Moving you to a server on ${offer.title}`, "newServer", { branch: build.branch, assetId: build.assetId }, true);
 		},
 	});
-	registry.addSource((ctx) => {
+	const devShortcut = (ctx: PaletteContext): [ServerOffer[], ServerOffer | undefined] => {
 		const picker = pickerOf(ctx);
-		if (picker === undefined || ctx.facts?.branches === undefined) return [];
-		return branchOffers(picker, ctx.facts.status?.branch, ctx.facts.branches).map((offer) => offerCommand(offer, "Branches", false));
+		const branches = ctx.facts?.branches;
+		if (picker === undefined || branches === undefined) return [[], undefined];
+		const offers = branchOffers(picker, ctx.facts!.status?.branch, branches);
+		return [offers, devBranchOffer(offers, branches)];
+	};
+	registry.addSource((ctx) => {
+		const [offers, dev] = devShortcut(ctx);
+		// The dev branch shows once, as the Server group's shortcut.
+		return offers.filter((offer) => offer.branch !== dev?.branch).map((offer) => offerCommand(offer, "Branches", false));
 	});
 	registry.addSource((ctx) => {
 		const picker = pickerOf(ctx);
@@ -310,6 +377,25 @@ export function paletteCommands(deps: PaletteDeps): PaletteCommands {
 			if (player === Players.LocalPlayer) continue;
 			list.push({ id: `player.kick:${userId}`, title: `Kick ${name}`, group: "Players", keywords, searchOnly: true, run: () => show(userId, "kick") });
 			list.push({ id: `player.ban:${userId}`, title: `Ban ${name}`, group: "Players", keywords, searchOnly: true, run: () => show(userId, "ban") });
+		}
+		// Teleport to / Bring / Respawn: Manage > Players' permissions, for players still here.
+		for (const data of ctx.facts?.players ?? []) {
+			const player = Players.GetPlayerByUserId(data.userId);
+			if (player === undefined) continue;
+			const keywords = [player.Name, player.DisplayName, tostring(data.userId), "player"];
+			const you = player === Players.LocalPlayer;
+			for (const action of playerActions(data.can, player.DisplayName, you)) {
+				list.push({
+					id: `player.${action.key}:${data.userId}`,
+					title: action.title,
+					group: "Players",
+					keywords: [...keywords, ...ACTION_WORDS[action.key]],
+					// Respawn me lists on an empty query; the others need a name.
+					searchOnly: !you,
+					keepOpen: true,
+					run: () => manage(action.busy, action.op, data.userId, action.done),
+				});
+			}
 		}
 		return list;
 	});
