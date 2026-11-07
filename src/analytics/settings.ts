@@ -131,6 +131,11 @@ export function parseSettings(raw: unknown, decode: (text: string) => unknown): 
 	const recordShare = clampNumber(entry.recordShare, 1, 0, 1, "recordShare", errors);
 	const techEvery = clampNumber(entry.techEvery, DEFAULT_TECH_EVERY, 15, 3600, "techEvery", errors);
 	const experiments = parseExperiments(entry.experiments, errors);
+	let joinLaunchPrefix = false;
+	if (entry.joinLaunchPrefix !== undefined) {
+		if (typeIs(entry.joinLaunchPrefix, "boolean")) joinLaunchPrefix = entry.joinLaunchPrefix;
+		else errors.push("joinLaunchPrefix must be true or false");
+	}
 	let identity: string | undefined;
 	if (entry.identity !== undefined) {
 		if (isUrl(entry.identity)) identity = entry.identity;
@@ -145,7 +150,7 @@ export function parseSettings(raw: unknown, decode: (text: string) => unknown): 
 
 	if ((backend !== "basin" && backend !== "duckdb") || !isUrl(entry.events)) return { errors };
 	return {
-		settings: { backend, events: entry.events, recordings, token, flushSeconds, recordShare, techEvery, experiments, identity, identityToken },
+		settings: { backend, events: entry.events, recordings, token, flushSeconds, recordShare, techEvery, experiments, identity, identityToken, joinLaunchPrefix },
 		errors,
 	};
 }
@@ -178,6 +183,7 @@ export function sinkSettings(backend: unknown, analytics: unknown, decode: (text
 		recordShare: extra.recordShare,
 		techEvery: extra.techEvery,
 		experiments: extra.experiments,
+		joinLaunchPrefix: extra.joinLaunchPrefix,
 	};
 }
 

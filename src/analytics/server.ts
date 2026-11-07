@@ -31,6 +31,9 @@ import {
 	type ServerHello,
 } from "./protocol";
 import { describeFailure } from "./hints";
+import { joinProps, wantedUserIds, type JoinDataLike, type JoinFacts, type LaunchVerdict } from "./join";
+import { registerBuiltinRows } from "./rows";
+import { readKeys, verifyToken } from "../notifications/token";
 import { backoffSeconds, classifyStatus, configWaitSeconds, newQueueState, RowQueue, takeToken, type BucketState, type QueueState } from "./queue";
 import {
 	RECORDING_CODEC,
@@ -96,6 +99,12 @@ const CLIENT_SESSION_MAX = 5000;
 const EXPERIMENTS_MAX = 32;
 /** Friend-list pages read per join for the join's `friends` (one web call each; most players fit on the first). */
 const FRIEND_PAGES_MAX = 10;
+/**
+ * DataStore reads per join for other players' pids (ref, follow, party; players in this server cost none), and the
+ * GetAsync budget a read leaves untouched.
+ */
+const JOIN_LOOKUPS_MAX = 2;
+const JOIN_LOOKUP_BUDGET = 20;
 /** A recording: at most this many bytes, chunks and seconds after the join. */
 const RECORDING_MAX_BYTES = 262144;
 const RECORDING_MAX_CHUNKS = 80;
@@ -356,6 +365,8 @@ export class ServerAnalytics {
 		});
 		// The dev menu (Status > Analytics, the Attention list) reads the counters through this.
 		trove.add(registerAnalyticsStatus(() => this.stats()));
+		// Notifications (and later built-ins) write their rows here (analytics/rows.ts).
+		trove.add(registerBuiltinRows((target, kind, name, props) => this.builtinRow(target, kind, name, props)));
 		if (this.testMode) print("[analytics] cloud test: rows are collected but nothing is sent (no uploads, no identity rows)");
 		this.startSettings();
 		this.startIntake();
@@ -457,6 +468,16 @@ export class ServerAnalytics {
 			src: "server",
 			props: encodeProps(props),
 		});
+	}
+
+	/** A built-in's row (analytics/rows.ts): on the player's session when they are here, else a server row (no pid). */
+	private builtinRow(target: Player | number | undefined, kind: EventKind, name: string, props: object) {
+		if (!isEventName(name)) return;
+		let player: Player | undefined;
+		if (typeIs(target, "Instance")) player = target;
+		else if (typeIs(target, "number")) player = Players.GetPlayerByUserId(target);
+		const session = player !== undefined && player.Parent === Players ? this.sessionOf(player) : player !== undefined ? this.sessions.get(player) : undefined;
+		this.emit(session, kind, name, encodeProps(props));
 	}
 
 	/** The player's session; created now if game code is faster than the engine's own join handler. */
@@ -740,26 +761,93 @@ export class ServerAnalytics {
 		pcall(() => kernel.budgetCount!("analytics", kind, op, n));
 	}
 
+	/** A player in this server's pid (free: their session), for the join row's ref / follow / party. */
+	private pidHere(userId: number): string | undefined {
+		for (const [other, session] of this.sessions) if (other.UserId === userId && session.ready && !session.temp) return session.pid;
+		return undefined;
+	}
+
+	/**
+	 * A player not in this server: this game's record of them (one GetAsync, no retries, only with read budget to
+	 * spare). undefined when unknown (never seen by this game, no budget, or the store can't be read).
+	 */
+	private pidFromRecord(userId: number, store: DataStore | undefined): string | undefined {
+		if (!store) return undefined;
+		const [budgetOk, budget] = pcall(() => DataStoreService.GetRequestBudgetForRequestType(Enum.DataStoreRequestType.GetAsync));
+		if (!budgetOk || budget < JOIN_LOOKUP_BUDGET) return undefined;
+		this.countBudget("datastore", "read");
+		const [ok, value] = pcall(() => store.GetAsync(`p/${userId}`)[0]);
+		if (!ok || !typeIs(value, "table")) return undefined;
+		const pid = (value as Partial<PlayerRecord>).pid;
+		return typeIs(pid, "string") && pid.size() >= 8 ? pid : undefined;
+	}
+
+	/** The join row's join metadata (analytics/join.ts): GetJoinData, the player facts, the launch data's verdict. */
 	private joinSource(player: Player): Record<string, unknown> {
-		const [ok, data] = pcall(() => player.GetJoinData());
-		const info: Record<string, unknown> = {};
-		let from = "direct";
-		if (ok && data) {
-			if (data.SourcePlaceId !== undefined && data.SourcePlaceId !== 0) {
-				from = data.SourceGameId !== undefined && data.SourceGameId !== game.GameId ? "teleport_game" : "teleport";
-			} else if (data.ReferredByPlayerId !== undefined && data.ReferredByPlayerId !== 0) from = "referral";
-			else if (data.LaunchData !== undefined && data.LaunchData !== "") from = "share";
-			const context = data.GameJoinContext;
+		const [ok, raw] = pcall(() => player.GetJoinData());
+		const facts: JoinFacts = {
+			userId: player.UserId,
+			gameId: game.GameId,
+			followUserId: player.FollowUserId,
+			accountAge: player.AccountAge,
+		};
+		const [localeOk, locale] = pcall(() => player.LocaleId);
+		if (localeOk) facts.locale = locale;
+		const [verifiedOk, verified] = pcall(() => player.HasVerifiedBadge);
+		if (verifiedOk) facts.verified = verified;
+		facts.membership = player.MembershipType.Name;
+		let data: JoinDataLike | undefined;
+		let launch: LaunchVerdict;
+		if (ok && raw) {
+			data = {
+				SourcePlaceId: raw.SourcePlaceId,
+				SourceGameId: raw.SourceGameId,
+				ReferredByPlayerId: raw.ReferredByPlayerId,
+				Members: typeIs(raw.Members, "table") ? [...raw.Members] : undefined,
+				HasTeleportData: raw.TeleportData !== undefined,
+				LaunchData: typeIs(raw.LaunchData, "string") ? raw.LaunchData : undefined,
+			};
+			const context = raw.GameJoinContext;
 			if (context !== undefined) {
-				const [contextOk, source] = pcall(() => context.JoinSource.Name);
-				if (contextOk) info.ctx = source;
+				const name = (value: unknown) => (typeIs(value, "EnumItem") ? value.Name : undefined);
+				const text = (value: unknown) => (typeIs(value, "string") ? value.sub(1, 32) : typeIs(value, "number") ? tostring(value) : undefined);
+				const [contextOk, read] = pcall(() => ({
+					JoinSource: name(context.JoinSource),
+					ItemType: name(context.ItemType),
+					AssetId: text(context.AssetId),
+					OutfitId: text(context.OutfitId),
+					AssetType: name(context.AssetType),
+				}));
+				if (contextOk) data.GameJoinContext = read;
 			}
-			if (data.TeleportData !== undefined) info.tp = true;
-			if (data.Members !== undefined && data.Members.size() > 0) info.party = data.Members.size();
+			if (raw.TeleportData !== undefined) {
+				const [encodedOk, encoded] = pcall(() => HttpService.JSONEncode(raw.TeleportData));
+				if (encodedOk) facts.tpBytes = encoded.size();
+			}
+			// The same check the notifications server makes (both verify; neither trusts the other's copy).
+			const settings = currentSettings();
+			const verdict = verifyToken(data.LaunchData, player.UserId, readKeys(settings?.backend?.notify), os.time());
+			launch = verdict === undefined ? undefined : verdict.ok ? { ok: true, nid: verdict.nid, kind: verdict.kind } : { ok: false, why: verdict.why };
 		}
-		if (from === "direct" && player.FollowUserId !== 0) from = "follow";
-		info.from = from;
-		return info;
+		const wanted = wantedUserIds(data, facts);
+		const pids = new Map<number, string>();
+		// Players here first (free), then at most JOIN_LOOKUPS_MAX DataStore reads per join, in wanted order (ref, follow,
+		// party).
+		let store: DataStore | undefined;
+		let reads = 0;
+		for (const userId of wanted) {
+			const here = this.pidHere(userId);
+			if (here !== undefined) {
+				pids.set(userId, here);
+				continue;
+			}
+			if (this.stopped || reads >= JOIN_LOOKUPS_MAX) continue;
+			reads += 1;
+			store = store ?? this.dataStore();
+			const pid = this.pidFromRecord(userId, store);
+			if (pid !== undefined) pids.set(userId, pid);
+		}
+		return joinProps(data, facts, (userId) => pids.get(userId), launch, { launchPrefix: this.settings?.joinLaunchPrefix === true });
 	}
 
 	/**

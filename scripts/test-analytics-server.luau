@@ -163,10 +163,12 @@ local HttpService = {
 }
 
 local records = {}
+local readKeys = {}
 local DataStoreService = {
 	GetDataStore = function()
 		return {
 			GetAsync = function(_, key)
+				table.insert(readKeys, key)
 				return records[key], nil
 			end,
 			UpdateAsync = function(_, key, transform)
@@ -369,6 +371,16 @@ function TS.import(_, parent, ...)
 		return loadAnalytics(path)
 	end
 	if parent == outFolder then
+		-- The real launch-token code (pure) for the join row's verdict.
+		if internals[path] == nil and (path == "notifications/token" or path == "util/sha256") then
+			local folder = { Name = path:match("^[^/]+"), Parent = outFolder }
+			local script = { Name = path:match("[^/]+$"), Parent = folder }
+			G[script] = TS
+			internals[path] = luau.load(fs.readFile(base .. path .. ".luau"), {
+				debugName = path,
+				environment = setmetatable({ script = script, _G = G }, { __index = _G }),
+			})()
+		end
 		return assert(internals[path], "no mock for " .. path)
 	end
 	error("unexpected import " .. path)
@@ -453,6 +465,13 @@ end
 records["p/2"] = { pid = "existingpid00000000000000000002", first = os.time() - 10 * 86400, last = os.time() - 3 * 86400 }
 local newbie = makePlayer(1, "NewbieName")
 local regular = makePlayer(2, "RegularName")
+-- Join metadata (plans/29): referred by the newbie (in this server: their pid, no read), a party with three players
+-- not here (99998 known to this game; at most 2 DataStore reads per join, so 99997 is never looked up), and launch data
+-- that claims to be a TypeTorch token but isn't well formed.
+records["p/99998"] = { pid = "knownpid0000000000000000099998", first = 1, last = 1 }
+function regular:GetJoinData()
+	return { ReferredByPlayerId = 1, Members = { 1, 2, 99999, 99998, 99997 }, LaunchData = "tt1n.not.a.token" }
+end
 PlayersService.list = { newbie, regular }
 -- The newbie's friend list holds the regular on page 2 (of 3); the regular's holds the newbie on page 11 (of 12),
 -- past the 10-page cap.
@@ -506,6 +525,19 @@ end
 local joinNewProps = joinNew and serde.decode("json", joinNew.props)
 local joinRegProps = joinReg and serde.decode("json", joinReg.props)
 check("join: new player props", joinNewProps and joinNewProps.from == "direct" and joinNewProps.ret == -1 and joinNewProps.age == "7-30d" and joinNewProps.country == "US" and joinNewProps.prem == false)
+check("join: referral as the referrer's pid", joinRegProps and joinRegProps.from == "referral" and joinRegProps.ref == newbiePid, joinRegProps and joinRegProps.ref)
+check("join: party + known pids only", joinRegProps and joinRegProps.party == 5 and #joinRegProps.party_pids == 2 and joinRegProps.party_pids[1] == newbiePid and joinRegProps.party_pids[2] == "knownpid0000000000000000099998")
+local otherReads = {}
+for _, key in readKeys do
+	if key:match("^p/9999") then
+		table.insert(otherReads, key)
+	end
+end
+check("join: at most 2 DataStore reads for other players", #otherReads == 2 and otherReads[1] == "p/99999" and otherReads[2] == "p/99998", table.concat(otherReads, ","))
+check("join: tt_bad launch", joinRegProps and joinRegProps.launch == "tt_bad" and joinRegProps.launch_bad == "format" and joinRegProps.launch_len == nil)
+check("join: player facts", joinRegProps and joinRegProps.age_days == 12 and joinRegProps.membership == "None")
+check("join: no other player's UserId", joinReg and not joinReg.props:find("99999", 1, true) and not joinReg.props:find("99997", 1, true) and not joinReg.props:find('"ref":1', 1, true))
+check("join: direct has no ref / launch", joinNewProps and joinNewProps.ref == nil and joinNewProps.launch == nil and joinNewProps.age_days == 12)
 check("join: returning ret = 3 days", joinRegProps and joinRegProps.ret == 3, joinRegProps and joinRegProps.ret)
 check("join: newp", joinNew.newp == true and joinReg.newp == false)
 check("join: device stamped", joinNew.dev == "phone" and joinReg.dev == "desktop")
