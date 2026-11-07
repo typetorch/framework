@@ -360,6 +360,27 @@ TypeTorch.runDetached(() => store.StartSessionAsync(`Player_${userId}`)).then((p
   run at once per server (then it throws); one past 60 s is logged and flagged in Server > Status. Older kernels
   throw "needs kernel 0.3.8; use the DataHost job queue (Player data guide)": the other option, which works on every
   kernel. `features.runDetached` tells which one this server has.
+- **`notifications()`** (plans/29): native Roblox experience notifications through the TypeTorch backend (`backend.url`
+  / `backend.key`, the launch-token keys in `backend.notify` from `typetorch notify key rotate`; no kernel change).
+  The game says why a player should hear from it, the backend decides when and sends, the framework verifies the tap:
+
+  ```ts
+  const notify = TypeTorch.notifications();
+  // Server: intents (upsert by user + kind + key; offline players by UserId), batched and swap-safe.
+  notify.want(userIdOrPlayer, "gift_new", { key: letterId, until: expiresAt, params: { gift: "5 coins" }, data: `mail:${letterId}` });
+  notify.drop(userIdOrPlayer, "streak", "20034", "played"); // no key: every key of the kind
+  trove.add(notify.onOpen((player, open) => openMail(player, open.data))); // open: { nid, kind, data, ageSeconds, first }
+  // Client: Roblox's opt-in prompt, once per session (show your own explainer first). Yields until it closes.
+  const result = TypeTorch.notifications().promptOptIn("streak_2"); // "shown" | "unavailable" | "error" | "busy" | "already"
+  ```
+
+  Kinds are declared in typetorch.json `notifications` and pushed with the CLI. Intents go to
+  `<backend.url>/v1/notify/intents` every `flushSeconds` (and at 200); presence (`online` on join and every 3 h, `offline` on leave)
+  rides along while `backend.notify` is set. A join with `tt1n.` launch data is verified on the server (HMAC, the
+  player's UserId, 14 days; the previous key for 14 days after a rotation): `onOpen` gets only verified data, also for
+  players who joined before the callback connected. Rows (`kind = notify`): `want`, `drop`, `optin_check`,
+  `optin_shown`, `optin_closed`, `open`, `open_bad`, `played` (src/analytics/SCHEMA.md); the join row gets
+  `from = "notification"`. Without backend settings (Studio) nothing is posted; rows are still written.
 - **Edit mode** (UI Labs stories, no kernel): `running` is false, identity has defaults, `persist` keeps a local table,
   events never fire, and the server-only reads throw.
 
@@ -520,7 +541,7 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   when the player is alone) intersected with the players there, not a web call per player.
 
 **Settings, framework 0.4.0 / kernel 0.4.0 (plans/21):** the record's `backend` = `{ url, key, analytics?: { flushSeconds,
-recordShare } }` (`typetorch backend setup`) is the whole sink: DuckDB at `<url>/v1/ingest` with the one key (Basin
+recordShare, joinLaunchPrefix } }` (`typetorch backend setup`) is the whole sink: DuckDB at `<url>/v1/ingest` with the one key (Basin
 identities to `<url>/v1/identity`). The old `analytics` value below is read while `backend` is missing, and stays the
 way to a Basin sink. The engine also tells the kernel each player's pid (`setAnalyticsId`: the kernel's error reports
 count affected players by pid, never by name) and counts its own DataStore and HTTP requests for the budget view (dev
@@ -589,8 +610,10 @@ bun run build   # rbxtsc --type package -> out/
   vouch, live-copy rules), `test-messaging` (messaging and the server list), `test-settings` (`liveConfig` and the
   settings lines), `test-detached` (`runDetached`), `test-dev-access` (the dev-only tools rule and every gate through
   it), `test-remote-debug` (the remote debug ops and their limits), `test-net-inspect` (packet capture),
-  `test-explorer-core` (Dex), `test-toolbox-sanitize` (the Creator Store sanitizer) and `test-sha256` (the pairing-code
-  fingerprint). `node scripts/check-self-calls.mjs out` flags compiled functions that call themselves on their first
+  `test-explorer-core` (Dex), `test-toolbox-sanitize` (the Creator Store sanitizer), `test-sha256` (SHA-256 / HMAC in util and the
+  pairing-code fingerprint), `test-notifications` (the launch token with the contract's shared vector, intent checks,
+  the queue: batches of 200, rev order, a swap's handover), `test-notify-server` (the notifications server against
+  mocked services) and `test-analytics-join` (the join row's metadata; no other player's UserId). `node scripts/check-self-calls.mjs out` flags compiled functions that call themselves on their first
   lines (after `bun run build`).
 - **Package contents:** only `out/` (no `.tsbuildinfo`), `README.md` and `LICENSE`; check with `bun pm pack --dry-run`.
 - **Explorer class icons:** `assets/class-icons.png` (kept locally, not in the repo: it is Roblox's own texture) is
