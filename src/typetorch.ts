@@ -266,7 +266,7 @@ export interface TypeTorchApi {
 	// Notifications (plans/29) --------------------------------------------------------------------------------------------
 	/**
 	 * Native Roblox experience notifications through the TypeTorch backend. Server: `want` / `drop` intents (batched,
-	 * swap-safe, offline players by UserId), `onOpen` for players who joined from a verified notification. Client:
+	 * swap-safe, offline players by UserId), `setOff` (a player's switched-off kinds), `onOpen` for players who joined from a verified notification. Client:
 	 * `promptOptIn(where)`. Outside a running generation every call is a no-op. See src/notifications/api.ts.
 	 */
 	notifications(): Notifications;
@@ -580,6 +580,9 @@ export function setNotificationsFactory(factory: (() => Notifications) | undefin
 /** Edit mode (UI Labs stories) and stopped generations: nothing happens. */
 const INERT_NOTIFICATIONS: Notifications = {
 	want() {
+		return false;
+	},
+	setOff() {
 		return false;
 	},
 	drop() {

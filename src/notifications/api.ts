@@ -41,6 +41,15 @@ export interface Notifications {
 	/** Server: drops the intent (no key: every key of that kind), e.g. the player already did it. Row `drop`. */
 	drop(user: Player | number, kind: string, key?: string, why?: string): boolean;
 	/**
+	 * Server: the kinds this user switched off in the game's settings. REPLACES the user's whole off set (an empty list =
+	 * every kind on); at most 32 kind names (1-24 of [a-z0-9_]; need not be pushed yet), duplicates ignored. The backend
+	 * then skips that user's intents of those kinds whoever issued them (another server's `want` for an offline player
+	 * too), keeping them: switched back on, an intent whose window is still open goes out. Test sends and custom one-offs
+	 * ignore it. Batched and swap-safe like `want` (the latest call wins); false (with a warning) when refused here.
+	 * Call it whenever the player's setting changes, and once per join if the game is the source of truth.
+	 */
+	setOff(user: Player | number, kinds: string[]): boolean;
+	/**
 	 * Server: `callback(player, open)` for each player who joined from a notification (verified launch data), including
 	 * those who joined before the first callback connected in this generation. Returns a disconnect (for the trove).
 	 */

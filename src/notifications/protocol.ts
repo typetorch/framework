@@ -28,6 +28,8 @@ export const PARAM_VALUE_MAX = 64;
 export const DATA_MAX = 64;
 export const TEMPLATE_MAX = 128;
 export const WHY_MAX = 64;
+/** Kinds one user can switch off at most (`setOff`). */
+export const OFF_MAX = 32;
 
 export interface WantItem {
 	op: "want";
@@ -59,7 +61,16 @@ export interface PresenceItem {
 	at: number;
 }
 
-export type Item = WantItem | DropItem | PresenceItem;
+/** Replaces the user's switched-off kinds (the backend skips their intents, whoever issued them: `pref_off`). */
+export interface PrefsItem {
+	op: "prefs";
+	u: number;
+	/** Sorted, unique kind names (at most OFF_MAX); empty = every kind on. */
+	off: string[];
+	rev: number;
+}
+
+export type Item = WantItem | DropItem | PresenceItem | PrefsItem;
 
 /** `want` options as game code passes them (checked by `cleanWant`). */
 export interface WantOptions {
@@ -197,6 +208,41 @@ export function cleanDrop(userId: unknown, kind: unknown, key: unknown, why: unk
 	return item;
 }
 
+/**
+ * The prefs item (`setOff`): the kinds as a list of kind names, duplicates removed, sorted; at most OFF_MAX. Kinds need
+ * not be in the pushed config yet (a kind added later is covered at once).
+ */
+export function cleanPrefs(userId: unknown, kinds: unknown, rev: number): PrefsItem | string {
+	if (!isUserId(userId)) return "the user must be a Player or a positive UserId";
+	if (!typeIs(kinds, "table")) return "kinds must be a list of kind names";
+	const list = kinds as unknown[];
+	let count = 0;
+	for (const [index] of pairs(list as object)) {
+		count += 1;
+		if (!typeIs(index, "number")) return "kinds must be a list of kind names";
+	}
+	if (count !== list.size()) return "kinds must be a list of kind names";
+	const seen = new Set<string>();
+	const off = new Array<string>();
+	for (const kind of list) {
+		if (!isKind(kind)) return "every kind must be 1-24 of [a-z0-9_]";
+		if (seen.has(kind)) continue;
+		seen.add(kind);
+		off.push(kind);
+	}
+	if (off.size() > OFF_MAX) return `at most ${OFF_MAX} kinds`;
+	off.sort();
+	return { op: "prefs", u: userId, off, rev };
+}
+
+/** Adds a prefs item, replacing one for the same user still waiting (only the newest set matters). */
+export function pushPrefs(state: QueueState, item: PrefsItem) {
+	const kept = new Array<Item>();
+	for (const entry of state.items) if (!(entry.op === "prefs" && entry.u === item.u)) kept.push(entry);
+	state.items = kept;
+	pushItem(state, item);
+}
+
 /** Adds an item; over the cap drops presence items first (the backend re-learns presence on the next join), then the oldest. */
 export function pushItem(state: QueueState, item: Item) {
 	state.items.push(item);
@@ -228,6 +274,10 @@ export function encodeItem(item: Item, quote: Quote): string {
 	parts.push(`"op":${quote(item.op)}`, `"u":${int(item.u)}`);
 	if (item.op === "presence") {
 		parts.push(`"online":${item.online ? "true" : "false"}`, `"at":${int(item.at)}`);
+		return `{${parts.join(",")}}`;
+	}
+	if (item.op === "prefs") {
+		parts.push(`"off":[${item.off.map((kind) => quote(kind)).join(",")}]`, `"rev":${int(item.rev)}`);
 		return `{${parts.join(",")}}`;
 	}
 	parts.push(`"k":${quote(item.k)}`);
