@@ -164,6 +164,18 @@ local prefixOn = S.parseSettings(S.sinkSettings({ url = "https://b.example.com",
 check("joinLaunchPrefix from backend.analytics", prefixOn.settings and prefixOn.settings.joinLaunchPrefix == true)
 local prefixBad = S.parseSettings({ backend = "duckdb", events = "https://a.example.com/ingest", joinLaunchPrefix = "yes" }, decode)
 check("joinLaunchPrefix must be a boolean", prefixBad.settings.joinLaunchPrefix == false and #prefixBad.errors == 1)
+-- joinData (plans/30): full by default; summary / off; anything else warns (an error line) and means full.
+check("joinData default full", json.settings.joinData == "full")
+for _, mode in { "full", "summary", "off" } do
+	local parsed = S.parseSettings(S.sinkSettings({ url = "https://b.example.com", key = "k", analytics = { joinData = mode } }, nil, decode), decode)
+	check("joinData " .. mode .. " from backend.analytics", parsed.settings and parsed.settings.joinData == mode and #parsed.errors == 0)
+end
+local oldValue = S.parseSettings({ backend = "duckdb", events = "https://a.example.com/ingest", joinData = "off" }, decode)
+check("joinData in the old analytics value", oldValue.settings.joinData == "off")
+for _, bad in { "raw", true, 1 } do
+	local parsed = S.parseSettings({ backend = "duckdb", events = "https://a.example.com/ingest", joinData = bad }, decode)
+	check("joinData bad value " .. tostring(bad) .. ": full + a warning", parsed.settings.joinData == "full" and #parsed.errors == 1 and parsed.errors[1]:find("joinData", 1, true) ~= nil)
+end
 check("array root", S.parseSettings("[1]", decode).settings == nil or false)
 check("bad backend", S.parseSettings({ backend = "clickhouse", events = "https://a.b" }, decode).settings == nil)
 check("bad url", S.parseSettings({ backend = "basin", events = "ftp://a.b" }, decode).settings == nil)

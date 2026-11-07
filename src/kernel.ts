@@ -818,7 +818,7 @@ export interface KernelSettings {
 	backend?: {
 		url: string;
 		key: string;
-		analytics?: { flushSeconds?: number; recordShare?: number; techEvery?: number; experiments?: unknown; joinLaunchPrefix?: boolean };
+		analytics?: { flushSeconds?: number; recordShare?: number; techEvery?: number; experiments?: unknown; joinLaunchPrefix?: boolean; joinData?: string };
 		/**
 		 * Plans/29 (no kernel change: the kernel keeps unknown fields of `backend`): the notification launch-token keys
 		 * `{ keys: { current, previous?, since } }` from `typetorch notify key rotate`. Read by notifications/token.ts.

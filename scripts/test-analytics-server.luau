@@ -538,6 +538,44 @@ check("join: tt_bad launch", joinRegProps and joinRegProps.launch == "tt_bad" an
 check("join: player facts", joinRegProps and joinRegProps.age_days == 12 and joinRegProps.membership == "None")
 check("join: no other player's UserId", joinReg and not joinReg.props:find("99999", 1, true) and not joinReg.props:find("99997", 1, true) and not joinReg.props:find('"ref":1', 1, true))
 check("join: direct has no ref / launch", joinNewProps and joinNewProps.ref == nil and joinNewProps.launch == nil and joinNewProps.age_days == 12)
+-- plans/30: the raw join data on the same row (joinData "full" by default), from the same lookups.
+local jdReg = joinRegProps and joinRegProps.jd
+check("jd: on the join row", jdReg ~= nil and jdReg.LaunchData == "tt1n.not.a.token" and jdReg.LaunchDataLen == 16)
+check("jd: keys", jdReg and table.concat(jdReg.keys, ",") == "LaunchData,Members,ReferredByPlayerId", jdReg and table.concat(jdReg.keys, ","))
+check("jd: referrer as pid", jdReg and jdReg.ReferredByPlayerId == newbiePid)
+check(
+	"jd: members by pid / other, the joining player by their own pid",
+	jdReg
+		and jdReg.Members.count == 5
+		and jdReg.Members.pids[1] == newbiePid
+		and jdReg.Members.pids[2] == "existingpid00000000000000000002"
+		and jdReg.Members.pids[3] == "other"
+		and jdReg.Members.pids[4] == "knownpid0000000000000000099998"
+		and jdReg.Members.pids[5] == "other",
+	jdReg and serde.encode("json", jdReg.Members)
+)
+check("jd: no extra DataStore reads", #otherReads == 2)
+check("jd: on the direct join too", joinNewProps and joinNewProps.jd ~= nil and #joinNewProps.jd.keys == 0)
+-- The joinData setting through the engine (joinSource returns { props, jd }).
+do
+	local settings = core1.settings
+	settings.joinData = "summary"
+	local summary = core1:joinSource(regular)
+	check("joinData summary: no jd, summary props", summary[2] == nil and summary[1].ref == newbiePid and summary[1].launch_bad == "format")
+	settings.joinData = "off"
+	local readsBefore = #readKeys
+	local off = core1:joinSource(regular)
+	local names = {}
+	for name in off[1] do
+		table.insert(names, name)
+	end
+	table.sort(names)
+	check("joinData off: no jd, the pre-plans/29 props only", off[2] == nil and table.concat(names, ",") == "from,party", table.concat(names, ","))
+	check("joinData off: no DataStore lookups", #readKeys == readsBefore)
+	settings.joinData = "full"
+	local full = core1:joinSource(regular)
+	check("joinData full: jd text", type(full[2]) == "string" and serde.decode("json", full[2]).Members.count == 5)
+end
 check("join: returning ret = 3 days", joinRegProps and joinRegProps.ret == 3, joinRegProps and joinRegProps.ret)
 check("join: newp", joinNew.newp == true and joinReg.newp == false)
 check("join: device stamped", joinNew.dev == "phone" and joinReg.dev == "desktop")

@@ -120,6 +120,144 @@ do
 	check("wantedUserIds: none", #J.wantedUserIds(nil, facts()) == 0)
 end
 
+-- The raw join data: jd (plans/30) -----------------------------------------------------------------------------------------
+do
+	local Enum = require("@lune/roblox").Enum
+	local encode = function(value)
+		return serde.encode("json", value)
+	end
+	local quote = function(text)
+		return serde.encode("json", text)
+	end
+	local function jd(raw, followUserId, lookup)
+		local value = J.joinDataJson(raw, followUserId or 0, lookup or pidOf, encode, quote)
+		if value == nil then
+			return nil, nil
+		end
+		local text = J.encodeJoinData(value, quote)
+		return serde.decode("json", text), text
+	end
+	local function noIds(label, text)
+		for _, userId in { REF, FOLLOW, FRIEND, STRANGER } do
+			check(label .. ": no UserId " .. userId, not text:find(tostring(userId), 1, true), text)
+		end
+	end
+
+	-- The evidence case: Roblox dropped the launch data, the context came back empty.
+	local evidence, evidenceText = jd({ LaunchData = "", GameJoinContext = {} })
+	check("evidence: keys sorted", #evidence.keys == 2 and evidence.keys[1] == "GameJoinContext" and evidence.keys[2] == "LaunchData")
+	check("evidence: empty launch data kept", evidence.LaunchData == "" and evidence.LaunchDataLen == 0)
+	check("evidence: empty context is {} (not [])", evidenceText:find('"GameJoinContext":{}', 1, true) ~= nil, evidenceText)
+	check("evidence: nothing else", evidence.SourcePlaceId == nil and evidence.Members == nil and evidence.TeleportData == nil and evidence.other == nil and evidence.trunc == nil)
+	local absent, absentText = jd({})
+	check("absent context: no key", absent.GameJoinContext == nil and absent.LaunchData == nil and absent.LaunchDataLen == nil and #absent.keys == 0)
+	check("absent: keys is a list", absentText:find('"keys":[]', 1, true) ~= nil, absentText)
+	check("GetJoinData failed: no jd", J.joinDataJson(nil, 0, pidOf, encode, quote) == nil)
+
+	-- Enum fields by .Name, every field as text.
+	local context = jd({ GameJoinContext = { JoinSource = Enum.JoinSource.CreatedItemAttribution, ItemType = Enum.AvatarItemType.Asset, AssetId = "123", OutfitId = 456, AssetType = Enum.AssetType.Hat } })
+	local c = context.GameJoinContext
+	check("context: enums by name", c.JoinSource == "CreatedItemAttribution" and c.ItemType == "Asset" and c.AssetType == "Hat", serde.encode("json", c))
+	check("context: every field as text", c.AssetId == "123" and c.OutfitId == "456")
+
+	-- Ids: numbers; ReferredByPlayerId 0: absent; Follow from the player.
+	local ids, idsText = jd({ SourcePlaceId = 1818, SourceGameId = 2828, ReferredByPlayerId = 0 }, FOLLOW)
+	check("place / game ids as numbers", ids.SourcePlaceId == 1818 and ids.SourceGameId == 2828)
+	check("ReferredByPlayerId 0: absent (key still listed)", ids.ReferredByPlayerId == nil and table.find(ids.keys, "ReferredByPlayerId") ~= nil)
+	check("FollowUserId unknown: other", ids.FollowUserId == "other")
+	noIds("ids", idsText)
+	local referred = jd({ ReferredByPlayerId = REF }, 0)
+	check("referrer known: pid", referred.ReferredByPlayerId == KNOWN[REF] and referred.FollowUserId == nil)
+
+	-- Members: pids or other, in order, with the count; the joining player by their own pid when known.
+	local lookup = function(userId)
+		if userId == ME then
+			return "pidme000000000000000000000000000"
+		end
+		return KNOWN[userId]
+	end
+	local members, membersText = jd({ Members = { ME, FRIEND, STRANGER, REF } }, 0, lookup)
+	check("members: count + pids in order", members.Members.count == 4 and members.Members.pids[1] == "pidme000000000000000000000000000" and members.Members.pids[2] == KNOWN[FRIEND] and members.Members.pids[3] == "other" and members.Members.pids[4] == KNOWN[REF])
+	noIds("members", membersText)
+
+	-- TeleportData: size, type, top-level keys (at most 20, 32 chars each, sorted), never the content.
+	local tp = {}
+	for index = 1, 30 do
+		tp[string.format("key%02d_", index) .. string.rep("z", 40)] = "SECRET" .. index
+	end
+	local teleport, teleportText = jd({ TeleportData = tp })
+	check("teleport: bytes", teleport.TeleportData.bytes == #encode(tp), teleport.TeleportData.bytes)
+	check("teleport: type", teleport.TeleportData.type == "table")
+	check("teleport: 20 keys, 32 chars, sorted", #teleport.TeleportData.keys == 20 and #teleport.TeleportData.keys[1] == 32 and teleport.TeleportData.keys[1] < teleport.TeleportData.keys[2])
+	check("teleport: never the content", not teleportText:find("SECRET", 1, true))
+	local scalar = jd({ TeleportData = "SECRETSTRING" })
+	check("teleport string: type + bytes only", scalar.TeleportData.type == "string" and scalar.TeleportData.keys == nil and scalar.TeleportData.bytes == 14)
+
+	-- LaunchData: 200 bytes at a UTF-8 boundary, the full length.
+	local long = string.rep("a", 199) .. "é" .. string.rep("b", 50) -- é = 2 bytes at 200..201
+	local launch = jd({ LaunchData = long })
+	check("launch: cut before a split character", launch.LaunchData == string.rep("a", 199) and launch.LaunchDataLen == #long, #launch.LaunchData)
+	check("launch: 3-byte character", J.cutUtf8(string.rep("a", 198) .. "€x", 200) == string.rep("a", 198) and J.cutUtf8("ab€", 5) == "ab€" and J.cutUtf8("ab€", 4) == "ab")
+	local exact = jd({ LaunchData = string.rep("c", 200) })
+	check("launch: exactly 200 kept", #exact.LaunchData == 200)
+	local nonString = jd({ LaunchData = 5 })
+	check("launch: not a string, by type", nonString.LaunchData == nil and nonString.other.LaunchData == "number")
+
+	-- Unknown keys: type only.
+	local extra, extraText = jd({ LaunchData = "x", NewRobloxField = { secret = "SECRETVALUE" }, Another = "SECRETTOO" })
+	check("unknown keys by type", extra.other.NewRobloxField == "table" and extra.other.Another == "string")
+	check("unknown keys: never the value", not extraText:find("SECRET", 1, true))
+	check("unknown keys listed", table.find(extra.keys, "NewRobloxField") ~= nil)
+
+	-- The 1 KB cap: TeleportData keys go first, then Members pids, then LaunchData; trunc.
+	local bigTp = {}
+	for index = 1, 20 do
+		bigTp[string.format("k%02d", index) .. string.rep("q", 29)] = index
+	end
+	local bigMembers = {}
+	for index = 1, 40 do
+		table.insert(bigMembers, 7000000000 + index)
+	end
+	local manyPids = function(userId)
+		if userId > 7000000000 then
+			return string.format("pid%029d", userId - 7000000000)
+		end
+		return nil
+	end
+	local capped, cappedText = jd({ LaunchData = string.rep("L", 200), TeleportData = bigTp, Members = bigMembers, GameJoinContext = { JoinSource = "Direct" } }, 0, manyPids)
+	check("cap: <= 1024 bytes", #cappedText <= J.JD_MAX_BYTES, #cappedText)
+	check("cap: trunc", capped.trunc == true)
+	check("cap: teleport keys dropped first", capped.TeleportData.keys == nil and capped.TeleportData.bytes ~= nil)
+	check("cap: members pids cut, count kept", capped.Members.count == 40 and (capped.Members.pids == nil or #capped.Members.pids < 40))
+	check("cap: launch data kept while pids could go", #capped.LaunchData == 200)
+	local small, smallText = jd({ LaunchData = "x", TeleportData = { a = 1 } })
+	check("under the cap: no trunc", small.trunc == nil and not smallText:find("trunc", 1, true))
+	-- Launch data shortens only after the lists are gone.
+	local launchHeavy = {}
+	for index = 1, 40 do
+		launchHeavy["field" .. index] = string.rep("v", 40)
+	end
+	local heavy, heavyText = jd({ LaunchData = string.rep("\"", 200), GameJoinContext = launchHeavy }, 0)
+	check("cap: escaped launch data + big context fits", #heavyText <= J.JD_MAX_BYTES and heavy.trunc == true, #heavyText)
+	check("cap: launch data shortened", heavy.LaunchData == nil or #heavy.LaunchData < 200)
+	check("cap: LaunchDataLen kept", heavy.LaunchDataLen == 200)
+end
+
+-- joinData "off": only the props from before plans/29 ----------------------------------------------------------------------
+do
+	local data = { SourcePlaceId = 777, SourceGameId = 99, ReferredByPlayerId = REF, Members = { FRIEND }, HasTeleportData = true, LaunchData = "abc", GameJoinContext = { JoinSource = "Direct", AssetId = "5" } }
+	local off = J.joinProps(data, facts({ followUserId = FOLLOW, tpBytes = 9 }), pidOf, nil, { mode = "off" })
+	local names = {}
+	for name in off do
+		table.insert(names, name)
+	end
+	table.sort(names)
+	check("off: legacy props only", table.concat(names, ",") == "ctx,from,party,tp", table.concat(names, ","))
+	local summary = J.joinProps(data, facts({ followUserId = FOLLOW, tpBytes = 9 }), pidOf, nil, { mode = "summary" })
+	check("summary: every summary prop", summary.src_place == 777 and summary.ref == KNOWN[REF] and summary.ctx_asset == "5" and summary.launch_len == 3)
+	check("modes", #J.JOIN_DATA_MODES == 3)
+end
+
 print(`analytics join: {passed} passed, {failed} failed`)
 if failed > 0 then
 	process.exit(1)
