@@ -31,11 +31,12 @@ import {
 	type ServerHello,
 } from "./protocol";
 import { describeFailure } from "./hints";
-import { joinProps, wantedUserIds, type JoinDataLike, type JoinFacts, type LaunchVerdict } from "./join";
+import { encodeJoinData, joinDataJson, joinProps, wantedUserIds, type JoinDataLike, type JoinDataMode, type JoinFacts, type LaunchVerdict } from "./join";
 import { registerBuiltinRows } from "./rows";
 import { readKeys, verifyToken } from "../notifications/token";
 import { backoffSeconds, classifyStatus, configWaitSeconds, newQueueState, RowQueue, takeToken, type BucketState, type QueueState } from "./queue";
 import {
+	PROPS_MAX_BYTES,
 	RECORDING_CODEC,
 	SCHEMA_VERSION,
 	type AnalyticsOptions,
@@ -216,6 +217,16 @@ function newId(): string {
 
 function quote(text: string): string {
 	return HttpService.JSONEncode(text);
+}
+
+/**
+ * The join props with `jd` (plans/30) spliced in as written by encodeJoinData (HttpService.JSONEncode would turn an
+ * empty GameJoinContext into `[]`). Left out if the props would pass PROPS_MAX_BYTES.
+ */
+function withJoinData(props: string, jd: string | undefined): string {
+	if (jd === undefined || props.sub(1, 1) !== "{" || props.sub(1, 7) === `{"_trun`) return props;
+	const text = props === "{}" ? `{"jd":${jd}}` : `${props.sub(1, -2)},"jd":${jd}}`;
+	return text.size() <= PROPS_MAX_BYTES ? text : props;
 }
 
 function decode(text: string): unknown {
@@ -783,7 +794,8 @@ export class ServerAnalytics {
 	}
 
 	/** The join row's join metadata (analytics/join.ts): GetJoinData, the player facts, the launch data's verdict. */
-	private joinSource(player: Player): Record<string, unknown> {
+	private joinSource(player: Player): [props: Record<string, unknown>, jd: string | undefined] {
+		const mode: JoinDataMode = this.settings?.joinData ?? "full";
 		const [ok, raw] = pcall(() => player.GetJoinData());
 		const facts: JoinFacts = {
 			userId: player.UserId,
@@ -829,8 +841,12 @@ export class ServerAnalytics {
 			const verdict = verifyToken(data.LaunchData, player.UserId, readKeys(settings?.backend?.notify), os.time());
 			launch = verdict === undefined ? undefined : verdict.ok ? { ok: true, nid: verdict.nid, kind: verdict.kind } : { ok: false, why: verdict.why };
 		}
-		const wanted = wantedUserIds(data, facts);
+		// joinData "off": none of the pid props, so no lookups either.
+		const wanted = mode === "off" ? [] : wantedUserIds(data, facts);
 		const pids = new Map<number, string>();
+		// The player's own pid, when a party lists them (jd.Members): free.
+		const own = this.pidHere(player.UserId);
+		if (own !== undefined) pids.set(player.UserId, own);
 		// Players here first (free), then at most JOIN_LOOKUPS_MAX DataStore reads per join, in wanted order (ref, follow,
 		// party).
 		let store: DataStore | undefined;
@@ -847,7 +863,15 @@ export class ServerAnalytics {
 			const pid = this.pidFromRecord(userId, store);
 			if (pid !== undefined) pids.set(userId, pid);
 		}
-		return joinProps(data, facts, (userId) => pids.get(userId), launch, { launchPrefix: this.settings?.joinLaunchPrefix === true });
+		const pidOf = (userId: number) => pids.get(userId);
+		const props = joinProps(data, facts, pidOf, launch, { launchPrefix: this.settings?.joinLaunchPrefix === true, mode });
+		// plans/30: the raw join data, privacy-safe, from the same lookups (no read of its own).
+		let jd: string | undefined;
+		if (mode === "full" && ok) {
+			const [built, value] = pcall(() => joinDataJson(raw, player.FollowUserId, pidOf, (item) => HttpService.JSONEncode(item), quote));
+			if (built && value !== undefined) jd = encodeJoinData(value, quote);
+		}
+		return [props, jd];
 	}
 
 	/**
@@ -882,7 +906,7 @@ export class ServerAnalytics {
 		while (session.device === undefined && os.clock() < deadline && player.Parent !== undefined && !this.stopped) task.wait(0.25);
 		if (session.joined || this.stopped) return;
 		session.joined = true;
-		const props = this.joinSource(player);
+		const [props, jd] = this.joinSource(player);
 		props.age = ageBucket(player.AccountAge);
 		props.prem = player.MembershipType === Enum.MembershipType.Premium;
 		const [countryOk, country] = pcall(() => LocalizationService.GetCountryRegionForPlayerAsync(player));
@@ -891,7 +915,7 @@ export class ServerAnalytics {
 		props.ret = session.ret;
 		// The engine started after this player joined (created later, or added by a deploy).
 		if (nowMs() - session.joinedAt > 60000) props.late = true;
-		this.emit(session, "session", "join", encodeProps(props), "server", session.joinedAt);
+		this.emit(session, "session", "join", withJoinData(encodeProps(props), jd), "server", session.joinedAt);
 	}
 
 	private onPlayer(player: Player) {

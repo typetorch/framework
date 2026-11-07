@@ -141,6 +141,11 @@ export interface AnalyticsSettings {
 	identityToken?: string;
 	/** Keep the first 32 chars of the game's own launch data on the join row (`launch`); default off (`launch_len` always). */
 	joinLaunchPrefix?: boolean;
+	/**
+	 * plans/30: "full" (default: the join row's summary props and `jd`, the raw join data privacy-safe), "summary" (no
+	 * `jd`), "off" (no `jd` and only the join props from before plans/29). Anything else warns and means "full".
+	 */
+	joinData?: "full" | "summary" | "off";
 }
 
 /** AnalyticsSettings with every default filled in. */
@@ -156,6 +161,7 @@ export interface ResolvedSettings {
 	identity?: string;
 	identityToken?: string;
 	joinLaunchPrefix: boolean;
+	joinData: "full" | "summary" | "off";
 }
 
 export type AnalyticsValue = string | number | boolean;
