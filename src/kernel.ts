@@ -815,7 +815,16 @@ export interface KernelSettings {
 	 * Kernel 0.4.0 / CLI 0.9 (plans/21): ONE backend and one key: heartbeats to <url>/v1/fleet/*, events to <url>/v1/ingest,
 	 * error reports to <url>/v1/errors. Replaces `fleet` and `analytics` (both still read while it is missing).
 	 */
-	backend?: { url: string; key: string; analytics?: { flushSeconds?: number; recordShare?: number; techEvery?: number; experiments?: unknown } };
+	backend?: {
+		url: string;
+		key: string;
+		analytics?: { flushSeconds?: number; recordShare?: number; techEvery?: number; experiments?: unknown; joinLaunchPrefix?: boolean };
+		/**
+		 * Plans/29 (no kernel change: the kernel keeps unknown fields of `backend`): the notification launch-token keys
+		 * `{ keys: { current, previous?, since } }` from `typetorch notify key rotate`. Read by notifications/token.ts.
+		 */
+		notify?: unknown;
+	};
 	/** The old fleet settings (before `backend`). */
 	fleet?: { url: string; token: string };
 	/** The old analytics sink settings (before `backend`; still the way to a Basin sink). */

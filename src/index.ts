@@ -31,6 +31,7 @@ export type { BranchChange, TypeTorchApi, TypeTorchFeatures } from "./typetorch"
 export type { MessageSource, MessagingApi, MessagingSubscribeOptions } from "./messaging";
 export type { GameServer, ServerListOptions } from "./servers";
 export type { LiveConfig, LiveConfigOptions } from "./settings";
+export type { Notifications, NotifyOpen, OptInResult, WantOptions } from "./notifications/api";
 export { observePlayers } from "./players";
 export { createNetwork, setNetworkLimits } from "./net";
 // @flamework/networking names on the same network, for migrating Flamework games (guides/from-flamework.md).
