@@ -61,6 +61,11 @@ export class NotifyClient implements Notifications {
 		return false;
 	}
 
+	setOff(_user: Player | number, _kinds: string[]): boolean {
+		$warn("[notifications] setOff() is server-only");
+		return false;
+	}
+
 	onOpen(_callback: (player: Player, open: NotifyOpen) => void): () => void {
 		$warn("[notifications] onOpen() is server-only (the launch data is verified on the server)");
 		return () => {};

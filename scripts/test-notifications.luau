@@ -1,8 +1,8 @@
 --!nocheck
 -- Offline test of the notifications' pure parts (plans/29) under Lune: the signed launch token (the contract's shared
 -- vector, sign -> verify, wrong user, too old, previous key within / after 7 days, bad sig, format), the key hash, the
--- intent checks, the queue (rev order, batching at 200, the body JSON, requeue after a failure, a swap's handover) and
--- the client's opt-in rows. Run after `bun run build`:
+-- intent checks, the queue (rev order, batching at 200, the body JSON, requeue after a failure, a swap's handover),
+-- the prefs item (setOff) and the client's opt-in rows. Run after `bun run build`:
 --   cd ../kernel && lune run ../framework/scripts/test-notifications.luau ../framework/
 local fs = require("@lune/fs")
 local luau = require("@lune/luau")
@@ -305,6 +305,41 @@ do
 	check("answer: junk", P.readIntentsAnswer("x").rejected == 0)
 	check("opened state", P.readOpenedState({ state = "first" }) == "first" and P.readOpenedState({ state = "repeat" }) == "repeat" and P.readOpenedState({ state = "unknown" }) == "unknown")
 	check("opened state: junk", P.readOpenedState({ state = "x" }) == nil and P.readOpenedState(nil) == nil)
+end
+
+-- Prefs (setOff): the user's switched-off kinds -------------------------------------------------------------------------------
+do
+	local prefs = P.cleanPrefs(42, { "streak", "gift_new", "streak", "daily" }, 11)
+	check("prefs: item, unique and sorted", type(prefs) == "table" and prefs.op == "prefs" and prefs.u == 42 and table.concat(prefs.off, ",") == "daily,gift_new,streak" and prefs.rev == 11, prefs)
+	check("prefs: empty = every kind on", type(P.cleanPrefs(42, {}, 1)) == "table" and #P.cleanPrefs(42, {}, 1).off == 0)
+	check("prefs: bad user", type(P.cleanPrefs(0, {}, 1)) == "string" and type(P.cleanPrefs(1.5, {}, 1)) == "string")
+	check("prefs: bad kind", type(P.cleanPrefs(1, { "Gift" }, 1)) == "string" and type(P.cleanPrefs(1, { string.rep("a", 25) }, 1)) == "string" and type(P.cleanPrefs(1, { 5 }, 1)) == "string")
+	check("prefs: not a list", type(P.cleanPrefs(1, "gift", 1)) == "string" and type(P.cleanPrefs(1, { a = "gift" }, 1)) == "string" and type(P.cleanPrefs(1, nil, 1)) == "string")
+	local many = {}
+	for index = 1, P.OFF_MAX + 1 do
+		table.insert(many, "k" .. index)
+	end
+	check("prefs: over the cap", type(P.cleanPrefs(1, many, 1)) == "string")
+	local capped = table.clone(many)
+	capped[P.OFF_MAX + 1] = "k1"
+	check("prefs: duplicates don't count toward the cap", type(P.cleanPrefs(1, capped, 1)) == "table" and #P.cleanPrefs(1, capped, 1).off == P.OFF_MAX)
+	check("encode prefs", P.encodeItem(prefs, quote) == '{"op":"prefs","u":42,"off":["daily","gift_new","streak"],"rev":11}', P.encodeItem(prefs, quote))
+	check("encode prefs: empty list", P.encodeItem(P.cleanPrefs(7, {}, 1762500000123), quote) == '{"op":"prefs","u":7,"off":[],"rev":1762500000123}')
+	check("encode prefs: valid JSON", serde.decode("json", P.encodeItem(prefs, quote)).off[2] == "gift_new")
+
+	-- The queue keeps one prefs item per user (the newest), behind the other items; batching and requeue as any item.
+	local state = P.newQueueState()
+	P.pushItem(state, P.cleanWant(42, "daily", nil, P.nextRev(state, 1762500000)))
+	P.pushPrefs(state, P.cleanPrefs(42, { "daily" }, P.nextRev(state, 1762500000)))
+	P.pushPrefs(state, P.cleanPrefs(43, { "streak" }, P.nextRev(state, 1762500000)))
+	P.pushPrefs(state, P.cleanPrefs(42, {}, P.nextRev(state, 1762500000)))
+	check("prefs queue: one per user, the newest last", #state.items == 3 and state.items[1].op == "want" and state.items[2].u == 43 and state.items[3].u == 42 and #state.items[3].off == 0)
+	check("prefs queue: revs keep the call order", state.items[3].rev > state.items[2].rev and state.items[2].rev > state.items[1].rev)
+	local batch, body = unpackBatch(P.takeBatch(state, quote))
+	local parsed = serde.decode("json", body)
+	check("prefs batch: body", #batch == 3 and parsed.items[3].op == "prefs" and #parsed.items[3].off == 0 and parsed.items[2].off[1] == "streak")
+	local handed = serde.decode("json", serde.encode("json", { items = batch }))
+	check("prefs: plain data across a swap", handed.items[2].off[1] == "streak")
 end
 
 -- Opt-in rows from a client ----------------------------------------------------------------------------------------------------

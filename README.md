@@ -369,6 +369,9 @@ TypeTorch.runDetached(() => store.StartSessionAsync(`Player_${userId}`)).then((p
   // Server: intents (upsert by user + kind + key; offline players by UserId), batched and swap-safe.
   notify.want(userIdOrPlayer, "gift_new", { key: letterId, until: expiresAt, params: { gift: "5 coins" }, data: `mail:${letterId}` });
   notify.drop(userIdOrPlayer, "streak", "20034", "played"); // no key: every key of the kind
+  // The kinds the player switched off in your settings: REPLACES their set ([] = all on), at most 32 names. The backend
+  // skips those intents whoever issued them (pref_off) and keeps them, so switching a kind back on resumes it.
+  notify.setOff(player, ["daily", "quests"]);
   trove.add(notify.onOpen((player, open) => openMail(player, open.data))); // open: { nid, kind, data, ageSeconds, first }
   // Client: Roblox's opt-in prompt, once per session (show your own explainer first). Yields until it closes.
   const result = TypeTorch.notifications().promptOptIn("streak_2"); // "shown" | "unavailable" | "error" | "busy" | "already"

@@ -14,11 +14,13 @@ import {
 	CHANNEL,
 	cleanDrop,
 	cleanOptInRow,
+	cleanPrefs,
 	cleanWant,
 	newQueueState,
 	nextRev,
 	pushCall,
 	pushItem,
+	pushPrefs,
 	readIntentsAnswer,
 	readOpenedState,
 	requeueItems,
@@ -242,6 +244,17 @@ export class NotifyServer implements Notifications {
 		}
 		pushItem(this.store.queue, item);
 		this.row(item.u, "drop", { k: item.k, key: item.key !== undefined ? keyHash(item.key) : undefined, why: item.why });
+		return true;
+	}
+
+	setOff(user: Player | number, kinds: string[]): boolean {
+		if (this.stopped) return false;
+		const item = cleanPrefs(userIdOf(user), kinds, nextRev(this.store.queue, os.time()));
+		if (typeIs(item, "string")) {
+			this.warn(`setOff refused: ${item}`);
+			return false;
+		}
+		pushPrefs(this.store.queue, item);
 		return true;
 	}
 
