@@ -4,6 +4,7 @@ import {
 	HttpService,
 	LocalizationService,
 	Players,
+	PolicyService,
 	RunService,
 	Stats,
 	Workspace,
@@ -112,8 +113,19 @@ const RECORDING_MAX_CHUNKS = 80;
 const RECORDING_MAX_SECONDS = 900;
 /** The join event waits this long for the client's device info. */
 const DEVICE_WAIT = 8;
+/** The join event waits this long for PolicyService's answer (GetPolicyInfoForPlayerAsync has no timeout of its own). */
+const POLICY_WAIT = 5;
 const ZONE_INTERVAL = 0.5;
 const ZONE_TAG = "TTZone";
+
+/**
+ * Player.DeviceTrustLevel's name (Pending, Unknown, None, Standard, Full; Roblox sets it once, some time after the join,
+ * and Studio never does), or undefined on an engine without the property. Roblox acts on none of it: data only.
+ */
+function deviceTrust(player: Player): string | undefined {
+	const [ok, level] = pcall(() => (player as unknown as { DeviceTrustLevel: EnumItem }).DeviceTrustLevel);
+	return ok && typeIs(level, "EnumItem") ? level.Name : undefined;
+}
 
 interface RecordingState {
 	/** Decided: recorded or not. */
@@ -901,6 +913,38 @@ export class ServerAnalytics {
 		return count;
 	}
 
+	/**
+	 * The join's player policy (PolicyService:GetPolicyInfoForPlayerAsync): `pol` = `ok`, `failed` or `timeout` (no answer in
+	 * POLICY_WAIT s), and with `ok` the answer: `pol_ads`, `pol_rand` (paid random items restricted), `pol_trade` (paid
+	 * item trading allowed), `pol_share` (content sharing allowed), `pol_subs` (eligible to buy a subscription), `pol_cn`
+	 * (China policies), `pol_links` (the allowed external link references, comma separated, "" = none).
+	 */
+	private policyProps(player: Player, props: Record<string, unknown>) {
+		let info: Record<string, unknown> | undefined;
+		let failed = false;
+		task.spawn(() => {
+			const [ok, result] = pcall(() => PolicyService.GetPolicyInfoForPlayerAsync(player));
+			if (ok && typeIs(result, "table")) info = result as unknown as Record<string, unknown>;
+			else failed = true;
+		});
+		const deadline = os.clock() + POLICY_WAIT;
+		while (info === undefined && !failed && os.clock() < deadline && player.Parent !== undefined && !this.stopped) task.wait(0.1);
+		const answer = info as Record<string, unknown> | undefined;
+		if (answer === undefined) {
+			props.pol = failed ? "failed" : "timeout";
+			return;
+		}
+		props.pol = "ok";
+		props.pol_ads = answer.AreAdsAllowed === true;
+		props.pol_rand = answer.ArePaidRandomItemsRestricted === true;
+		props.pol_trade = answer.IsPaidItemTradingAllowed === true;
+		props.pol_share = answer.IsContentSharingAllowed === true;
+		props.pol_subs = answer.IsEligibleToPurchaseSubscription === true;
+		props.pol_cn = answer.IsSubjectToChinaPolicies === true;
+		const links = typeIs(answer.AllowedExternalLinkReferences, "table") ? (answer.AllowedExternalLinkReferences as string[]) : [];
+		props.pol_links = links.join(",").sub(1, 120);
+	}
+
 	private emitJoin(player: Player, session: PlayerSession) {
 		const deadline = os.clock() + DEVICE_WAIT;
 		while (session.device === undefined && os.clock() < deadline && player.Parent !== undefined && !this.stopped) task.wait(0.25);
@@ -911,6 +955,8 @@ export class ServerAnalytics {
 		props.prem = player.MembershipType === Enum.MembershipType.Premium;
 		const [countryOk, country] = pcall(() => LocalizationService.GetCountryRegionForPlayerAsync(player));
 		if (countryOk) props.country = country;
+		this.policyProps(player, props);
+		props.trust = deviceTrust(player);
 		props.friends = this.friendsHere(player);
 		props.ret = session.ret;
 		// The engine started after this player joined (created later, or added by a deploy).
@@ -956,6 +1002,7 @@ export class ServerAnalytics {
 				encodeProps({
 					secs: math.floor((now - session.joinedAt) / 1000),
 					why,
+					trust: deviceTrust(player),
 					swap60: lastSwap !== undefined && os.time() - lastSwap <= 60 ? true : undefined,
 				}),
 			);
