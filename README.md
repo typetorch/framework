@@ -490,7 +490,7 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   economy are server-authoritative): on the client they warn once and send nothing, and the server refuses them from
   clients.
 - **Options** (all on by default): `sessions` (joins, leaves, device, join source, account age bucket, Premium,
-  country, friends in the server, first-ever vs returning, days since the last visit), `tech` (FPS, ping, memory, load
+  country, the player policy, device trust, friends in the server, first-ever vs returning, days since the last visit), `tech` (FPS, ping, memory, load
   time, client and server errors, swaps and rollbacks, leaves within 60 s of a swap), `zones` (parts or models tagged
   `TTZone`, named by a `Name` attribute or the instance name), `screens` (ScreenGuis in PlayerGui, GuiObjects tagged
   `TTScreen`), `recording` (the first-ever session in detail), `fleet` (kernel 0.3.2 heartbeats and deploy reports),
