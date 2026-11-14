@@ -300,6 +300,16 @@ export function rateAllows(state: RateState, now: number, perMinute: number, per
 	return lastMinute < perMinute;
 }
 
+/** Whole seconds (at least 1) until one more submit fits both windows; call after `rateAllows` said no. */
+export function rateWait(state: RateState, now: number, perMinute: number, perDay: number): number {
+	const times = state.times;
+	let wait = 0;
+	if (times.size() >= perDay) wait = DAY_SECONDS - (now - times[times.size() - perDay]);
+	const minute = times.filter((at) => now - at < MINUTE_SECONDS);
+	if (minute.size() >= perMinute) wait = math.max(wait, MINUTE_SECONDS - (now - minute[minute.size() - perMinute]));
+	return math.max(1, math.ceil(wait));
+}
+
 export function rateRecord(state: RateState, now: number) {
 	state.times.push(now);
 	while (state.times.size() > RATE_LIMIT_MAX) state.times.remove(0);

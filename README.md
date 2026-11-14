@@ -395,6 +395,7 @@ TypeTorch.runDetached(() => store.StartSessionAsync(`Player_${userId}`)).then((p
   // In your remote's handler (the arguments come from a client: everything is checked here).
   const result = feedback.submit(player, { rating, text, topic: "bug", ctx: { level: 12, map: "forest" } });
   if (!result.ok) warn(result.reason); // "rate_limited" | "empty" | "bad_rating" | "no_session" | "disabled"
+  // rate_limited also has retryIn: whole seconds until the player may submit again (for "try again in 40 s").
   feedback.scale(); // the scale in effect, to send to clients for the UI (undefined while disabled)
   ```
 

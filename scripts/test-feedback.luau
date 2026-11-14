@@ -268,8 +268,10 @@ local function attempt(now, perMinute, perDay)
 	return false
 end
 check("rate: 2 a minute", attempt(0, 2, 5) and attempt(10, 2, 5) and not attempt(59, 2, 5))
+check("rate: wait for the minute window", Core.rateWait(rate, 59, 2, 5) == 1 and Core.rateWait(rate, 30, 2, 5) == 30, Core.rateWait(rate, 30, 2, 5))
 check("rate: the minute window slides", attempt(60.5, 2, 5) and not attempt(65, 2, 5) and attempt(71, 2, 5))
 check("rate: 5 a day", attempt(200, 2, 5) and not attempt(400, 2, 5) and not attempt(86399, 2, 5))
+check("rate: wait for the day window", Core.rateWait(rate, 86399, 2, 5) == 86400 - (86399 - 0), Core.rateWait(rate, 86399, 2, 5))
 check("rate: a day later again", attempt(86400 + 11, 2, 5) and #rate.times <= 5, #rate.times)
 
 -- The row ---------------------------------------------------------------------------------------------------------------
@@ -347,7 +349,9 @@ check("no UserId or username on the row", written and written.props.userId == ni
 check("bad_rating refused", server:submit(alice, { rating = 9 }).reason == "bad_rating")
 check("empty refused", server:submit(alice, { text = "   " }).reason == "empty")
 check("second ok", server:submit(alice, { text = "more" }).ok == true)
-check("third in a minute: rate_limited", server:submit(alice, { rating = 1 }).reason == "rate_limited" and #rows == 2)
+local limited = server:submit(alice, { rating = 1 })
+check("third in a minute: rate_limited", limited.reason == "rate_limited" and #rows == 2)
+check("rate_limited: retryIn until the oldest leaves the minute", limited.retryIn == 60, limited.retryIn)
 check("another player has their own limit", server:submit(bob, { rating = 1 }).ok == true)
 now += 61
 check("a minute later: ok", server:submit(alice, { rating = 2 }).ok == true)

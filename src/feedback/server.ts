@@ -5,7 +5,7 @@ import { PROPS_MAX_BYTES } from "../analytics/schema";
 import { playerState, type PlayerState } from "../runtime/player-state";
 import { currentSettings } from "../settings";
 import type { Feedback, FeedbackConfig, FeedbackInput, FeedbackResult, FeedbackScale } from "./api";
-import { buildFeedbackProps, rateAllows, rateRecord, resolveFeedbackConfig, type FeedbackProps, type RateState, type ResolvedFeedbackConfig } from "./core";
+import { buildFeedbackProps, rateAllows, rateRecord, rateWait, resolveFeedbackConfig, type FeedbackProps, type RateState, type ResolvedFeedbackConfig } from "./core";
 
 /** The playerState store of accepted submits (removed when the player leaves; kept across swaps). */
 export const RATE_STORE = "__typetorch/feedback.rate.v1";
@@ -75,7 +75,9 @@ export class FeedbackServer implements Feedback {
 		if (safe.topic !== undefined && built.props.topic === undefined) $warn(`[TypeTorch] feedback: topic dropped (1-32 of [a-z0-9_])`);
 		const rate = this.rates.get(player);
 		const now = this.clock();
-		if (!rateAllows(rate, now, config.perMinute, config.perDay)) return refuse("rate_limited");
+		if (!rateAllows(rate, now, config.perMinute, config.perDay)) {
+			return { ok: false, reason: "rate_limited", retryIn: rateWait(rate, now, config.perMinute, config.perDay) };
+		}
 		rateRecord(rate, now);
 		writer(player, "feedback", "submit", built.props);
 		return OK;

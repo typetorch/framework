@@ -52,7 +52,14 @@ export interface FeedbackInput {
  */
 export type FeedbackRefusal = "rate_limited" | "empty" | "bad_rating" | "no_session" | "disabled";
 
-export type FeedbackResult = { readonly ok: true } | { readonly ok: false; readonly reason: FeedbackRefusal };
+export type FeedbackResult =
+	| { readonly ok: true }
+	| {
+			readonly ok: false;
+			readonly reason: FeedbackRefusal;
+			/** `rate_limited` only: whole seconds (at least 1) until a submit fits the limits again. */
+			readonly retryIn?: number;
+	  };
 
 export interface Feedback {
 	/**
