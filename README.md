@@ -384,6 +384,48 @@ TypeTorch.runDetached(() => store.StartSessionAsync(`Player_${userId}`)).then((p
   players who joined before the callback connected. Rows (`kind = notify`): `want`, `drop`, `optin_check`,
   `optin_shown`, `optin_closed`, `open`, `open_bad`, `played` (src/analytics/SCHEMA.md); the join row gets
   `from = "notification"`. Without backend settings (Studio) nothing is posted; rows are still written.
+- **`feedback()`** (plans/32, server only): player feedback as a built-in. Collect the answer in your own UI, send it
+  to the server through your own network, and submit it there; the framework checks it and writes one analytics row
+  (`kind = feedback`, `name = submit`) on the player's session, which the explorer's Feedback page reads:
+
+  ```ts
+  const feedback = TypeTorch.feedback();
+  // Optional, once at start: the scale in code (used while the settings record has no game.feedback).
+  feedback.configure({ scale: { id: "faces5", type: "scale", steps: 5, labels: ["BAD", "MEH", "OK", "GOOD", "GREAT"] } });
+  // In your remote's handler (the arguments come from a client: everything is checked here).
+  const result = feedback.submit(player, { rating, text, topic: "bug", ctx: { level: 12, map: "forest" } });
+  if (!result.ok) warn(result.reason); // "rate_limited" | "empty" | "bad_rating" | "no_session" | "disabled"
+  feedback.scale(); // the scale in effect, to send to clients for the UI (undefined while disabled)
+  ```
+
+  The config (the settings record's `game.feedback`, live: `typetorch settings set game.feedback '<json>'`; without
+  it the game's `configure(...)`; without that the defaults):
+
+  ```jsonc
+  "feedback": {
+    "scale": { "id": "faces5", "type": "scale", "steps": 5, "labels": ["BAD", "MEH", "OK", "GOOD", "GREAT"] },
+    "maxText": 1000,
+    "rate": { "perMinute": 2, "perDay": 20 }
+  }
+  ```
+
+  | Field | Default | Meaning |
+  |---|---|---|
+  | `enabled` | `true` | `false` (or the whole value `false`): every submit answers `disabled` |
+  | `scale.id` | `"stars5"` | 1-32 of `[a-z0-9_]`, on every row; give a changed scale a new id (old rows keep theirs) |
+  | `scale.type` | `"stars"` | `thumbs` (rating 0 down / 1 up), `stars` or `scale` (rating 1..steps) |
+  | `scale.steps` | `5` | 2..10; thumbs is always 2 |
+  | `scale.labels` | none | one per step, lowest first (thumbs: 2, e.g. `["Down", "Up"]`); the rated step's label goes on the row |
+  | `maxText` | `1000` | most characters of text kept (1..2000); the row also keeps at most 2000 UTF-8 bytes |
+  | `rate.perMinute`, `rate.perDay` | `2`, `20` | accepted submits per player (in memory, kept across swaps, cleared when the player leaves) |
+
+  An invalid record value disables feedback (warned once per value); an invalid `configure` throws. Text is sanitised
+  (control and invisible characters stripped, whitespace collapsed, trimmed) and capped without splitting a code point;
+  `len` keeps the original length. `rating` must be an integer in the scale (`bad_rating`); a submit needs a rating or
+  some text (`empty`); `no_session` when no `AnalyticsEngine` runs or the player isn't in this server. Refused submits
+  don't count against the limits. The row's props (`scale`, `type`, `steps`, `r?`, `norm?`, `label?`, `text?`, `len`,
+  `topic?`, `play_s`, `ctx?`) are in src/analytics/SCHEMA.md. On a client `feedback()` throws; in edit mode every
+  submit is `disabled`.
 - **Edit mode** (UI Labs stories, no kernel): `running` is false, identity has defaults, `persist` keeps a local table,
   events never fire, and the server-only reads throw.
 
@@ -622,7 +664,9 @@ bun run build   # rbxtsc --type package -> out/
   `test-explorer-core` (Dex), `test-toolbox-sanitize` (the Creator Store sanitizer), `test-sha256` (SHA-256 / HMAC in util and the
   pairing-code fingerprint), `test-notifications` (the launch token with the contract's shared vector, intent checks,
   the queue: batches of 200, rev order, a swap's handover), `test-notify-server` (the notifications server against
-  mocked services) and `test-analytics-join` (the join row's metadata; no other player's UserId). `node scripts/check-self-calls.mjs out` flags compiled functions that call themselves on their first
+  mocked services), `test-analytics-join` (the join row's metadata; no other player's UserId) and `test-feedback`
+  (`feedback()`: the scale config, rating normalisation, text sanitising and caps with multi-byte text, rate limits, the
+  row's shape; run from framework/: `lune run scripts/test-feedback.luau out/`). `node scripts/check-self-calls.mjs out` flags compiled functions that call themselves on their first
   lines (after `bun run build`).
 - **Package contents:** only `out/` (no `.tsbuildinfo`), `README.md` and `LICENSE`; check with `bun pm pack --dry-run`.
 - **Explorer class icons:** `assets/class-icons.png` (kept locally, not in the repo: it is Roblox's own texture) is

@@ -507,8 +507,9 @@ export class ServerAnalytics {
 
 	/** A built-in's view of the player's session (analytics/rows.ts): undefined when they have none (left, stopped). */
 	private builtinSession(player: Player) {
+		// Never creates one (sessionOf would, for a player whose PlayerRemoving already ran).
 		if (this.stopped || player.Parent !== Players) return undefined;
-		const session = this.sessionOf(player);
+		const session = this.sessions.get(player);
 		if (!session || session.left) return undefined;
 		return { playSeconds: math.max(0, math.floor((nowMs() - session.joinedAt) / 1000)) };
 	}
