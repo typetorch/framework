@@ -32,6 +32,16 @@ export type { MessageSource, MessagingApi, MessagingSubscribeOptions } from "./m
 export type { GameServer, ServerListOptions } from "./servers";
 export type { LiveConfig, LiveConfigOptions } from "./settings";
 export type { Notifications, NotifyOpen, OptInResult, WantOptions } from "./notifications/api";
+export type {
+	Feedback,
+	FeedbackConfig,
+	FeedbackContextValue,
+	FeedbackInput,
+	FeedbackRefusal,
+	FeedbackResult,
+	FeedbackScale,
+	FeedbackScaleType,
+} from "./feedback/api";
 export { observePlayers } from "./players";
 export { createNetwork, setNetworkLimits } from "./net";
 // @flamework/networking names on the same network, for migrating Flamework games (guides/from-flamework.md).

@@ -23,7 +23,8 @@ export type EventKind =
 	| "custom"
 	| "recording_meta"
 	| "fleet"
-	| "notify";
+	| "notify"
+	| "feedback";
 
 export type DeviceKind = "desktop" | "phone" | "tablet" | "console" | "vr" | "unknown";
 

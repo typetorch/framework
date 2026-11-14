@@ -33,7 +33,7 @@ import {
 } from "./protocol";
 import { describeFailure } from "./hints";
 import { encodeJoinData, joinDataJson, joinProps, wantedUserIds, type JoinDataLike, type JoinDataMode, type JoinFacts, type LaunchVerdict } from "./join";
-import { registerBuiltinRows } from "./rows";
+import { registerBuiltinRows, registerBuiltinSessions } from "./rows";
 import { readKeys, verifyToken } from "../notifications/token";
 import { backoffSeconds, classifyStatus, configWaitSeconds, newQueueState, RowQueue, takeToken, type BucketState, type QueueState } from "./queue";
 import {
@@ -390,6 +390,8 @@ export class ServerAnalytics {
 		trove.add(registerAnalyticsStatus(() => this.stats()));
 		// Notifications (and later built-ins) write their rows here (analytics/rows.ts).
 		trove.add(registerBuiltinRows((target, kind, name, props) => this.builtinRow(target, kind, name, props)));
+		// Feedback (plans/32) reads the session's play time (play_s) through this.
+		trove.add(registerBuiltinSessions((player) => this.builtinSession(player)));
 		if (this.testMode) print("[analytics] cloud test: rows are collected but nothing is sent (no uploads, no identity rows)");
 		this.startSettings();
 		this.startIntake();
@@ -501,6 +503,15 @@ export class ServerAnalytics {
 		else if (typeIs(target, "number")) player = Players.GetPlayerByUserId(target);
 		const session = player !== undefined && player.Parent === Players ? this.sessionOf(player) : player !== undefined ? this.sessions.get(player) : undefined;
 		this.emit(session, kind, name, encodeProps(props));
+	}
+
+	/** A built-in's view of the player's session (analytics/rows.ts): undefined when they have none (left, stopped). */
+	private builtinSession(player: Player) {
+		// Never creates one (sessionOf would, for a player whose PlayerRemoving already ran).
+		if (this.stopped || player.Parent !== Players) return undefined;
+		const session = this.sessions.get(player);
+		if (!session || session.left) return undefined;
+		return { playSeconds: math.max(0, math.floor((nowMs() - session.joinedAt) / 1000)) };
 	}
 
 	/** The player's session; created now if game code is faster than the engine's own join handler. */

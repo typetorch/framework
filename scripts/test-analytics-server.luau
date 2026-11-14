@@ -514,6 +514,9 @@ task.wait(0.6) -- joins wait for the device
 
 local joins = rowsNamed(store().events.rows, "session", "join")
 check("two joins", #joins == 2, #joins)
+-- Built-ins' session lookup (feedback's play_s, plans/32).
+local played = loadAnalytics("rows").builtinSession(regular)
+check("builtinSession: the session's play seconds", played ~= nil and played.playSeconds >= 0 and played.playSeconds < 5, played and played.playSeconds)
 local joinNew, joinReg
 for _, row in joins do
 	if row.pid == newbiePid then
@@ -846,6 +849,7 @@ local leaveProps = leave and serde.decode("json", leave.props)
 check("leave row", leave and leave.pid == "existingpid00000000000000000002" and leaveProps.why == "left" and leaveProps.swap60 == true)
 check("leave writes last", records["p/2"].last >= before and records["p/2"].pid == "existingpid00000000000000000002")
 check("session removed", store().players["2"] == nil)
+check("builtinSession: none after the leave", loadAnalytics("rows").builtinSession(regular) == nil)
 
 local requestsBefore = #requests
 for hook in closeHooks do
