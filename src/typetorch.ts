@@ -32,7 +32,7 @@ import { persistKeys } from "./runtime/registry";
 import { hotAsset, type HotAsset } from "./assets/hot-asset";
 import { bindMessaging, messaging, messagingSupported, unbindMessaging, type MessagingApi } from "./messaging";
 import { bindServers, listServers, setServerInfo, unbindServers, type GameServer, type ServerListOptions } from "./servers";
-import { bindSettings, currentSettings, liveConfig, settingsSupported, unbindSettings, type LiveConfig, type LiveConfigOptions } from "./settings";
+import { bindSettings, currentSettings, liveConfig, liveEvents, settingsSupported, unbindSettings, type LiveConfig, type LiveConfigOptions, type LiveEvents } from "./settings";
 import { bindDetached, detachedSupported, runDetached, unbindDetached } from "./detached";
 
 /**
@@ -249,6 +249,13 @@ export interface TypeTorchApi {
 	 * kernels (warned once) or when `parse` throws. See src/settings.ts.
 	 */
 	liveConfig<T>(key: string, options: LiveConfigOptions<T>): LiveConfig<T>;
+	/**
+	 * Server only: the scheduled live events of the signed record's `game["tt.events"]` (the explorer's Live events page,
+	 * signed with `typetorch settings set game.tt.events -`). While one runs, its values replace `liveConfig` values on
+	 * their own at the start and end times (this server's clock); `active()`, `upcoming()` and `onChanged(fn)` are for
+	 * game UI ("Double cash ends in 3h").
+	 */
+	liveEvents(): LiveEvents;
 	/**
 	 * Server only, kernel 0.3.8: this generation's copy of the whole verified settings record (`seq`, `at`, `game`,
 	 * `analytics`, `fleet`, ...), or undefined. It holds tokens: never send it to a client.
@@ -557,6 +564,11 @@ class TypeTorchRuntime implements TypeTorchApi {
 
 	liveConfig<T>(key: string, options: LiveConfigOptions<T>): LiveConfig<T> {
 		return liveConfig(key, options);
+	}
+
+	liveEvents(): LiveEvents {
+		if (client) error("TypeTorch.liveEvents() is server-only", 2);
+		return liveEvents();
 	}
 
 	settings(): KernelSettings | undefined {
