@@ -11,6 +11,10 @@ import type { ExperimentOverride, ResolvedSettings } from "./schema";
 
 export const DEFAULT_FLUSH_SECONDS = 15;
 export const DEFAULT_TECH_EVERY = 60;
+/** The recording window after the first input (`recordSeconds`): default, and its clamp (the 10 minute recording cap). */
+export const DEFAULT_RECORD_SECONDS = 60;
+export const RECORD_SECONDS_MIN = 10;
+export const RECORD_SECONDS_MAX = 600;
 
 export interface ParsedSettings {
 	/** Undefined when there are no settings, or they're unusable (see `errors`). */
@@ -29,6 +33,33 @@ function clampNumber(value: unknown, fallback: number, low: number, high: number
 		return fallback;
 	}
 	return math.clamp(value, low, high);
+}
+
+/** Event names in one `positions` list (options or settings). */
+export const POSITION_NAMES_MAX = 64;
+
+/** A `positions` list (options or settings): event names (1-64 characters), at most 64. Undefined when it isn't one. */
+export function parsePositionNames(value: unknown): Set<string> | undefined {
+	if (!typeIs(value, "table")) return undefined;
+	const names = new Set<string>();
+	let count = 0;
+	for (const [key, name] of pairs(value as object)) {
+		count += 1;
+		if (!typeIs(key, "number") || !typeIs(name, "string") || name.size() < 1 || name.size() > 64 || count > POSITION_NAMES_MAX) {
+			return undefined;
+		}
+		names.add(name);
+	}
+	return names;
+}
+
+/** `options.positions` as a set: none when unset; a bad list warns and means none. */
+export function optionPositions(value: unknown): Set<string> {
+	if (value === undefined) return new Set();
+	const names = parsePositionNames(value);
+	if (names) return names;
+	warn("[analytics] options.positions must be a list of event names (1-64 characters, at most 64): ignored");
+	return new Set();
 }
 
 /** Per-player overrides one experiment may hold (`players`). */
@@ -130,6 +161,13 @@ export function parseSettings(raw: unknown, decode: (text: string) => unknown): 
 	}
 	const flushSeconds = clampNumber(entry.flushSeconds, DEFAULT_FLUSH_SECONDS, 5, 300, "flushSeconds", errors);
 	const recordShare = clampNumber(entry.recordShare, 1, 0, 1, "recordShare", errors);
+	const recordSeconds = clampNumber(entry.recordSeconds, DEFAULT_RECORD_SECONDS, RECORD_SECONDS_MIN, RECORD_SECONDS_MAX, "recordSeconds", errors);
+	let positions = new Set<string>();
+	if (entry.positions !== undefined) {
+		const parsed = parsePositionNames(entry.positions);
+		if (parsed) positions = parsed;
+		else errors.push("positions must be a list of event names (1-64 characters, at most 64)");
+	}
 	const techEvery = clampNumber(entry.techEvery, DEFAULT_TECH_EVERY, 15, 3600, "techEvery", errors);
 	const experiments = parseExperiments(entry.experiments, errors);
 	let joinData: JoinDataMode = "full";
@@ -156,14 +194,29 @@ export function parseSettings(raw: unknown, decode: (text: string) => unknown): 
 
 	if ((backend !== "basin" && backend !== "duckdb") || !isUrl(entry.events)) return { errors };
 	return {
-		settings: { backend, events: entry.events, recordings, token, flushSeconds, recordShare, techEvery, experiments, identity, identityToken, joinLaunchPrefix, joinData },
+		settings: {
+				backend,
+				events: entry.events,
+				recordings,
+				token,
+				flushSeconds,
+				recordShare,
+				recordSeconds,
+				techEvery,
+				experiments,
+				positions,
+				identity,
+				identityToken,
+				joinLaunchPrefix,
+				joinData,
+			},
 		errors,
 	};
 }
 
 /**
  * Kernel 0.4.0 / plans/21: the raw sink settings from the signed record. `backend` = { url, key, analytics? } is the
- * DuckDB sink at <url>/v1/ingest with the key (flushSeconds, recordShare, techEvery and experiments from
+ * DuckDB sink at <url>/v1/ingest with the key (flushSeconds, recordShare, recordSeconds, positions, techEvery and experiments from
  * `backend.analytics`). The old `analytics` value is used while `backend` is missing, and whenever it names a Basin sink
  * (`backend` can't describe Basin streams). Returns what parseSettings reads (undefined: no settings).
  */
@@ -187,6 +240,8 @@ export function sinkSettings(backend: unknown, analytics: unknown, decode: (text
 		token: entry.key,
 		flushSeconds: extra.flushSeconds,
 		recordShare: extra.recordShare,
+		recordSeconds: extra.recordSeconds,
+		positions: extra.positions,
 		techEvery: extra.techEvery,
 		experiments: extra.experiments,
 		joinLaunchPrefix: extra.joinLaunchPrefix,

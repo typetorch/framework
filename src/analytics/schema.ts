@@ -128,6 +128,16 @@ export interface AnalyticsSettings {
 	flushSeconds?: number;
 	/** Share of new players whose first session is recorded (default 1, 0..1). */
 	recordShare?: number;
+	/**
+	 * Seconds a first-session recording runs after the player's first input (default 60, 10..600). The recording still
+	 * stops at 10 minutes from its start and at the per-recording caps (256 KB, 80 chunks).
+	 */
+	recordSeconds?: number;
+	/**
+	 * Event names (1-64 characters, at most 64) whose game-code events always carry the player's character position
+	 * (`px`, `py`, `pz`), added to `AnalyticsOptions.positions`. Live: changes apply to later events.
+	 */
+	positions?: string[];
 	/** Seconds between tech health samples (default 60, 15..3600). */
 	techEvery?: number;
 	/** Live experiment overrides by experiment name. */
@@ -157,8 +167,10 @@ export interface ResolvedSettings {
 	token?: string;
 	flushSeconds: number;
 	recordShare: number;
+	recordSeconds: number;
 	techEvery: number;
 	experiments: Map<string, ExperimentOverride>;
+	positions: Set<string>;
 	identity?: string;
 	identityToken?: string;
 	joinLaunchPrefix: boolean;
@@ -205,6 +217,23 @@ export interface AnalyticsOptions {
 	 * can't be deleted). Never part of the events table. Default true.
 	 */
 	identity?: boolean;
+	/**
+	 * Event names whose game-code events (`track`, `step`, `purchase`, `currency`; matched on the event name, e.g. a
+	 * purchase's `kind`) always carry the player's character position as props `px`, `py`, `pz` (studs, 0.1). Server:
+	 * the event's player; client: the local player. Nothing is added without a character, and never over the game's own
+	 * `px` / `py` / `pz`. At most 64 names. The settings' `positions` adds to this list.
+	 */
+	positions?: string[];
+}
+
+/** Per-event options of `track()`. */
+export interface AnalyticsEventOptions {
+	/**
+	 * Add a character position as props `px`, `py`, `pz` (studs, rounded to 0.1): `true` the event's player (server:
+	 * the player passed first; client: the local player), or any player. Nothing is added when they have no character
+	 * or root part, and never over `px` / `py` / `pz` the props already have.
+	 */
+	position?: boolean | Player;
 }
 
 /** Kernel 0.3.2+ `fleetStatus()`: the server's heartbeat (sent as the props of a "fleet" / "heartbeat" row). */

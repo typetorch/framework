@@ -30,7 +30,7 @@ export { TypeTorch } from "./typetorch";
 export type { BranchChange, TypeTorchApi, TypeTorchFeatures } from "./typetorch";
 export type { MessageSource, MessagingApi, MessagingSubscribeOptions } from "./messaging";
 export type { GameServer, ServerListOptions } from "./servers";
-export type { LiveConfig, LiveConfigOptions } from "./settings";
+export type { LiveConfig, LiveConfigOptions, LiveEvent, LiveEvents } from "./settings";
 export type { Notifications, NotifyOpen, OptInResult, WantOptions } from "./notifications/api";
 export type {
 	Feedback,
@@ -101,6 +101,7 @@ export { hotAsset } from "./assets/hot-asset";
 // Analytics (plans/16): optional, nothing runs until `new AnalyticsEngine()`.
 export { AnalyticsEngine } from "./analytics/engine";
 export type {
+	AnalyticsEventOptions,
 	AnalyticsOptions,
 	AnalyticsProps,
 	AnalyticsPurchase,

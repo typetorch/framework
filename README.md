@@ -363,6 +363,24 @@ TypeTorch.runDetached(() => store.StartSessionAsync(`Player_${userId}`)).then((p
   changes; generation-scoped). The default without a record or key, when `parse` throws (warned per value), and on older
   kernels (warned once: "needs kernel 0.3.8"; no ConfigService fallback). `TypeTorch.settings()` is the whole copy
   (`seq`, `at`, `game`, `analytics`, `fleet`, ...): server only, it holds tokens.
+- **Scheduled live events** (`liveEvents()`, server only): the explorer's Live events page schedules "double cash,
+  Saturday 12:00 to Sunday 23:59 UTC" as a change to `game` keys, and the owner signs the schedule with the CLI like any
+  other value (`typetorch settings set game.tt.events -`, the page gives the exact command). While an event runs
+  (`start <= now < end` on the server's own clock) its values replace the record's `game[key]` for `liveConfig`, so
+  `get()` and `onChanged` switch at the start and end times with no message: a server that starts mid-event has it at
+  once, and the event ends on time even when the backend is down. Cancelling = signing the schedule without it. The
+  game only reads its usual `liveConfig` keys; `parse` still checks an event's value (keep your bounds there):
+
+  ```ts
+  const multiplier = TypeTorch.liveConfig("cash.multiplier", { default: 1, parse: (raw) => (typeIs(raw, "number") && raw >= 1 && raw <= 3 ? raw : 1) });
+  const events = TypeTorch.liveEvents();
+  events.active(); // [{ id, name, startsAt, endsAt, set }]: "Double cash ends in 3h"
+  this.trove.add(events.onChanged((active) => this.showBanner(active)));
+  ```
+
+  The schedule is `game["tt.events"] = { v: 1, events: [{ id, name, start, end, set: { [key]: JSON } }] }` (unix
+  seconds); two events on one key at once: the later start wins. Nothing unsigned reaches servers: the backend only
+  prepares the JSON.
 - **`runDetached(fn)`** (kernel 0.3.8, server only): runs `fn` on a thread the kernel owns, so a deploy's hard stop
   (which kills this generation's threads mid-call) can't cut it off: for ProfileStore / ProfileService loads, saves and
   releases. Returns a Promise that settles while this generation runs; after a swap the result is dropped, so a job
@@ -522,6 +540,7 @@ import { AnalyticsEngine } from "@typetorch/framework";
 // A server module (onInit): the sink comes from the signed settings' `analytics` (kernel 0.3.8).
 const analytics = new AnalyticsEngine();
 analytics.track(player, "quest_done", { quest: "tutorial" }); // custom
+analytics.track(player, "down", { by: "fall" }, { position: true }); // + px, py, pz of the player's character
 analytics.step(player, "onboarding", 3, "opened_shop"); // funnels
 analytics.purchase(player, { product: 1234, robux: 99, where: "shop" }); // after the receipt is granted
 analytics.currency(player, "coins", 50, "round_reward"); // economy in (+) and out (-)
@@ -550,6 +569,14 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   `TTScreen`), `recording` (the first-ever session in detail), `fleet` (kernel 0.3.2 heartbeats and deploy reports),
   `identity` (one `{ pid, uid }` row per session to the dev's own server, below). `settings` (server only) replaces the
   signed settings' `analytics`, for tests, Studio and kernels before 0.3.8.
+- **Positions on events** (for map layers): `px`, `py`, `pz` props (studs, rounded to 0.1) from a character's root
+  part. Per call: `track(player, name, props, { position: true })` (the event's player; on the client the local
+  player) or `{ position: otherPlayer }`. Per event name: `new AnalyticsEngine({ positions: ["down", "death_final",
+  "round_result", "product"] })` (code), or the settings' `positions` (live, added to the code's list): every
+  `track`, `step`, `purchase` and `currency` event with that name gets the event player's position (a purchase is
+  named by its `kind`, `product` by default). No character or root part: nothing is added. Props that already have
+  `px`, `py` or `pz` are left alone. One property read per such event, nothing per frame. Server-only events (no
+  player) only get one with `{ position: somePlayer }`.
 - **Every row** carries the time (server clock), a random player id (never the UserId), the session, the server
   (JobId, type, place), the artifact (id, seq, branch, channel), the device, new vs returning, the player's state
   (`zone:Lobby|screen:Shop|activity:round`) and experiment variants. The exact rows: `src/analytics/SCHEMA.md`.
@@ -563,8 +590,11 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   `vi` (framework 0.7.1+), the variant's position in the game's list, so the backend can check the split.
 - **First-ever session:** for new players (a share of them, `recordShare`), the client records character and camera
   about 10 times a second, every input (never while a TextBox or the chat has focus; text boxes only say which box was
-  used), buttons pressed and hovered, screens, prompts and deaths, from the join until 60 s after the first input.
-  Packed into small binary chunks (10-20 KB a player) and sent through the server.
+  used), buttons pressed and hovered, screens, prompts and deaths, from the join until `recordSeconds` (the settings,
+  default 60, 10..600) after the first input, and at most 10 minutes in all. Packed into small binary chunks and sent
+  through the server: about 13 KB a minute for an active player (18 KB as stored base64), under 1 KB for an idle one;
+  the per-recording caps (256 KB, 80 chunks) still apply, and 10 minutes of an active player fit inside them. Set
+  `recordSeconds` to the length of your first round (e.g. 300) to record it whole.
 - **Never collected:** chat or anything typed, usernames and display names (error texts have them replaced). No event
   row carries a UserId.
 - **Identities** (option `identity`, default on): once the pid is known, one row `{ pid, uid, t }` (the UserId, nothing
@@ -600,7 +630,7 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   when the player is alone) intersected with the players there, not a web call per player.
 
 **Settings, framework 0.4.0 / kernel 0.4.0 (plans/21):** the record's `backend` = `{ url, key, analytics?: { flushSeconds,
-recordShare, joinLaunchPrefix, joinData } }` (`typetorch backend setup`) is the whole sink: DuckDB at `<url>/v1/ingest` with the one key (Basin
+recordShare, recordSeconds, positions, joinLaunchPrefix, joinData } }` (`typetorch backend setup`) is the whole sink: DuckDB at `<url>/v1/ingest` with the one key (Basin
 identities to `<url>/v1/identity`). The old `analytics` value below is read while `backend` is missing, and stays the
 way to a Basin sink. The engine also tells the kernel each player's pid (`setAnalyticsId`: the kernel's error reports
 count affected players by pid, never by name) and counts its own DataStore and HTTP requests for the budget view (dev
@@ -615,7 +645,7 @@ there are no settings unless the game passes `new AnalyticsEngine({ settings })`
 ```json
 { "backend": "basin", "events": "https://<stream-id>.ingest.cloudflare.com",
   "recordings": "https://<stream-id>.ingest.cloudflare.com", "token": "<write-only token>",
-  "flushSeconds": 15, "recordShare": 1, "techEvery": 60,
+  "flushSeconds": 15, "recordShare": 1, "recordSeconds": 60, "positions": ["round_result"], "techEvery": 60,
   "experiments": { "onboarding": { "weights": [1, 1] } } }
 ```
 
@@ -673,7 +703,7 @@ bun run build   # rbxtsc --type package -> out/
   Attention issues.
   The others, each on the compiled `out/`: `test-hot-assets` (manifest parser, AssetSync decisions incl. the backup
   vouch, live-copy rules), `test-messaging` (messaging and the server list), `test-settings` (`liveConfig` and the
-  settings lines), `test-detached` (`runDetached`), `test-dev-access` (the dev-only tools rule and every gate through
+  settings lines), `test-live-events` (scheduled live events on a fake clock), `test-detached` (`runDetached`), `test-dev-access` (the dev-only tools rule and every gate through
   it), `test-remote-debug` (the remote debug ops and their limits), `test-net-inspect` (packet capture),
   `test-explorer-core` (Dex), `test-toolbox-sanitize` (the Creator Store sanitizer), `test-sha256` (SHA-256 / HMAC in util and the
   pairing-code fingerprint), `test-notifications` (the launch token with the contract's shared vector, intent checks,

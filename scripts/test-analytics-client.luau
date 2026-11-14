@@ -320,7 +320,7 @@ end
 
 -- Start --------------------------------------------------------------------------------------------------------------
 local trove = Trove.new()
-local client = ClientAnalytics.new({}, dispatcher, trove)
+local client = ClientAnalytics.new({ positions = { "down" } }, dispatcher, trove)
 task.wait(0.05)
 local hello = messages("hello")[1]
 check("hello sent", hello ~= nil)
@@ -335,6 +335,7 @@ raw["__tt/an"]("hi", {
 	rec = true,
 	tech = 60,
 	exps = { onboarding = { variant = "long" } },
+	pos = { "round_result" },
 })
 local events = heldEvents()
 check("hi releases held events", #events >= 2, #events)
@@ -352,6 +353,29 @@ check("experiment forced by settings", client:experiment("onboarding", { "short"
 client:experiment("onboarding", { "short", "long" })
 check("exp sent once", #messages("exp") == 1 and messages("exp")[1][2] == "onboarding")
 check("bad experiment = control", client:experiment("bad name!", { "a", "b" }) == "a")
+
+-- Positions: the local player's character root (10, 3, -5) as px/py/pz, by options, by the hello's list, on request.
+client:track("custom", "down", nil)
+client:track("custom", "round_result", { a = 1 })
+client:track("custom", "down", { px = 5 })
+client:track("custom", "tap", nil)
+client:track("custom", "tap_at", nil, localPlayer)
+localPlayer.Character = nil
+client:track("custom", "down", { nochar = true })
+localPlayer.Character = character
+client:flush()
+local positioned = {}
+for _, event in heldEvents() do
+	positioned[event[3]] = positioned[event[3]] or {}
+	table.insert(positioned[event[3]], serde.decode("json", event[4]))
+end
+local downEvents = positioned.down or {}
+check("client position by options.positions", downEvents[1] and downEvents[1].px == 10 and downEvents[1].py == 3 and downEvents[1].pz == -5)
+check("client position by the hello's positions", positioned.round_result and positioned.round_result[1].pz == -5 and positioned.round_result[1].a == 1)
+check("client never overrides the game's px", downEvents[2] and downEvents[2].px == 5 and downEvents[2].py == nil)
+check("client: unlisted event has none", positioned.tap and positioned.tap[1].px == nil)
+check("client position on request", positioned.tap_at and positioned.tap_at[1].px == 10)
+check("client: no character, no position", downEvents[3] and downEvents[3].nochar == true and downEvents[3].px == nil)
 
 -- Recorder -----------------------------------------------------------------------------------------------------------
 for _ = 1, 5 do
@@ -486,6 +510,35 @@ end
 check("activity once", activities == 1)
 check("load only once", messages("hello")[1][2].load == nil)
 trove2:clean()
+
+-- recordSeconds: the hello's window (rsec) replaces the 60 s; clamped to 10..600.
+local recordWindow = loadAnalytics("client").recordWindow
+check("window default 60", recordWindow(nil) == 60 and recordWindow("x") == 60 and recordWindow(0 / 0) == 60)
+check("window longer", recordWindow(180) == 180)
+check("window clamped", recordWindow(5000) == 600 and recordWindow(2) == 10)
+persist["__typetorch/analytics-client.v1"] = nil
+sent = {}
+local trove3 = Trove.new()
+ClientAnalytics.new({}, dispatcher, trove3)
+raw["__tt/an"]("hi", { pid = string.rep("cd", 16), newp = true, rec = true, tech = 60, exps = {}, rsec = 120 })
+step(0.1)
+services.UserInputService.InputBegan:Fire({ UserInputType = Enum.UserInputType.Keyboard, KeyCode = Enum.KeyCode.W, Position = Vector3.new() }, false)
+local inputAt = fakeNow
+fakeNow = inputAt + 61
+step(0.5)
+local function ended()
+	for _, chunk in messages("rec") do
+		if chunk[6] == true then
+			return chunk[7]
+		end
+	end
+	return nil
+end
+check("a 120 s window still records at 61 s", ended() == nil, ended())
+fakeNow = inputAt + 120
+step(0.5)
+check("a 120 s window ends at 120 s", ended() == "window", ended())
+trove3:clean()
 
 print(`analytics client: {passed} passed, {failed} failed`)
 if failed > 0 then
