@@ -10,6 +10,8 @@ import type { PaneActions, SplitDir } from "./layout";
 import { branchOffers, buildOffers, confirmText, devBranchOffer, playerActions, type ServerOffer } from "./palette-rules";
 import type { PickItem, WindowManager } from "./panes";
 import { COLORS, copyText } from "./widgets";
+import type { DevExperiment } from "../analytics/dev-control";
+import type { ExperimentsReply } from "./experiments-ui";
 
 /**
  * The dev menu's commands for the command palette (devtools/palette.ts, devtools/commands.ts), registered by client.ts.
@@ -23,6 +25,8 @@ import { COLORS, copyText } from "./widgets";
  * - Players: find a player by name, display name or UserId; open them in Manage > Players, or its Kick / Ban cards;
  *   Player: Teleport to / Bring / Respawn (Manage > Players' menu, its permissions; owners).
  * - Copy: job id, artifact id, commit, branch, place version (the copy popup: Roblox has no clipboard API).
+ * - Experiments: "Experiment <name>: use <variant>" / "...: clear my variant" (Server > Experiments' picks, your own
+ *   variant only; devs where the dev-only tools are open, owners everywhere).
  * - Claude: "Ask Claude: <query>" puts the query in the Claude tab's draft.
  * Everything that swaps what runs on this server is two-step. The kernel and the server re-check every request.
  */
@@ -42,6 +46,8 @@ export interface PaletteFacts {
 	servers?: AdminServer[];
 	/** Owners: Manage > Players' list (what each player allows). */
 	players?: AdminPlayer[];
+	/** Server > Experiments: your experiments and variants (undefined when the server refuses you or runs no analytics). */
+	myExperiments?: DevExperiment[];
 }
 
 export interface PaletteContext {
@@ -107,6 +113,9 @@ export function paletteCommands(deps: PaletteDeps): PaletteCommands {
 				fresh.experiments = reply.facts?.experiments === true;
 			}
 			if (branchesOk && typeIs(branchesReply, "table")) fresh.branches = branchesReply as BranchInfo[];
+			const [experimentsOk, experimentsReply] = call("exp.list");
+			const mine = (typeIs(experimentsReply, "table") ? experimentsReply : {}) as ExperimentsReply;
+			if (experimentsOk && mine.supported === true) fresh.myExperiments = mine.experiments ?? [];
 			const artifacts = (typeIs(artifactsReply, "table") ? artifactsReply : {}) as { supported?: boolean; list?: ArtifactEntry[] };
 			if (artifactsOk && artifacts.supported === true) fresh.artifacts = artifacts.list ?? [];
 			if (deps.owner()) {
@@ -394,6 +403,54 @@ export function paletteCommands(deps: PaletteDeps): PaletteCommands {
 					searchOnly: !you,
 					keepOpen: true,
 					run: () => manage(action.busy, action.op, data.userId, action.done),
+				});
+			}
+		}
+		return list;
+	});
+
+	// Experiments: pick your own variant (Server > Experiments) -------------------------------------------------------
+	const pickVariant = (name: string, variant: string | undefined) => {
+		if (busy) return deps.report("Busy with the last action", COLORS.warn);
+		busy = true;
+		deps.report(variant !== undefined ? `Picking ${variant} of ${name}...` : `Clearing ${name}...`, COLORS.dim);
+		task.spawn(() => {
+			const [ok, reply] = call("exp.set", variant !== undefined ? { name, variant } : { name });
+			busy = false;
+			const answer = (typeIs(reply, "table") ? reply : {}) as ExperimentsReply;
+			if (!ok) return deps.report(`Failed: ${tostring(reply)}`, COLORS.bad);
+			if (facts !== undefined) facts.myExperiments = answer.experiments;
+			if (answer.saved === false) deps.report("Set for this server only (not saved)", COLORS.warn);
+			else deps.report(variant !== undefined ? `You get ${variant} of ${name} (rejoin if the game asked already)` : `Cleared ${name}`, COLORS.good);
+			deps.refresh();
+		});
+	};
+	registry.addSource((ctx) => {
+		const list = new Array<Command<PaletteContext>>();
+		for (const entry of ctx.facts?.myExperiments ?? []) {
+			for (const variant of entry.variants ?? []) {
+				if (entry.override === variant) continue;
+				list.push({
+					id: `experiment.use:${entry.name}:${variant}`,
+					title: `Experiment ${entry.name}: use ${variant}`,
+					group: "Experiments",
+					hint: entry.variant !== undefined ? `now ${entry.variant}` : undefined,
+					keywords: ["experiment", "variant", "ab", "a/b", entry.name, variant],
+					searchOnly: true,
+					keepOpen: true,
+					run: () => pickVariant(entry.name, variant),
+				});
+			}
+			if (entry.override !== undefined) {
+				list.push({
+					id: `experiment.clear:${entry.name}`,
+					title: `Experiment ${entry.name}: clear my variant`,
+					group: "Experiments",
+					hint: `yours: ${entry.override}`,
+					keywords: ["experiment", "variant", "ab", "a/b", "reset", entry.name],
+					searchOnly: true,
+					keepOpen: true,
+					run: () => pickVariant(entry.name, undefined),
 				});
 			}
 		}

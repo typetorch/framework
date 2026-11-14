@@ -22,6 +22,16 @@ import { toBase64 } from "./codec";
 import { encodeProps, scrubNames } from "./props";
 import { assignVariant, inShare, isExperimentName, isVariantList, playerOverride } from "./experiments";
 import {
+	cleanDevOverrides,
+	DEV_OVERRIDE_PREFIX,
+	DEV_OVERRIDES_MAX,
+	devOverrideAllowed,
+	isVariantName,
+	registerDevExperiments,
+	type DevExperiment,
+	type DevExperimentsReply,
+} from "./dev-control";
+import {
 	CHANNEL,
 	CHUNK_MAX_BYTES,
 	CLIENT_BATCH_MAX,
@@ -166,6 +176,12 @@ interface PlayerSession {
 	/** Active experiments: name -> variant. */
 	exp: Map<string, string>;
 	expJson: string;
+	/** Whether each active experiment's variant was forced (settings or a dev override): a change emits a new row. */
+	expForced?: Map<string, boolean>;
+	/** The variants the game passed per experiment (the dev menu's list; at most EXPERIMENTS_MAX). */
+	declared?: Map<string, string[]>;
+	/** The player's own dev overrides (analytics/dev-control.ts), read at join for players the dev menu allows. */
+	dexp?: Map<string, string>;
 	stateText: string;
 	pending: EventRow[];
 	rec: RecordingState;
@@ -388,6 +404,8 @@ export class ServerAnalytics {
 		});
 		// The dev menu (Status > Analytics, the Attention list) reads the counters through this.
 		trove.add(registerAnalyticsStatus(() => this.stats()));
+		// The dev menu's Server > Experiments (a dev picks their own variant) through this.
+		trove.add(registerDevExperiments({ list: (player) => this.devList(player), set: (player, name, variant) => this.devSet(player, name, variant) }));
 		// Notifications (and later built-ins) write their rows here (analytics/rows.ts).
 		trove.add(registerBuiltinRows((target, kind, name, props) => this.builtinRow(target, kind, name, props)));
 		// Feedback (plans/32) reads the session's play time (play_s) through this.
@@ -570,7 +588,19 @@ export class ServerAnalytics {
 	private overrides(player: Player, session: PlayerSession): Record<string, ExperimentOverride> {
 		const result: Record<string, ExperimentOverride> = {};
 		if (this.settings) for (const [name, override] of this.settings.experiments) result[name] = playerOverride(override, player.UserId, session.pid)!;
+		// The player's own dev overrides win (only their own; the client's assignVariant ignores a variant it doesn't have).
+		if (session.dexp !== undefined && session.dexp.size() > 0 && devOverrideAllowed(player)) {
+			for (const [name, variant] of session.dexp) result[name] = { ...(result[name] ?? {}), player: variant };
+		}
 		return result;
+	}
+
+	/** This player's override of `name`: the settings' (their `players` entry) with their own dev override on top. */
+	private overrideFor(player: Player, session: PlayerSession, name: string): ExperimentOverride | undefined {
+		const fromSettings = playerOverride(this.settings?.experiments.get(name), player.UserId, session.pid);
+		const mine = session.dexp?.get(name);
+		if (mine === undefined || !devOverrideAllowed(player)) return fromSettings;
+		return { ...(fromSettings ?? {}), player: mine };
 	}
 
 	/** The player's variant (stamped on their later events while active). May yield until the player's pid loads. */
@@ -589,22 +619,112 @@ export class ServerAnalytics {
 			this.warn(`experiment("${name}") not assigned: a session holds at most ${EXPERIMENTS_MAX} experiments`);
 			return control;
 		}
-		const assignment = assignVariant(session.pid, name, variants, playerOverride(this.settings?.experiments.get(name), player.UserId, session.pid));
+		const declared = (session.declared ??= new Map());
+		if (declared.has(name) || declared.size() < EXPERIMENTS_MAX) declared.set(name, [...variants]);
+		const assignment = assignVariant(session.pid, name, variants, this.overrideFor(player, session, name));
 		const current = session.exp.get(name);
-		if (assignment.active && current !== assignment.variant) {
+		const forced = (session.expForced ??= new Map());
+		// A new row when the variant changes, or when the same variant became (or stopped being) forced: the backend
+		// leaves forced players out of the results, so it must hear about a dev override even of the variant they had.
+		if (assignment.active && (current !== assignment.variant || (forced.get(name) ?? false) !== assignment.forced)) {
 			session.exp.set(name, assignment.variant);
+			forced.set(name, assignment.forced);
 			session.expJson = encodeProps(session.exp as unknown as object);
 			this.emit(
 				session,
 				"experiment",
 				name,
-				encodeProps({ variant: assignment.variant, variants: variants.size(), forced: assignment.forced || undefined }),
+				// vi: the variant's 1-based position in the game's list (the backend's sample ratio check needs the order).
+				encodeProps({ variant: assignment.variant, variants: variants.size(), vi: (variants.indexOf(assignment.variant) + 1) || undefined, forced: assignment.forced || undefined }),
 			);
 		} else if (!assignment.active && current !== undefined) {
 			session.exp.delete(name);
+			forced.delete(name);
 			session.expJson = encodeProps(session.exp as unknown as object);
 		}
 		return assignment.variant;
+	}
+
+	// Dev overrides (analytics/dev-control.ts) -------------------------------------------------------------------------
+
+	/** The dev menu's list: every experiment the game asked about for this player, plus their overrides and the settings'. */
+	private devList(player: Player): DevExperiment[] {
+		const session = this.sessionOf(player);
+		if (!session || !session.ready) return [];
+		const names = new Set<string>();
+		for (const [name] of session.declared ?? new Map<string, string[]>()) names.add(name);
+		for (const [name] of session.dexp ?? new Map<string, string>()) names.add(name);
+		if (this.settings) for (const [name] of this.settings.experiments) names.add(name);
+		const list = new Array<DevExperiment>();
+		for (const name of names) {
+			const variants = session.declared?.get(name);
+			const override = session.dexp?.get(name);
+			const entry: DevExperiment = { name, active: this.settings?.experiments.get(name)?.active !== false, override };
+			if (variants !== undefined) {
+				const assignment = assignVariant(session.pid, name, variants, this.overrideFor(player, session, name));
+				entry.variants = [...variants];
+				entry.variant = assignment.variant;
+				entry.active = assignment.active;
+				entry.how = !assignment.forced ? "random" : override !== undefined && override === assignment.variant ? "dev" : "settings";
+			}
+			list.push(entry);
+		}
+		list.sort((a, b) => a.name < b.name);
+		return list;
+	}
+
+	/** Sets or clears the player's own override: in the session at once, then the DataStore, then the stamp and hello. */
+	private devSet(player: Player, name: string, variant: string | undefined): DevExperimentsReply {
+		if (!devOverrideAllowed(player)) error("not allowed here", 0);
+		if (!isExperimentName(name)) error("bad experiment name", 0);
+		const session = this.sessionOf(player);
+		if (!session || !session.ready) error("your analytics session isn't ready yet", 0);
+		const variants = session.declared?.get(name);
+		if (variant !== undefined) {
+			if (!isVariantName(variant)) error("bad variant", 0);
+			// Only variants the game passed: otherwise the game would ignore it and the menu would show a lie.
+			if (variants === undefined) error(`the game hasn't asked for your variant of ${name} yet`, 0);
+			if (!variants.includes(variant)) error(`${name} has no variant ${variant}`, 0);
+		}
+		const mine = (session.dexp ??= new Map());
+		if (variant === undefined) mine.delete(name);
+		else {
+			if (!mine.has(name) && mine.size() >= DEV_OVERRIDES_MAX) error(`at most ${DEV_OVERRIDES_MAX} overrides`, 0);
+			mine.set(name, variant);
+		}
+		const saved = session.temp ? false : this.writeDevOverrides(player.UserId, name, variant);
+		// Stamp it now (a new experiment row, forced while the override holds) and tell the client (its own assignment).
+		if (variants !== undefined) this.experiment(player, name, variants);
+		if (session.device !== undefined && !this.helloWaiting.has(player)) this.sendHello(player, session);
+		return { experiments: this.devList(player), saved };
+	}
+
+	/** Reads the player's stored overrides (one read; only for players the dev menu allows). */
+	private readDevOverrides(userId: number): Map<string, string> | undefined {
+		const store = this.dataStore();
+		if (!store) return undefined;
+		this.countBudget("datastore", "read");
+		const [ok, value] = pcall(() => store.GetAsync(`${DEV_OVERRIDE_PREFIX}${userId}`)[0]);
+		return ok ? cleanDevOverrides(value, isExperimentName) : undefined;
+	}
+
+	/** Writes one change into the stored overrides (merged, so two servers don't undo each other). */
+	private writeDevOverrides(userId: number, name: string, variant: string | undefined): boolean {
+		const store = this.dataStore();
+		if (!store) return false;
+		this.countBudget("datastore", "read");
+		this.countBudget("datastore", "write");
+		const [ok] = pcall(() =>
+			store.UpdateAsync(`${DEV_OVERRIDE_PREFIX}${userId}`, (old: unknown) => {
+				const merged = cleanDevOverrides(old, isExperimentName);
+				if (variant === undefined) merged.delete(name);
+				else if (merged.has(name) || merged.size() < DEV_OVERRIDES_MAX) merged.set(name, variant);
+				const value: Record<string, string> = {};
+				for (const [key, chosen] of merged) value[key] = chosen;
+				return $tuple(value);
+			}),
+		);
+		return ok;
 	}
 
 	// Settings ---------------------------------------------------------------------------------------------------------
@@ -759,6 +879,11 @@ export class ServerAnalytics {
 			// The store can't be read (Studio without API access, an outage): a session-only id, never recorded.
 			pid = `t${newId().sub(2)}`;
 			temp = true;
+		}
+		// The player's own dev overrides (dev-control.ts): one read, only for players the dev menu allows.
+		if (!temp && session.dexp === undefined && devOverrideAllowed(player)) {
+			const stored = this.readDevOverrides(player.UserId);
+			if (stored !== undefined) session.dexp = stored;
 		}
 		if (session.ready) return;
 		session.pid = pid;

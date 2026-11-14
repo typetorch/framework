@@ -31,6 +31,7 @@ import { ArtifactNotes, notesFromAttribute, parseArtifactNotes } from "./artifac
 import { loadstringAvailable } from "./claude-tools";
 import { kernelHasExperiments, NEEDS_KERNEL_AB } from "./ab";
 import { analyticsStatus } from "../analytics/status";
+import { devExperiments, registerDevGate } from "../analytics/dev-control";
 import { assetFacts, assetReport } from "../assets/sync";
 
 function isAssetId(value: unknown): value is number {
@@ -173,6 +174,41 @@ export function startDevtoolsServer(kernel: ServerKernel, dispatcher: ServerDisp
 	ops.set("budget", () => {
 		if (!typeIs((kernel as unknown as Record<string, unknown>).budget, "function")) return { supported: false };
 		return { supported: true, budget: kernel.budget!() };
+	});
+	// Server > Experiments (analytics/dev-control.ts): a dev picks their own variant of an analytics experiment. Like
+	// Modules > State: devs where the dev-only tools are open to them (access.ts), owners everywhere. Only ever their
+	// own variant; the engine re-checks the gate, and stored overrides apply only while it allows.
+	// The engine asks this gate directly (not through the dispatcher's dev check), so it checks the dev role itself.
+	const mayOverride = (player: Player) => {
+		const [ok, info] = pcall(() => kernel.devInfo(player));
+		if (!ok || !typeIs(info, "table") || info.dev !== true) return false;
+		return access.allows(player) || isOwner(player);
+	};
+	trove.add(registerDevGate(mayOverride));
+	const experimentSets = new Map<Player, number>();
+	trove.connect(Players.PlayerRemoving, (player) => experimentSets.delete(player));
+	ops.set("exp.list", (player) => {
+		const refusal = access.refusal(player);
+		if (!mayOverride(player)) error(refusal ?? "owners_only", 0);
+		const control = devExperiments();
+		if (control === undefined) return { supported: false, experiments: [] };
+		return { supported: true, experiments: control.list(player) };
+	});
+	// payload: { name, variant? } (no variant: clear). One change per second per dev (each one writes the DataStore).
+	ops.set("exp.set", (player, payload) => {
+		const refusal = access.refusal(player);
+		if (!mayOverride(player)) error(refusal ?? "owners_only", 0);
+		assert(typeIs(payload, "table"), "bad request");
+		const request = payload as { name?: unknown; variant?: unknown };
+		assert(typeIs(request.name, "string") && request.name.size() <= 64, "bad experiment");
+		assert(request.variant === undefined || (typeIs(request.variant, "string") && request.variant.size() <= 32), "bad variant");
+		const now = os.clock();
+		const last = experimentSets.get(player);
+		if (last !== undefined && now - last < 1) error("rate_limited", 0);
+		experimentSets.set(player, now);
+		const control = devExperiments();
+		if (control === undefined) error("analytics isn't running on this server", 0);
+		return { supported: true, ...control.set(player, request.name, request.variant as string | undefined) };
 	});
 	ops.set("branches", () => kernel.branches());
 	ops.set("reload", (player) => {

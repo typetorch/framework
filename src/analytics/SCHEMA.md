@@ -76,7 +76,7 @@ First-ever-session detail, one row per packed chunk.
 | zone | `leave` | `zone`, `to?`, `secs` |
 | state | `activity` | `to`, `from` (server or client src) |
 | state | `screen` | `to`, `from` (`""` = none). Client: ScreenGuis in PlayerGui (Enabled), GuiObjects tagged `TTScreen` (Visible), `screen()` |
-| experiment | `<experiment>` | `variant`, `variants` (count), `forced?`. Once per session when assigned or changed. At most 32 experiments per session: a 33rd `experiment()` returns the control (the first variant) and warns. A client's experiment calls count against its event budget (below) |
+| experiment | `<experiment>` | `variant`, `variants` (count), `vi` (the variant's 1-based position in the game's list; 0.7.1+), `forced?` (the settings or the player's own dev pick chose it). Once per session when assigned or changed, and again when the same variant becomes or stops being forced. At most 32 experiments per session: a 33rd `experiment()` returns the control (the first variant) and warns. A client's experiment calls count against its event budget (below) |
 | recording_meta | `start` | `share` (the recorded share then) |
 | recording_meta | `end` | `chunks`, `bytes`, `why`: `window` (60 s after the first input), `cap` (10 min, or the server's 256 KB / 80 chunks), `left`, `end` |
 | fleet | `heartbeat` | The kernel's `fleetStatus()` (kernel 0.3.2+), every 60 ± 10 s and once at each generation start. pid `""` |

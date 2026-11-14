@@ -67,6 +67,7 @@ import { describeState } from "./state";
 import type { ArtifactNotes } from "./artifact-notes";
 import { analyticsText, badgeLevel, checkHealth, detachedText, errorsFailing, errorsText, fleetFailing, fleetText, HealthIssue, HealthLevel, healthLimitsText, perfLow, perfText, ServerFacts, settingsText } from "./health";
 import { renderBudgetTab } from "./budget-ui";
+import { renderExperimentsTab } from "./experiments-ui";
 import { NEEDS_KERNEL_AB } from "./ab";
 import {
 	addButton,
@@ -175,7 +176,7 @@ const CLIENT_UPLOAD_BYTES = 256 * 1024;
 const TABS = ["Artifact", "Server", "Network", "Modules", "Manage", "Logs", "Dex", "Claude"] as const;
 type TabName = (typeof TABS)[number];
 /** Tabs with sub-tabs (a segmented bar on top of the content); the first one is the default. */
-const SUBTABS: Partial<Record<TabName, readonly string[]>> = { Modules: ["Overview", "State", "Assets"], Server: ["Status", "Branch", "Budget"], Manage: ["Players", "Servers", "Bans"], Network: ["Packets", "Stats"] };
+const SUBTABS: Partial<Record<TabName, readonly string[]>> = { Modules: ["Overview", "State", "Assets"], Server: ["Status", "Branch", "Budget", "Experiments"], Manage: ["Players", "Servers", "Bans"], Network: ["Packets", "Stats"] };
 
 /**
  * Pages that open in one pane at most (panes.ts focuses the open one instead of opening a second):
@@ -1625,6 +1626,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		"Server/Status": renderServer,
 		"Server/Branch": renderBranch,
 		"Server/Budget": (tab) => renderBudgetTab(tab, { call }),
+		"Server/Experiments": (tab) => renderExperimentsTab(tab, { call, errorText: (code) => ACCESS_TEXT[code] ?? OTHER_LOG_ERRORS[code] }),
 		...adminTabs({ kernel, call, playerFocus }),
 		Logs: renderLogs,
 		Dex: renderDex,
