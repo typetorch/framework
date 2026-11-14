@@ -489,8 +489,11 @@ local options = {
 		token = "TKN-secret",
 		flushSeconds = 5,
 		experiments = { qa = { active = false, players = { ["2"] = "b" } } },
+		recordSeconds = 180,
+		positions = { "round_result" },
 	},
 	zones = false,
+	positions = { "down" },
 }
 local trove1 = Trove.new()
 local core1 = ServerAnalytics.new(options, { trove = trove1, server = kernel }, trove1)
@@ -508,6 +511,8 @@ local hiReg = hiFor(regular)
 check("hi: new player", hiNew ~= nil and hiNew.pid == newbiePid and hiNew.newp == true and hiNew.rec == true, hiNew and hiNew.pid)
 check("hi: returning player", hiReg ~= nil and hiReg.newp == false and hiReg.rec == false)
 check("hi: tech interval", hiNew.tech == 60)
+check("hi: recording window (recordSeconds)", hiNew.rsec == 180, hiNew.rsec)
+check("hi: the settings' position names", hiNew.pos ~= nil and #hiNew.pos == 1 and hiNew.pos[1] == "round_result")
 -- Per-player overrides: each hello carries only its own player's entry, never the others' ids.
 check("hi: own forced variant only", hiReg.exps.qa ~= nil and hiReg.exps.qa.player == "b" and hiReg.exps.qa.players == nil and hiReg.exps.qa.active == false)
 check("hi: no entry, no player", hiNew.exps.qa ~= nil and hiNew.exps.qa.player == nil and hiNew.exps.qa.players == nil)
@@ -625,6 +630,37 @@ core1:track(newbie, "custom", "after_exp", nil)
 local rows = store().events.rows
 local quest = rowsNamed(rows, "custom", "quest_done")[1]
 check("track: row", quest and quest.pid == newbiePid and quest.props == '{"quest":"tutorial"}' and quest.src == "server")
+-- Positions: px/py/pz of the character root, rounded to 0.1, on request or by event name; never over the game's own.
+local newbieRoot = { Position = roblox.Vector3.new(10.04, 3.06, -5.56) }
+function newbieRoot:IsA(class)
+	return class == "BasePart"
+end
+newbie.Character = {}
+function newbie.Character:FindFirstChild(name)
+	return if name == "HumanoidRootPart" then newbieRoot else nil
+end
+core1:track(newbie, "custom", "tapped", { a = 1 }, newbie)
+core1:track(newbie, "custom", "down", { by = "fall" })
+core1:track(newbie, "custom", "round_result", nil)
+core1:track(newbie, "custom", "down", { px = 1, py = 2, pz = 3 })
+core1:track(newbie, "custom", "seen_regular", nil, regular) -- the regular has no character
+core1:track(nil, "custom", "down", nil) -- no player: nothing to read
+core1:track(newbie, "funnel", "down", { i = 1 })
+local function propsOf(name, index, kind)
+	local row = rowsNamed(store().events.rows, kind or "custom", name)[index or 1]
+	return row and serde.decode("json", row.props) or {}, row and row.props
+end
+local tapped, tappedText = propsOf("tapped")
+check("position on request: rounded", tapped.px == 10 and tapped.py == 3.1 and tapped.pz == -5.6 and tapped.a == 1, tappedText)
+local downs = rowsNamed(store().events.rows, "custom", "down")
+check("position by options.positions", #downs == 3 and serde.decode("json", downs[1].props).pz == -5.6 and serde.decode("json", downs[1].props).by == "fall", downs[1] and downs[1].props)
+check("position by the settings' positions", propsOf("round_result").py == 3.1)
+check("position never overrides the game's px/py/pz", downs[2] and downs[2].props == '{"px":1,"py":2,"pz":3}' or false, downs[2] and downs[2].props)
+check("position: none without a character", propsOf("seen_regular").px == nil and select(2, propsOf("seen_regular")) == "{}")
+check("position: none for a server-only event", downs[3] and downs[3].props == "{}" and downs[3].pid == "", downs[3] and downs[3].props)
+check("position on other game-code kinds (funnel) by name", propsOf("down", 1, "funnel").px == 10)
+check("quest_done untouched (not listed)", rowsNamed(store().events.rows, "custom", "quest_done")[1].props == '{"quest":"tutorial"}')
+newbie.Character = nil
 local serverThing = rowsNamed(rows, "custom", "server_thing")[1]
 check("server-only event", serverThing and serverThing.pid == "" and serverThing.sid == "" and serverThing.dev == "unknown" and serverThing.props == "{}")
 check("activity rows per player", #rowsNamed(rows, "state", "activity") == 2)
@@ -691,6 +727,8 @@ check("recording data", buffer.tostring(C.fromBase64(recs[1].data)) == buffer.to
 check("recording t", math.abs(recs[1].t - (nowMs() - 1000 - 50)) < 200)
 local metaEnd = rowsNamed(store().events.rows, "recording_meta", "end")[1]
 check("recording_meta start + end", #rowsNamed(store().events.rows, "recording_meta", "start") == 1 and metaEnd and serde.decode("json", metaEnd.props).why == "window")
+local metaStart = rowsNamed(store().events.rows, "recording_meta", "start")[1]
+check("recording_meta start: share and window", metaStart and serde.decode("json", metaStart.props).secs == 180 and serde.decode("json", metaStart.props).share == 1, metaStart and metaStart.props)
 
 -- Fleet rows: a heartbeat at start, the replayed reports once each.
 check("fleet heartbeat", #rowsNamed(store().fleet.rows, "fleet", "heartbeat") == 1)

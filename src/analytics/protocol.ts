@@ -6,7 +6,8 @@
  *                     "ev", ClientEvent[]                       a batch of events (at most CLIENT_BATCH_MAX)
  *                     "exp", name, variants                     the client evaluated an experiment
  *                     "rec", chunk, ageMs, n, data, last, why   one tt-rec-1 chunk of the first-session recording
- *   server -> client  "hi", ServerHello                         pid, recording on/off, tech interval, experiments
+ *   server -> client  "hi", ServerHello                         pid, recording on/off and window, tech interval,
+ *                                                               experiments, position event names
  *
  * Event times travel as ages (ms before the send) and the server subtracts them from its own clock, so client clocks
  * never matter.
@@ -82,6 +83,10 @@ export interface ServerHello {
 	tech: number;
 	/** Live experiment overrides by name. */
 	exps: Record<string, ExperimentOverride>;
+	/** Seconds the recording runs after the first input (the settings' `recordSeconds`; missing: 60). */
+	rsec?: number;
+	/** The settings' `positions`: event names whose game-code events carry the local player's position. */
+	pos?: string[];
 }
 
 const DEVICES = new Set<string>(["desktop", "phone", "tablet", "console", "vr", "unknown"]);

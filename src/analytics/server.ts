@@ -20,6 +20,7 @@ import { assetCounts } from "../assets/manifest";
 import { assetReport } from "../assets/sync";
 import { toBase64 } from "./codec";
 import { encodeProps, scrubNames } from "./props";
+import { characterPosition, withPosition } from "./position";
 import { assignVariant, inShare, isExperimentName, isVariantList, playerOverride } from "./experiments";
 import {
 	CHANNEL,
@@ -53,7 +54,16 @@ import {
 	type RecordingRow,
 	type ResolvedSettings,
 } from "./schema";
-import { identityTarget, parseSettings, recordsSupported, sinkSettings, DEFAULT_TECH_EVERY, type ParsedSettings } from "./settings";
+import {
+	identityTarget,
+	optionPositions,
+	parseSettings,
+	recordsSupported,
+	sinkSettings,
+	DEFAULT_RECORD_SECONDS,
+	DEFAULT_TECH_EVERY,
+	type ParsedSettings,
+} from "./settings";
 import { registerAnalyticsStatus } from "./status";
 import { buildRequests, estimateEventBytes, estimateRecordingBytes, type SinkRequest } from "./sinks";
 
@@ -347,6 +357,8 @@ export class ServerAnalytics {
 	 * fake server session into the owner's analytics. Set by the stub kernel's `test` or the TypeTorchTest attribute.
 	 */
 	private readonly testMode: boolean;
+	/** `options.positions`: event names whose game-code events carry the player's position (plus the settings' list). */
+	private readonly positionNames: Set<string>;
 
 	constructor(
 		private readonly options: AnalyticsOptions,
@@ -355,6 +367,7 @@ export class ServerAnalytics {
 	) {
 		this.kernel = scope.server;
 		this.testMode = isCloudTest(scope.server);
+		this.positionNames = optionPositions(options.positions);
 		this.store = TypeTorch.persist(PERSIST_KEY, newStore);
 		this.events = new RowQueue(this.store.events, EVENTS_CAP_UNCONFIGURED);
 		this.recordings = new RowQueue(this.store.recordings, RECORDINGS_CAP);
@@ -522,15 +535,24 @@ export class ServerAnalytics {
 		return this.sessions.get(player);
 	}
 
-	/** Game code's events. `player` undefined: a server-only event (no pid). */
-	track(player: Player | undefined, kind: EventKind, name: string, props?: object) {
+	/**
+	 * Game code's events. `player` undefined: a server-only event (no pid). `position`: add that player's character
+	 * position (`px`, `py`, `pz`); without it, events named in the `positions` lists get the event player's.
+	 */
+	track(player: Player | undefined, kind: EventKind, name: string, props?: object, position?: Player) {
 		if (!isEventName(name)) {
 			$warn(`[analytics] ${kind} event name must be 1-64 characters: ${tostring(name).sub(1, 80)}`);
 			return;
 		}
 		const session = player ? this.sessionOf(player) : undefined;
 		if (player && !session) return;
-		this.emit(session, kind, name, encodeProps(props));
+		const from = position ?? (player !== undefined && this.wantsPosition(name) ? player : undefined);
+		this.emit(session, kind, name, encodeProps(from !== undefined ? withPosition(props, characterPosition(from)) : props));
+	}
+
+	/** The event name is in `options.positions` or the settings' `positions`. */
+	private wantsPosition(name: string): boolean {
+		return this.positionNames.has(name) || this.settings?.positions.has(name) === true;
 	}
 
 	/** Activity: per player, or server-wide (every player without their own) when `player` is undefined. */
@@ -1119,6 +1141,8 @@ export class ServerAnalytics {
 			rec: session.rec.on && !session.rec.ended && this.options.recording !== false,
 			tech: this.settings?.techEvery ?? DEFAULT_TECH_EVERY,
 			exps: this.overrides(player, session),
+			rsec: this.settings?.recordSeconds ?? DEFAULT_RECORD_SECONDS,
+			pos: this.settings ? [...this.settings.positions] : [],
 		};
 		dispatcher.kernel.send(player, CHANNEL, "hi", hello);
 	}
@@ -1211,7 +1235,7 @@ export class ServerAnalytics {
 		const t = nowMs() - age - math.floor(math.clamp(player.GetNetworkPing(), 0, 2) * 500);
 		if (!rec.started) {
 			rec.started = true;
-			this.emit(session, "recording_meta", "start", encodeProps({ share: settings.recordShare }), "server", t);
+			this.emit(session, "recording_meta", "start", encodeProps({ share: settings.recordShare, secs: settings.recordSeconds }), "server", t);
 		}
 		rec.chunk = chunk + 1;
 		rec.bytes += size;

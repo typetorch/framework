@@ -1,8 +1,9 @@
+import { Players } from "@rbxts/services";
 import { $warn } from "rbxts-transform-debug";
 import { maybeClientDispatcher } from "../net/runtime";
 import { generationScope } from "../typetorch";
 import { ClientAnalytics } from "./client";
-import type { AnalyticsOptions, AnalyticsProps, AnalyticsPurchase, AnalyticsStats } from "./schema";
+import type { AnalyticsEventOptions, AnalyticsOptions, AnalyticsProps, AnalyticsPurchase, AnalyticsStats } from "./schema";
 import { ServerAnalytics } from "./server";
 
 /**
@@ -58,6 +59,18 @@ function currentClient(options: AnalyticsOptions): ClientAnalytics | undefined {
 	return core;
 }
 
+/**
+ * Whose character position `track()` adds: `position: true` the event's player (server: the player passed first;
+ * client: the local player), a Player that player, else none.
+ */
+function positionOf(options: AnalyticsEventOptions | undefined, player: Player | undefined): Player | undefined {
+	if (!typeIs(options, "table")) return undefined;
+	const position = options.position;
+	if (isPlayer(position)) return position;
+	if (position !== true) return undefined;
+	return player;
+}
+
 export class AnalyticsEngine {
 	private readonly server?: ServerAnalytics;
 	private readonly client?: ClientAnalytics;
@@ -84,16 +97,22 @@ export class AnalyticsEngine {
 		return (this.server !== undefined && serverCore === this.server) || (this.client !== undefined && clientCore === this.client);
 	}
 
-	/** A custom event. Server: pass the player first (without one it is a server-only event). */
-	track(name: string, props?: AnalyticsProps): void;
-	track(player: Player, name: string, props?: AnalyticsProps): void;
-	track(first: Player | string, second?: string | AnalyticsProps, third?: AnalyticsProps) {
+	/**
+	 * A custom event. Server: pass the player first (without one it is a server-only event). `options.position` adds a
+	 * character position as props `px`, `py`, `pz`: `true` the event's player (client: the local player), or any
+	 * player, e.g. `track(player, "down", { by: "fall" }, { position: true })`.
+	 */
+	track(name: string, props?: AnalyticsProps, options?: AnalyticsEventOptions): void;
+	track(player: Player, name: string, props?: AnalyticsProps, options?: AnalyticsEventOptions): void;
+	track(first: Player | string, second?: string | AnalyticsProps, third?: AnalyticsProps | AnalyticsEventOptions, fourth?: AnalyticsEventOptions) {
 		if (isPlayer(first)) {
-			this.server?.track(first, "custom", second as string, third);
-			this.client?.track("custom", second as string, third);
+			const at = positionOf(fourth, first);
+			this.server?.track(first, "custom", second as string, third, at);
+			this.client?.track("custom", second as string, third, at);
 		} else {
-			this.server?.track(undefined, "custom", first, second as AnalyticsProps | undefined);
-			this.client?.track("custom", first, second as AnalyticsProps | undefined);
+			const at = positionOf(third as AnalyticsEventOptions | undefined, this.client ? Players.LocalPlayer : undefined);
+			this.server?.track(undefined, "custom", first, second as AnalyticsProps | undefined, at);
+			this.client?.track("custom", first, second as AnalyticsProps | undefined, at);
 		}
 	}
 
