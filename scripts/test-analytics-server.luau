@@ -129,6 +129,7 @@ local function makePlayer(userId, name)
 		Parent = PlayersService,
 		AccountAge = 12,
 		MembershipType = Enum.MembershipType.None,
+		LocaleId = "pt-br",
 		FollowUserId = 0,
 	}
 	function player:GetJoinData()
@@ -527,7 +528,7 @@ for _, row in joins do
 end
 local joinNewProps = joinNew and serde.decode("json", joinNew.props)
 local joinRegProps = joinReg and serde.decode("json", joinReg.props)
-check("join: new player props", joinNewProps and joinNewProps.from == "direct" and joinNewProps.ret == -1 and joinNewProps.age == "7-30d" and joinNewProps.country == "US" and joinNewProps.prem == false)
+check("join: new player props", joinNewProps and joinNewProps.from == "direct" and joinNewProps.ret == -1 and joinNewProps.age == "7-30d" and joinNewProps.country == "US" and joinNewProps.prem == false and joinNewProps.locale == "pt-br")
 check("join: referral as the referrer's pid", joinRegProps and joinRegProps.from == "referral" and joinRegProps.ref == newbiePid, joinRegProps and joinRegProps.ref)
 check("join: party + known pids only", joinRegProps and joinRegProps.party == 5 and #joinRegProps.party_pids == 2 and joinRegProps.party_pids[1] == newbiePid and joinRegProps.party_pids[2] == "knownpid0000000000000000099998")
 local otherReads = {}

@@ -966,6 +966,9 @@ export class ServerAnalytics {
 		props.prem = player.MembershipType === Enum.MembershipType.Premium;
 		const [countryOk, country] = pcall(() => LocalizationService.GetCountryRegionForPlayerAsync(player));
 		if (countryOk) props.country = country;
+		// The player's Roblox language setting ("en-us"): the explorer's Demographics page groups it by language.
+		const [localeOk, locale] = pcall(() => player.LocaleId);
+		if (localeOk && typeIs(locale, "string") && locale !== "" && locale.size() <= 16) props.locale = locale;
 		this.policyProps(player, props);
 		props.trust = deviceTrust(player);
 		props.friends = this.friendsHere(player);
