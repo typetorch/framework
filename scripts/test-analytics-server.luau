@@ -482,6 +482,14 @@ for page = 1, 12 do
 	friendLists[2][page] = if page == 11 then { 1 } else { 200 + page }
 end
 
+-- Dev overrides (dev-control.ts): the dev menu's gate allows the regular (UserId 2) only; they stored a pick before.
+local DC = loadAnalytics("dev-control")
+local devAllowed = { [regular] = true }
+local removeGate = DC.registerDevGate(function(player)
+	return devAllowed[player] == true
+end)
+records["dexp/2"] = { stored = "b", ["bad name!"] = "x", toolong = string.rep("v", 40) }
+
 local options = {
 	settings = {
 		backend = "duckdb",
@@ -675,6 +683,63 @@ check("per-player: forced over stop", core1:experiment(regular, "qa", { "a", "b"
 local qaRow = rowsNamed(store().events.rows, "experiment", "qa")[1]
 check("per-player: row forced", qaRow and serde.decode("json", qaRow.props).forced == true, qaRow and qaRow.props)
 check("per-player: others keep the override", core1:experiment(newbie, "qa", { "a", "b" }) == "a" and #rowsNamed(store().events.rows, "experiment", "qa") == 1)
+
+-- Dev overrides: the stored pick applies at join (bad entries dropped), forced, with the variant's position (vi).
+check("dev: stored pick read at join", hiReg.exps.stored ~= nil and hiReg.exps.stored.player == "b" and hiReg.exps["bad name!"] == nil and hiReg.exps.toolong == nil)
+check("dev: not for others", hiNew.exps.stored == nil)
+check("dev: stored pick wins", core1:experiment(regular, "stored", { "a", "b" }) == "b")
+local storedRow = rowsNamed(store().events.rows, "experiment", "stored")[1]
+local storedProps = storedRow and serde.decode("json", storedRow.props) or {}
+check("dev: row forced with vi", storedProps.forced == true and storedProps.vi == 2 and storedProps.variants == 2, storedRow and storedRow.props)
+local onboardingRow = rowsNamed(store().events.rows, "experiment", "onboarding")[1]
+check("experiment row: vi of the random variant", serde.decode("json", onboardingRow.props).vi == (if variant == "short" then 1 else 2), onboardingRow.props)
+local control = DC.devExperiments()
+check("dev: the engine registered", control ~= nil)
+local refused = pcall(control.set, newbie, "onboarding", "long")
+check("dev: a player the gate refuses can't pick", not refused)
+-- The regular picks the other onboarding variant than the hash gives them.
+local regularRandom = core1:experiment(regular, "onboarding", { "short", "long" })
+local other = if regularRandom == "short" then "long" else "short"
+local rowsBefore = #rowsNamed(store().events.rows, "experiment", "onboarding")
+local sentBefore = #sent
+local reply = control.set(regular, "onboarding", other)
+local entry
+for _, item in reply.experiments do
+	if item.name == "onboarding" then
+		entry = item
+	end
+end
+check("dev: set answers the list", entry ~= nil and entry.variant == other and entry.how == "dev" and entry.override == other and reply.saved == true, entry and entry.how)
+check("dev: saved to the store", records["dexp/2"].onboarding == other and records["dexp/2"].stored == "b" and records["dexp/2"]["bad name!"] == nil)
+local pickRows = rowsNamed(store().events.rows, "experiment", "onboarding")
+local pickProps = serde.decode("json", pickRows[#pickRows].props)
+check("dev: a new forced row", #pickRows == rowsBefore + 1 and pickProps.variant == other and pickProps.forced == true)
+check("dev: experiment() gives the pick", core1:experiment(regular, "onboarding", { "short", "long" }) == other)
+local resent = false
+for index = sentBefore + 1, #sent do
+	if sent[index].player == regular and sent[index].args[1] == "hi" and sent[index].args[2].exps.onboarding.player == other then
+		resent = true
+	end
+end
+check("dev: hello sent again with the pick", resent)
+check("dev: unknown variant refused", not pcall(control.set, regular, "onboarding", "nope"))
+check("dev: undeclared experiment refused", not pcall(control.set, regular, "never_asked", "a"))
+-- Picking the variant you already have still marks you forced (left out of the results).
+local colorRandom = core1:experiment(regular, "color", { "red", "blue" })
+control.set(regular, "color", colorRandom)
+local colorRows = rowsNamed(store().events.rows, "experiment", "color")
+check("dev: same variant, now forced", #colorRows == 2 and serde.decode("json", colorRows[2].props).forced == true)
+-- Clear: back to the hash, a row without forced.
+control.set(regular, "onboarding", nil)
+check("dev: cleared in the store", records["dexp/2"].onboarding == nil and records["dexp/2"].color == colorRandom)
+check("dev: cleared gives the random variant", core1:experiment(regular, "onboarding", { "short", "long" }) == regularRandom)
+local clearRows = rowsNamed(store().events.rows, "experiment", "onboarding")
+check("dev: cleared row not forced", serde.decode("json", clearRows[#clearRows].props).forced == nil)
+-- The gate closes (role revoked): the stored pick is ignored.
+devAllowed[regular] = nil
+check("dev: gate closed, pick ignored", core1:experiment(regular, "stored", { "a", "b" }) == E.assignVariant(records["p/2"].pid, "stored", { "a", "b" }).variant)
+devAllowed[regular] = true
+check("dev: gate open again", core1:experiment(regular, "stored", { "a", "b" }) == "b")
 
 -- Client events: valid, server-only kinds (session, purchase, currency), bad JSON, a screen change.
 raw["__tt/an"](newbie, "ev", {
@@ -936,6 +1001,9 @@ do
 	troveNew:clean()
 	check("settings: the engine's listener goes with its trove", #settingsMock.listeners == 0)
 end
+
+removeGate()
+check("dev: no gate, nobody may", not DC.devOverrideAllowed(regular))
 
 print(`analytics server: {passed} passed, {failed} failed`)
 if failed > 0 then

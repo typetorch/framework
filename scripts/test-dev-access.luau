@@ -637,6 +637,30 @@ stubs.ab = {
 	NEEDS_KERNEL_AB = "kernel 0.2.3 needed",
 }
 stubs.status = { analyticsStatus = function() end } -- analytics/status
+-- analytics/dev-control: the gate server.luau registers, and a stub engine that answers who asked.
+local devGate
+local devSets = {}
+stubs["dev-control"] = {
+	registerDevGate = function(fn)
+		devGate = fn
+		return function()
+			if devGate == fn then
+				devGate = nil
+			end
+		end
+	end,
+	devExperiments = function()
+		return {
+			list = function()
+				return { { name = "onboarding", variants = { "a", "b" }, variant = "a", active = true, how = "random" } }
+			end,
+			set = function(target, name, variant)
+				table.insert(devSets, { target = target, name = name, variant = variant })
+				return { experiments = {}, saved = true }
+			end,
+		}
+	end,
+}
 stubs.sync = { -- assets/sync
 	assetFacts = function() end,
 	assetReport = function()
@@ -772,7 +796,20 @@ for _, case in SERVER_CASES do
 		ok, reply = request(target, "logs.upload", { kind = "server" })
 		local code = if ok then reply.error else reply
 		check(`{label}: logs.upload, {name}`, if expect ~= nil then code == expect else code == "not_connected", code)
+		-- Server > Experiments (your own variant): like Modules > State, owners everywhere, other devs where the tools are open.
+		ok, reply = request(target, "exp.list")
+		check(`{label}: exp.list, {name}`, if stateOpen then (ok and reply.supported == true and reply.experiments[1].name == "onboarding") else (not ok and reply == expect), reply)
+		check(`{label}: the engine's gate agrees, {name}`, devGate ~= nil and devGate(target) == stateOpen)
+		local setsBefore = #devSets
+		ok, reply = request(target, "exp.set", { name = "onboarding", variant = "b" })
+		check(`{label}: exp.set, {name}`, if stateOpen then (ok and reply.saved == true and #devSets == setsBefore + 1 and devSets[#devSets].target == target) else (not ok and #devSets == setsBefore), reply)
+		if stateOpen then
+			ok, reply = request(target, "exp.set", { name = "onboarding" })
+			check(`{label}: exp.set twice in a second is refused, {name}`, not ok and reply == "rate_limited", reply)
+		end
 	end
+	check(`{label}: a stranger may not hold an override`, not devGate(stranger))
+	check(`{label}: exp.set checks its payload`, not (request(owner, "exp.set", { name = 5 })))
 	local ok, reply = request(stranger, "access")
 	check(`{label}: not a dev`, ok == false and reply == "not a dev", reply)
 	stop()

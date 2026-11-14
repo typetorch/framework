@@ -192,9 +192,20 @@ return the generation's stop function, which the kernel calls on a swap.
   close it, dock all windows; Reload, Roll back, switch branch, load a build here, join a server on a branch or build
   (the Branch tab's rules and words, `devtools/build-actions.ts`), New server and Join a listed server (owners); find a
   player by name, display name or UserId and open them in Manage > Players or their Kick / Ban card (owners); copy the
-  job id, artifact id, commit, branch or place version (the copy popup); "Ask Claude: ..." puts the query in the Claude
-  draft. Anything that swaps what runs on the server takes a second Enter or tap to confirm. The kernel and the server
+  job id, artifact id, commit, branch or place version (the copy popup); "Experiment <name>: use <variant>" / "clear my
+  variant" (Server > Experiments, below); "Ask Claude: ..." puts the query in the Claude draft. Anything that swaps what runs on the server takes a second Enter or tap to confirm. The kernel and the server
   re-check every request. Core: `devtools/commands.ts` (pure, Lune-tested by `scripts/test-commands.luau`).
+- **Server > Experiments (framework 0.7.1): your own variant.** Every analytics experiment the game asked about for
+  you, the variant you're in and why (random, forced by the settings, or your pick), a button per variant to pick it
+  for yourself, and Clear; the palette has the same as "Experiment <name>: use <variant>". Devs where the dev-only
+  tools are open to them (dev rules, or owners on a server an owner switched), owners everywhere: the same rule as
+  Modules > State, re-checked by the server and by the analytics engine (`analytics/dev-control.ts`). It only ever
+  changes your own variant, at most one change a second. The pick is stored in the analytics DataStore
+  (`dexp/<UserId>`, read at join only for players the rule allows), so it follows you to every server; it wins over the
+  signed settings (stop, settle, weights, `players`), is stamped `forced` on the experiment row (the backend leaves
+  forced players out of the results), and the game sees it the next time it asks for your variant, usually your next
+  join. A pick the game's variants don't have is refused. While the rule doesn't allow you (a dev on a prod server,
+  a revoked role) a stored pick is ignored.
 - **Server TPS (framework 0.4.2, kernel 0.4.2):** Server > Status has a *TPS* line next to Memory and Lua heap: the
   last minute's average, its slowest second and the physics FPS (`59.9 avg, 52.0 min, physics 60`; the warning colour
   under 50 on average). Older kernels show `needs kernel 0.4.2`. The same numbers ride on fleet heartbeats (the
@@ -574,7 +585,9 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   The settings turn one off (`active: false`: everyone gets the first variant), sets `weights` or forces a
   `variant`, live. `players` (framework 0.5.3+) forces a variant for single players, keyed by UserId or pid, over
   everything else (QA, support); a client only ever gets its own entry. The CLI writes these with `typetorch
-  experiment weights | settle | stop | resume | clear | force | unforce`.
+  experiment weights | settle | stop | resume | clear | force | unforce` (the explorer's Experiments page prepares the
+  command for owners). A dev picks their own variant in the dev menu (Server > Experiments). The experiment row carries
+  `vi` (framework 0.7.1+), the variant's position in the game's list, so the backend can check the split.
 - **First-ever session:** for new players (a share of them, `recordShare`), the client records character and camera
   about 10 times a second, every input (never while a TextBox or the chat has focus; text boxes only say which box was
   used), buttons pressed and hovered, screens, prompts and deaths, from the join until `recordSeconds` (the settings,
