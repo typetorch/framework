@@ -352,6 +352,24 @@ TypeTorch.runDetached(() => store.StartSessionAsync(`Player_${userId}`)).then((p
   changes; generation-scoped). The default without a record or key, when `parse` throws (warned per value), and on older
   kernels (warned once: "needs kernel 0.3.8"; no ConfigService fallback). `TypeTorch.settings()` is the whole copy
   (`seq`, `at`, `game`, `analytics`, `fleet`, ...): server only, it holds tokens.
+- **Scheduled live events** (`liveEvents()`, server only): the explorer's Live events page schedules "double cash,
+  Saturday 12:00 to Sunday 23:59 UTC" as a change to `game` keys, and the owner signs the schedule with the CLI like any
+  other value (`typetorch settings set game.tt.events -`, the page gives the exact command). While an event runs
+  (`start <= now < end` on the server's own clock) its values replace the record's `game[key]` for `liveConfig`, so
+  `get()` and `onChanged` switch at the start and end times with no message: a server that starts mid-event has it at
+  once, and the event ends on time even when the backend is down. Cancelling = signing the schedule without it. The
+  game only reads its usual `liveConfig` keys; `parse` still checks an event's value (keep your bounds there):
+
+  ```ts
+  const multiplier = TypeTorch.liveConfig("cash.multiplier", { default: 1, parse: (raw) => (typeIs(raw, "number") && raw >= 1 && raw <= 3 ? raw : 1) });
+  const events = TypeTorch.liveEvents();
+  events.active(); // [{ id, name, startsAt, endsAt, set }]: "Double cash ends in 3h"
+  this.trove.add(events.onChanged((active) => this.showBanner(active)));
+  ```
+
+  The schedule is `game["tt.events"] = { v: 1, events: [{ id, name, start, end, set: { [key]: JSON } }] }` (unix
+  seconds); two events on one key at once: the later start wins. Nothing unsigned reaches servers: the backend only
+  prepares the JSON.
 - **`runDetached(fn)`** (kernel 0.3.8, server only): runs `fn` on a thread the kernel owns, so a deploy's hard stop
   (which kills this generation's threads mid-call) can't cut it off: for ProfileStore / ProfileService loads, saves and
   releases. Returns a Promise that settles while this generation runs; after a swap the result is dropped, so a job
@@ -660,7 +678,7 @@ bun run build   # rbxtsc --type package -> out/
   Attention issues.
   The others, each on the compiled `out/`: `test-hot-assets` (manifest parser, AssetSync decisions incl. the backup
   vouch, live-copy rules), `test-messaging` (messaging and the server list), `test-settings` (`liveConfig` and the
-  settings lines), `test-detached` (`runDetached`), `test-dev-access` (the dev-only tools rule and every gate through
+  settings lines), `test-live-events` (scheduled live events on a fake clock), `test-detached` (`runDetached`), `test-dev-access` (the dev-only tools rule and every gate through
   it), `test-remote-debug` (the remote debug ops and their limits), `test-net-inspect` (packet capture),
   `test-explorer-core` (Dex), `test-toolbox-sanitize` (the Creator Store sanitizer), `test-sha256` (SHA-256 / HMAC in util and the
   pairing-code fingerprint), `test-notifications` (the launch token with the contract's shared vector, intent checks,
