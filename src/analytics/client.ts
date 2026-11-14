@@ -28,6 +28,8 @@ import {
 	type HelloInfo,
 	type ServerHello,
 } from "./protocol";
+import { characterPosition, withPosition } from "./position";
+import { optionPositions, parsePositionNames } from "./settings";
 import { encodeProps, scrubNames } from "./props";
 import type { AnalyticsOptions, DeviceKind, EventKind, ExperimentOverride } from "./schema";
 
@@ -41,8 +43,12 @@ const CLIENT_KEY = "__typetorch/analytics-client.v1";
 /** Events held while the server hasn't answered hello (oldest dropped). */
 const HELD_MAX = 300;
 const SEND_EVERY = 2;
-/** The recording: seconds after the first input, and at most this long overall. */
+/**
+ * The recording: seconds after the first input (the hello's `rsec`, the settings' `recordSeconds`: default 60, 10..600),
+ * and at most this long overall.
+ */
 const RECORD_AFTER_INPUT = 60;
+const RECORD_AFTER_INPUT_MIN = 10;
 const RECORD_MAX = 600;
 const SAMPLE_EVERY = 0.1;
 /** An unchanged sample is still written this often. */
@@ -260,8 +266,8 @@ class ScreenTracker {
 /**
  * The first-ever-session recorder (plans/16 section 3): character and camera about 10 times a second, inputs (never
  * while a TextBox or the chat has focus; text boxes only say "used box <path>"), buttons pressed and hovered, screens,
- * prompts, deaths and the game's own events, packed into tt-rec-1 chunks. Runs from the join until 60 s after the
- * first input (at most 10 minutes).
+ * prompts, deaths and the game's own events, packed into tt-rec-1 chunks. Runs from the join until `window` seconds
+ * after the first input (the settings' `recordSeconds`, default 60; at most 10 minutes in all).
  */
 class Recorder {
 	private readonly trove: Trove;
@@ -279,6 +285,7 @@ class Recorder {
 		parent: Trove,
 		private readonly state: RecordingClientState,
 		private readonly send: (chunk: number, age: number, n: number, data: buffer, last: boolean, why: string) => void,
+		private readonly window = RECORD_AFTER_INPUT,
 	) {
 		this.trove = parent.extend();
 		if (!state.started) {
@@ -463,7 +470,7 @@ class Recorder {
 			accumulated = 0;
 			this.sample();
 			const now = os.clock();
-			if (this.state.firstInput !== undefined && now - this.state.firstInput >= RECORD_AFTER_INPUT) this.finish("window");
+			if (this.state.firstInput !== undefined && now - this.state.firstInput >= this.window) this.finish("window");
 			else if (now - this.state.startClock >= RECORD_MAX) this.finish("cap");
 			else if (now - this.chunkStart >= CHUNK_SECONDS || this.writer.size() >= CHUNK_TARGET_BYTES) this.rotate(false, "");
 		});
@@ -485,9 +492,18 @@ class Recorder {
 	}
 }
 
+/** The hello's recording window: seconds after the first input (default 60, 10..600). */
+export function recordWindow(value: unknown): number {
+	if (!typeIs(value, "number") || value !== value) return RECORD_AFTER_INPUT;
+	return math.clamp(value, RECORD_AFTER_INPUT_MIN, RECORD_MAX);
+}
+
 export class ClientAnalytics {
 	private readonly store: ClientStore;
 	private hello?: ServerHello;
+	/** `options.positions`, and the settings' list from the hello. */
+	private readonly positionNames: Set<string>;
+	private settingsPositions = new Set<string>();
 	private readonly held = new Array<Held>();
 	private heldBytes = 0;
 	private readonly experimentsSent = new Set<string>();
@@ -503,6 +519,7 @@ export class ClientAnalytics {
 		private readonly dispatcher: ClientDispatcher,
 		private readonly trove: Trove,
 	) {
+		this.positionNames = optionPositions(options.positions);
 		this.store = TypeTorch.persist<ClientStore>(CLIENT_KEY, () => ({
 			loadSent: false,
 			errorsSent: 0,
@@ -558,13 +575,18 @@ export class ClientAnalytics {
 			rec: raw.rec === true,
 			tech: typeIs(raw.tech, "number") ? math.clamp(raw.tech, 15, 3600) : 60,
 			exps,
+			rsec: recordWindow(raw.rsec),
 		};
+		this.settingsPositions = parsePositionNames(raw.pos) ?? new Set();
 		this.store.loadSent = true;
 		this.sendHeld();
 		const state = this.store.rec;
 		if (this.hello.rec && this.options.recording !== false && !this.recorder && !state.ended && !this.stopped) {
-			const recorder = new Recorder(this.trove, state, (chunk, age, n, data, last, why) =>
-				this.dispatcher.kernel.send(CHANNEL, "rec", chunk, age, n, data, last, why),
+			const recorder = new Recorder(
+				this.trove,
+				state,
+				(chunk, age, n, data, last, why) => this.dispatcher.kernel.send(CHANNEL, "rec", chunk, age, n, data, last, why),
+				this.hello.rsec,
 			);
 			this.recorder = recorder;
 			recorder.start(this.playerGui ?? Players.LocalPlayer.FindFirstChildOfClass("PlayerGui"));
@@ -632,12 +654,17 @@ export class ClientAnalytics {
 
 	// Game code --------------------------------------------------------------------------------------------------------
 
-	track(kind: EventKind, name: string, props?: object) {
+	/**
+	 * Game code's events. `position`: add that player's character position (`px`, `py`, `pz`); without it, events
+	 * named in the `positions` lists get the local player's.
+	 */
+	track(kind: EventKind, name: string, props?: object, position?: Player) {
 		if (!isEventName(name)) {
 			$warn(`[analytics] ${kind} event name must be 1-64 characters: ${tostring(name).sub(1, 80)}`);
 			return;
 		}
-		this.push(kind, name, encodeProps(props));
+		const from = position ?? (this.positionNames.has(name) || this.settingsPositions.has(name) ? Players.LocalPlayer : undefined);
+		this.push(kind, name, encodeProps(from !== undefined ? withPosition(props, characterPosition(from)) : props));
 		if (kind === "custom") this.recorder?.event(EventKindCode.Custom, name);
 	}
 

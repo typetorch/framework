@@ -101,6 +101,7 @@ export { hotAsset } from "./assets/hot-asset";
 // Analytics (plans/16): optional, nothing runs until `new AnalyticsEngine()`.
 export { AnalyticsEngine } from "./analytics/engine";
 export type {
+	AnalyticsEventOptions,
 	AnalyticsOptions,
 	AnalyticsProps,
 	AnalyticsPurchase,

@@ -77,14 +77,23 @@ First-ever-session detail, one row per packed chunk.
 | state | `activity` | `to`, `from` (server or client src) |
 | state | `screen` | `to`, `from` (`""` = none). Client: ScreenGuis in PlayerGui (Enabled), GuiObjects tagged `TTScreen` (Visible), `screen()` |
 | experiment | `<experiment>` | `variant`, `variants` (count), `forced?`. Once per session when assigned or changed. At most 32 experiments per session: a 33rd `experiment()` returns the control (the first variant) and warns. A client's experiment calls count against its event budget (below) |
-| recording_meta | `start` | `share` (the recorded share then) |
-| recording_meta | `end` | `chunks`, `bytes`, `why`: `window` (60 s after the first input), `cap` (10 min, or the server's 256 KB / 80 chunks), `left`, `end` |
+| recording_meta | `start` | `share` (the recorded share then), `secs?` (the window then: `recordSeconds`; frameworks before it leave it out and used 60) |
+| recording_meta | `end` | `chunks`, `bytes`, `why`: `window` (`recordSeconds`, default 60 s, after the first input), `cap` (10 min, or the recording's 256 KB / 80 chunks), `left`, `end` |
 | fleet | `heartbeat` | The kernel's `fleetStatus()` (kernel 0.3.2+), every 60 ± 10 s and once at each generation start. pid `""` |
 | fleet | `deploy_report` | One kernel deploy report `{s, b, a, j, r, e?, d?, t, g, k, p}` (r: `swapped`, `failed`, `rolled_back`, `skipped`, `booted`), once per (s, j, r) per server, across generations. pid `""` |
-| custom | `<name>` | `track(name, props)`: the game's props |
+| custom | `<name>` | `track(name, props)`: the game's props, plus the position props below when asked for |
 | funnel | `<funnel>` | `step(funnel, index, name?)`: `i`, `step?` |
 | purchase | `<kind>` | Server only. `purchase(player?, {product, robux, where?, kind?})`: name = `kind` (default `product`); `product`, `robux`, `where?` |
 | currency | `<currency>` | Server only. `currency(player?, name, delta, reason)`: `delta`, `reason` |
+
+**Positions** (`custom`, `funnel`, `purchase`, `currency`): `px`, `py`, `pz` (numbers, studs, rounded to 0.1) are the
+position of a player's character root part (the model's PrimaryPart, else `HumanoidRootPart`) when the event was
+tracked. Added on request (`track(..., { position: true | player })`) or for every event whose name is in the engine
+option `positions` or the settings' `positions`: server events read the event player's character, client events
+(src `client`) the local player's. Left out when there is no character, root part or finite position, and never
+written over `px` / `py` / `pz` the game set itself (any of the three: the game's props are kept as they are). The
+backend's map layers read exactly these keys. A client event tracked before the server's hello doesn't know the
+settings' list yet (the code's `positions` works from the start).
 
 Client-sent kinds are limited to `custom`, `funnel`, `state`, `tech`, within a budget of 120 a minute and 5,000 a
 session per player. `purchase` and `currency` are server-only (revenue and the economy are server-authoritative): on
@@ -128,8 +137,15 @@ start, i.e. the row's `t`). Time is the running sum of `dt`.
   once per second per button), 3 screen opened (name), 4 screen closed (name), 5 prompt shown, 6 prompt hidden,
   7 prompt triggered (ProximityPrompt path under Workspace, a character as `<player>`), 8 died (no text), 9 spawned
   (no text), 10 text box used (path, or `<other>`; never its text), 11 the game's own `track()` event (name).
-- **Window:** from the engine's start on the client until 60 s after the first key, click, tap, gamepad button or
-  stick; at most 10 minutes. Chunks are cut about every 10 s or 6 KB (and at a hot swap). Typical: 10-20 KB per player.
+- **Window:** from the engine's start on the client until `recordSeconds` (settings, default 60, 10..600) after the
+  first key, click, tap, gamepad button or stick; at most 10 minutes from the start. Chunks are cut about every 10 s
+  or 6 KB (and at a hot swap). A recording also ends at 256 KB or 80 chunks (`why` `cap`).
+- **Storage per recorded minute** (measured from the encoder, `scripts/test-analytics.luau`): an active player (moving
+  every sample, 4 key records a second, a click every 2 s, a button every 5 s) 13.2 KB of chunk bytes (~220 B/s; a
+  Sample record is 18 bytes, 10 a second while moving), stored as 17.6 KB of base64 in 6 rows; moving with no input
+  10.9 KB (14.6 KB base64); idle (one keepalive sample per 5 s) 0.3 KB. So `recordSeconds` 60 costs 10-20 KB per
+  recorded player (the time before the first input adds to it), 300 about 55-70 KB, and 600 about 110-135 KB of
+  chunk bytes, inside the 256 KB cap (the cap counts chunk bytes, not base64).
 
 ## Sink settings
 
@@ -146,6 +162,8 @@ repo's `bun run local` does it). Every new signed copy applies at once, so dials
   "token": "<write-only token>",
   "flushSeconds": 15,
   "recordShare": 1,
+  "recordSeconds": 60,
+  "positions": ["down", "death_final", "round_result"],
   "techEvery": 60,
   "experiments": { "onboarding": { "active": true, "weights": [1, 1], "variant": "short", "players": { "123456": "long" } } }
 }
@@ -159,6 +177,8 @@ repo's `bun run local` does it). Every new signed copy applies at once, so dials
 | `token` | none | Sent as `Authorization: Bearer <token>`. Never logged |
 | `flushSeconds` | 15 | 5..300 |
 | `recordShare` | 1 | 0..1, share of new players recorded (stable per pid) |
+| `recordSeconds` | 60 | 10..600: seconds a recording runs after the first input (at most 10 minutes from its start; the 256 KB / 80 chunk caps stay). Storage: tt-rec-1 above |
+| `positions` | none | Event names (1-64 characters, at most 64) whose game-code events always carry `px`, `py`, `pz` (Positions above), added to the engine option `positions`; sent to clients in the hello. Not a list: an error line, none used |
 | `techEvery` | 60 | 15..3600 seconds between tech samples |
 | `experiments` | none | Per experiment: `active: false` (everyone gets the first variant, not stamped), `weights` (per variant, in the game's order), `variant` (force one), `players` (`{ [UserId or pid]: variant }`, at most 200: forces one player's variant over everything else, stamped `forced`; each client's hello gets only its own entry). The CLI writes them: `typetorch experiment` |
 | `identity` | the settings' `fleet` url + `/v1/identity` | basin: where identity rows go (below); none and no `fleet` in the settings: not sent. duckdb: unused |

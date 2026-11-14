@@ -333,6 +333,53 @@ end
 local sessionBytes = buffer.len(session:finish(true))
 check("90 s session under 20 KB", sessionBytes < 20000, sessionBytes)
 
+-- Storage per recorded minute (the `recordSeconds` cost, SCHEMA.md): 60 s cut into chunks as the client cuts them
+-- (every 10 s or 6 KB, each with its own header, anchor and strings). Raw = the chunk bytes the per-recording caps count
+-- (256 KB, 80 chunks); stored = the base64 text in the `data` column.
+local function recordedMinute(moving, keysPerSecond, pointerEvery, eventEvery)
+	local raw, encoded, chunkCount, samples = 0, 0, 0, 0
+	local chunkWriter, chunkStartMs = C.RecWriter.new(100), 0
+	local function cut(last)
+		local data = chunkWriter:finish(last)
+		raw += buffer.len(data)
+		encoded += #C.toBase64(data)
+		chunkCount += 1
+		chunkWriter, samples = C.RecWriter.new(100), samples + chunkWriter.samples
+	end
+	local lastSampleAt = -math.huge
+	for tick = 0, 599 do
+		local at = tick * 100
+		if at - chunkStartMs >= 10000 or chunkWriter:size() >= 6000 then
+			cut(false)
+			chunkStartMs = at
+		end
+		local rel = at - chunkStartMs
+		if moving or at - lastSampleAt >= 5000 then
+			lastSampleAt = at
+			local x = if moving then tick * 1.6 else 0
+			chunkWriter:sample(rel, x, 3, math.sin(tick / 20) * 30, tick / 50, x + 10, 8, 10, tick / 50, -0.2)
+		end
+		if keysPerSecond > 0 and tick % math.max(1, math.floor(10 / keysPerSecond)) == 0 then
+			chunkWriter:key(rel + 5, if tick % 2 == 0 then 1 else 2, 119, false)
+		end
+		if pointerEvery > 0 and tick % (pointerEvery * 10) == 0 then
+			chunkWriter:pointer(rel + 7, 3, 0, 0.5, 0.5, false)
+		end
+		if eventEvery > 0 and tick % (eventEvery * 10) == 0 then
+			chunkWriter:event(rel + 8, 1, "HUD/Round/Play")
+		end
+	end
+	cut(true)
+	return raw, encoded, chunkCount
+end
+local activeRaw, activeB64, activeChunks = recordedMinute(true, 4, 2, 5)
+local movingRaw, movingB64 = recordedMinute(true, 0, 0, 0)
+local idleRaw, idleB64 = recordedMinute(false, 0, 0, 0)
+print(`recording cost per minute: active {activeRaw} B raw / {activeB64} B base64 ({activeChunks} chunks); moving only {movingRaw} / {movingB64}; idle {idleRaw} / {idleB64}`)
+check("a recorded minute of an active player is 10-16 KB raw", activeRaw > 10000 and activeRaw < 16000, activeRaw)
+check("10 minutes of an active player fit the 256 KB / 80 chunk caps", activeRaw * 10 < 262144 and activeChunks * 10 <= 80, activeRaw * 10)
+check("an idle minute is under 1 KB", idleRaw < 1000, idleRaw)
+
 check("base64 Man", C.toBase64(buffer.fromstring("Man")) == "TWFu")
 check("base64 Ma", C.toBase64(buffer.fromstring("Ma")) == "TWE=")
 check("base64 M", C.toBase64(buffer.fromstring("M")) == "TQ==")
@@ -513,6 +560,85 @@ local basin = S.sinkSettings({ url = "https://b.example.com", key = "k-012345678
 check("a Basin sink stays on analytics (backend can't describe streams)", basin == '{"backend":"basin","events":"https://s.ingest.cloudflare.com"}')
 local target = S.identityTarget({ backend = "basin", events = "https://s.ingest.cloudflare.com" }, { url = "https://b.example.com/", key = "k-0123456789" }, decode)
 check("Basin identities go to the backend with its key", target ~= nil and target.url == "https://b.example.com/v1/identity" and target.token == "k-0123456789")
+
+-- recordSeconds: the recording window after the first input (default 60, 10..600, the 10 minute cap) ------------------
+local window = function(value)
+	return S.parseSettings({ backend = "duckdb", events = "https://a.example.com/ingest", recordSeconds = value }, decode)
+end
+check("recordSeconds default 60", window(nil).settings.recordSeconds == 60 and #window(nil).errors == 0)
+check("recordSeconds longer", window(180).settings.recordSeconds == 180 and #window(180).errors == 0)
+check("recordSeconds clamped to 600", window(3600).settings.recordSeconds == 600)
+check("recordSeconds clamped to 10", window(1).settings.recordSeconds == 10 and window(-5).settings.recordSeconds == 10)
+check("recordSeconds not a number: 60 and an error", window("long").settings.recordSeconds == 60 and #window("long").errors == 1)
+local windowFromBackend = S.parseSettings(S.sinkSettings({ url = "https://b.example.com", key = "k", analytics = { recordSeconds = 240, positions = { "down" } } }, nil, decode), decode)
+check("recordSeconds and positions from backend.analytics", windowFromBackend.settings.recordSeconds == 240 and windowFromBackend.settings.positions.down == true, windowFromBackend.settings.recordSeconds)
+
+-- Positions (px, py, pz on game events) ---------------------------------------------------------------------------------
+local Pos = load("analytics/position.luau")
+local roblox = require("@lune/roblox")
+local function rootAt(position)
+	local root = { Position = position }
+	function root:IsA(class)
+		return class == "BasePart"
+	end
+	return root
+end
+local function playerWith(character)
+	return { Character = character }
+end
+local function characterWith(root, primary)
+	local model = { PrimaryPart = if primary then root else nil }
+	function model:FindFirstChild(name)
+		return if name == "HumanoidRootPart" then root else nil
+	end
+	return model
+end
+local here = roblox.Vector3.new(10.04, 3.06, -5.56)
+local walker = playerWith(characterWith(rootAt(here), false))
+local at = Pos.characterPosition(walker)
+check("position: HumanoidRootPart", at ~= nil and at.X == here.X)
+check("position: PrimaryPart first", Pos.characterPosition(playerWith(characterWith(rootAt(roblox.Vector3.new(1, 2, 3)), true))).Y == 2)
+check("position: no player", Pos.characterPosition(nil) == nil)
+check("position: no character", Pos.characterPosition(playerWith(nil)) == nil)
+check("position: no root part", Pos.characterPosition(playerWith(characterWith(nil, false))) == nil)
+check("position: not a part", Pos.characterPosition(playerWith(characterWith({ IsA = function() return false end }, false))) == nil)
+check("position: NaN", Pos.characterPosition(playerWith(characterWith(rootAt(roblox.Vector3.new(0 / 0, 1, 1)), false))) == nil)
+local throwing = setmetatable({}, { __index = function()
+	error("Character is not a valid member")
+end })
+check("position: never throws", Pos.characterPosition(throwing) == nil)
+local own = { by = "fall" }
+local placed = Pos.withPosition(own, at)
+check("withPosition: rounded to 0.1", placed.px == 10 and placed.py == 3.1 and placed.pz == -5.6, `{placed.px},{placed.py},{placed.pz}`)
+check("withPosition: keeps props, copies", placed.by == "fall" and own.px == nil)
+check("withPosition: encodes short", serde.encode("json", { px = placed.px, py = placed.py, pz = placed.pz }) == '{"px":10,"py":3.1,"pz":-5.6}', serde.encode("json", placed))
+check("withPosition: no props", Pos.withPosition(nil, at).pz == -5.6)
+check("withPosition: no position", Pos.withPosition(own, nil) == own)
+local gameSet = { px = 1 }
+local kept = Pos.withPosition(gameSet, at)
+check("withPosition: never overrides the game's px/py/pz", kept == gameSet and kept.px == 1 and kept.py == nil)
+check("withPosition: the game's pz alone is kept too", Pos.withPosition({ pz = 0 }, at).px == nil)
+check("roundTenth", Pos.roundTenth(-0.04) == 0 and Pos.roundTenth(-0.06) == -0.1 and Pos.roundTenth(123.449) == 123.4)
+local names = S.parsePositionNames({ "down", "death_final" })
+check("position names", names ~= nil and names.down == true and names.death_final == true)
+check("position names: empty list", S.parsePositionNames({}) ~= nil)
+check("position names: not a list", S.parsePositionNames("down") == nil and S.parsePositionNames({ a = "down" }) == nil and S.parsePositionNames({ "" }) == nil)
+local tooMany = {}
+for index = 1, 65 do
+	tooMany[index] = `e{index}`
+end
+check("position names: at most 64", S.parsePositionNames(tooMany) == nil)
+local function isEmpty(set)
+	for _ in set do
+		return false
+	end
+	return true
+end
+local withNames = S.parseSettings({ backend = "duckdb", events = "https://a.example.com/ingest", positions = { "round_result" } }, decode)
+check("settings positions", withNames.settings.positions.round_result == true and #withNames.errors == 0)
+local badNames = S.parseSettings({ backend = "duckdb", events = "https://a.example.com/ingest", positions = "round_result" }, decode)
+check("settings positions: bad list is an error, none used", isEmpty(badNames.settings.positions) and #badNames.errors == 1)
+check("settings positions: none by default", isEmpty(window(nil).settings.positions))
 
 print(`analytics: {passed} passed, {failed} failed`)
 if failed > 0 then
