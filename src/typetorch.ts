@@ -23,6 +23,7 @@ import type {
 } from "./kernel";
 import { branchChannelOf, normalRole, rulesOf } from "./kernel";
 import type { BuildInfo } from "./module";
+import type { Feedback, FeedbackConfig, FeedbackResult, FeedbackScale } from "./feedback/api";
 import type { Notifications, NotifyOpen, OptInResult } from "./notifications/api";
 import type { Modding } from "./reflection/modding";
 import { resolveModule, tryResolveModule } from "./runtime/dependency";
@@ -270,6 +271,16 @@ export interface TypeTorchApi {
 	 * `promptOptIn(where)`. Outside a running generation every call is a no-op. See src/notifications/api.ts.
 	 */
 	notifications(): Notifications;
+
+	// Feedback (plans/32, server only) ---------------------------------------------------------------------------------
+	/**
+	 * Player feedback as a built-in: `submit(player, { rating?, text?, topic?, ctx? })` checks the rating against the
+	 * configured scale, sanitises and caps the text, applies the per-player rate limits and writes one `feedback` /
+	 * `submit` analytics row; `{ ok: true }` or `{ ok: false, reason }`. The scale comes from the settings record's
+	 * `game.feedback` (else `configure`, else 5 stars). Throws on a client; in edit mode every submit is `disabled`.
+	 * See src/feedback/api.ts.
+	 */
+	feedback(): Feedback;
 }
 
 // State of this generation's binding ------------------------------------------------------------------------------------
@@ -566,7 +577,37 @@ class TypeTorchRuntime implements TypeTorchApi {
 		}
 		return INERT_NOTIFICATIONS;
 	}
+
+	feedback(): Feedback {
+		if (client) error("TypeTorch.feedback() is server-only: send the player's answer to the server and submit there", 2);
+		const factory = feedbackFactory;
+		if (factory) {
+			const [ok, core] = pcall(factory);
+			if (ok) return core;
+			$warn(`TypeTorch.feedback() is off in this generation: ${core}`);
+		}
+		return INERT_FEEDBACK;
+	}
 }
+
+// Feedback: feedback/index.ts registers the factory (server only; the same import cycle as notifications).
+let feedbackFactory: (() => Feedback) | undefined;
+
+/** Framework-internal (feedback/index.ts): this generation's `feedback()` (undefined: none). */
+export function setFeedbackFactory(factory: (() => Feedback) | undefined) {
+	feedbackFactory = factory;
+}
+
+/** Edit mode (UI Labs stories) and stopped generations: every submit is refused. */
+const INERT_FEEDBACK: Feedback = {
+	submit(): FeedbackResult {
+		return { ok: false, reason: "disabled" };
+	},
+	configure(_config: FeedbackConfig) {},
+	scale(): FeedbackScale | undefined {
+		return undefined;
+	},
+};
 
 // Notifications: notifications/index.ts registers the factory (this module can't import it: the notifications import
 // TypeTorch).
