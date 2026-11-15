@@ -440,6 +440,8 @@ export class ExtRecorder {
 	private keyframe(now: number) {
 		const writer = this.writer;
 		this.keyframeAt = now;
+		// A Keyframe starts its chunk (header flag bit 1), so a reader can start at that chunk.
+		this.rotate(false, "");
 		writer.keyframe(this.at());
 		const camera = Workspace.CurrentCamera;
 		if (camera) {
@@ -1108,7 +1110,8 @@ export class ExtRecorder {
 				}
 				this.uiCursor += 1;
 			}
-			if (os.clock() >= deadline) return;
+			// The rest next frame (the chunk is cut at the frame's end when it is full).
+			if (os.clock() >= deadline || writer.size() >= EXT_CHUNK_TARGET_BYTES) return;
 		}
 		this.uiPassActive = false;
 		this.uiVisible = this.uiVisibleCounting;
