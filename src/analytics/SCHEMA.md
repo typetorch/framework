@@ -149,10 +149,23 @@ start, i.e. the row's `t`). Time is the running sum of `dt`.
 
 ## Sink settings
 
-The signed settings record's `analytics` field (kernel 0.3.8, plans/20; server-only; before 0.3.8 the ConfigService key
-`TypeTorchAnalytics`), a JSON object, written with `typetorch settings set analytics -` (JSON on stdin; the analytics
-repo's `bun run local` does it). Every new signed copy applies at once, so dials change live (the CLI pings servers).
+Server-only, from the signed settings record (kernel 0.3.8, plans/20; before 0.3.8 the ConfigService key
+`TypeTorchAnalytics`). Every new signed copy applies at once, so dials change live (the CLI pings servers).
 `new AnalyticsEngine({ settings })` replaces it (tests, Studio, kernels before 0.3.8).
+
+- **`backend`** (kernel 0.4.0 / framework 0.4.0, plans/21) = `{ url, key, analytics? }` is the sink: `duckdb` at
+  `<url>/v1/ingest` with `key` as the token, and the dials below from `backend.analytics`. It is written by
+  `typetorch backend setup` (CLI 0.9+; `--flush-seconds`, `--record-share`), which `@typetorch/backend`'s
+  `writeBackendSettings()` and `bun run local` run. `typetorch experiment` writes `backend.analytics.experiments`.
+- **`analytics`** (the object below) is read while `backend` is missing, and whenever it names a `basin` sink
+  (`backend` can't describe Basin streams). `backend setup` also derives a `duckdb` copy of it for frameworks before
+  0.4. CLI 0.9 removed `typetorch settings set analytics` (it now points to `backend setup`), so a Basin sink has no CLI
+  writer.
+- **No CLI writer yet** for `recordSeconds`, `positions`, `techEvery`, `joinData` and `joinLaunchPrefix`: they keep
+  their defaults unless the record already holds them (`backend setup` keeps the existing `backend.analytics` fields),
+  or the game passes `new AnalyticsEngine({ settings })`. `positions` can also be set in code with the engine option of
+  the same name. `identity` and `identityToken` (Basin only) live in the old `analytics` value, which has no CLI writer
+  either.
 
 ```json
 {

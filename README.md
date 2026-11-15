@@ -47,7 +47,8 @@ it and run `bun install`.
 		"typeRoots": ["node_modules/@rbxts", "node_modules/@typetorch"],
 		"types": ["types", "compiler-types"],
 		"plugins": [
-			// Optional, first when present: $print/$warn with file and line (what every TypeTorch repo uses).
+			// Optional, first when present: $print/$warn with file and line. @typetorch/transformer 0.3.2+ has the same
+			// macros built in (`@typetorch/transformer/macros`; it also expands calls typed by rbxts-transform-debug).
 			{ "transform": "rbxts-transform-debug", "environmentRequires": {} },
 			{ "transform": "@typetorch/transformer" }
 		]
@@ -179,25 +180,30 @@ return the generation's stop function, which the kernel calls on a swap.
   work the same way; see the transformer's README.
 - **UI:** `observeElement(trove, tag, (instance, elementTrove) => ...)`, `isRealFrame`, `popIn` / `popOut` / `bump`
   (UIScale, never Size tweens) and `PopupQueue` (one modal at a time).
-- **Dev menu:** devs (Studio, project members, dev badge) get a DEV button, `Ctrl+Shift+D` and `/tt dev`: artifact
+- **Dev menu:** devs (Studio, project members, dev badge) get a DEV button (in Roblox's top-bar row since 0.6.2,
+  `GuiService.TopbarInset`, so it never covers a game's top-left HUD), `Ctrl+Shift+D` and `/tt dev`: artifact
   (with how long the server and client generations have run, the server's uptime and the build's age), server status,
   logs (server, own client, other players' clients), client and server dex, network stats, module state, a branch and
   build picker (Server > Branch) and a Claude prompt. The sidebar, top to bottom: Artifact, Server, Network, Modules,
   Manage, Logs, Dex, Claude. The window can be dragged by its header and resized from its corner (double-tap the
   header to reset).
-- **Command palette (`Ctrl+K`, `Cmd+K` on a Mac, or the search button in the menu header):** opens the dev menu if it
-  is closed and searches every command the dev may run now (fuzzy: `swb` finds *Switch branch*). Up / Down pick,
+- **Command palette (framework 0.5.7; `Ctrl+K`, `Cmd+K` on a Mac, or the search button in the menu header):** opens
+  the dev menu if it is closed and searches every command the dev may run now (fuzzy, every word against the title,
+  keywords or group: `swdev` finds *Switch to dev branch*). Up / Down pick,
   Enter runs, Shift+Enter opens a page in a split, Escape closes; recent commands come first on an empty query. Never
   fires while typing in chat or a text box. Commands: open any page; split right / down, open the pane in a new window,
-  close it, dock all windows; Reload, Roll back, switch branch, load a build here, join a server on a branch or build
-  (the Branch tab's rules and words, `devtools/build-actions.ts`), New server and Join a listed server (owners); find a
-  player by name, display name or UserId and open them in Manage > Players or their Kick / Ban card (owners); copy the
-  job id, artifact id, commit, branch or place version (the copy popup); "Experiment <name>: use <variant>" / "clear my
-  variant" (Server > Experiments, below); "Ask Claude: ..." puts the query in the Claude draft. Anything that swaps what runs on the server takes a second Enter or tap to confirm. The kernel and the server
-  re-check every request. Core: `devtools/commands.ts` (pure, Lune-tested by `scripts/test-commands.luau`).
+  close it, dock all windows; Switch to dev branch, Reload, Roll back, Migrate all players to a new server, switch
+  branch, load a build here, join a server on a branch or build (the Branch tab's rules and words,
+  `devtools/build-actions.ts`, `devtools/palette-rules.ts`), New server and Join a listed server (owners); find a
+  player by name, display name or UserId and open them in Manage > Players or their Kick / Ban card, or Teleport to /
+  Bring / Respawn them (owners, Manage > Players' permissions); copy the
+  job id, artifact id, commit, branch or place version (the copy popup); `Experiment <name>: use <variant>` / "clear my
+  variant" (Server > Experiments, below); "Ask Claude: ..." puts the query in the Claude draft. Anything that swaps
+  what runs on the server arms on the first Enter or tap and runs on a second one within 4 s. The kernel and the
+  server re-check every request. Core: `devtools/commands.ts` (pure, Lune-tested by `scripts/test-commands.luau`).
 - **Server > Experiments (framework 0.7.1): your own variant.** Every analytics experiment the game asked about for
   you, the variant you're in and why (random, forced by the settings, or your pick), a button per variant to pick it
-  for yourself, and Clear; the palette has the same as "Experiment <name>: use <variant>". Devs where the dev-only
+  for yourself, and Clear; the palette has the same as `Experiment <name>: use <variant>`. Devs where the dev-only
   tools are open to them (dev rules, or owners on a server an owner switched), owners everywhere: the same rule as
   Modules > State, re-checked by the server and by the analytics engine (`analytics/dev-control.ts`). It only ever
   changes your own variant, at most one change a second. The pick is stored in the analytics DataStore
@@ -210,12 +216,12 @@ return the generation's stop function, which the kernel calls on a swap.
   last minute's average, its slowest second and the physics FPS (`59.9 avg, 52.0 min, physics 60`; the warning colour
   under 50 on average). Older kernels show `needs kernel 0.4.2`. The same numbers ride on fleet heartbeats (the
   explorer's fleet table).
-- **Devtools reach devs only (kernel 0.5.6+):** the kernel leaves `devtools` off the shared client tree of a framework
-  with `devtools/on-demand.ts`. `runtime/devtools-loader.ts` then clones the folder, minus the server-only modules, into
+- **Devtools reach devs only (framework and kernel 0.5.6+):** the kernel leaves `devtools` off the shared client tree
+  of a framework with `devtools/on-demand.ts`. `runtime/devtools-loader.ts` then clones the folder, minus the server-only modules, into
   each dev's PlayerGui (join, each generation, dev status changes), and that client copies it into its own tree and
   starts it. On older kernels the folder stays in the tree as before. A failure costs a dev the menu, with a warning, and
   never the generation.
-- **Dev-only tools (framework 0.4.1, `devtools/access.ts`):** Claude, Logs > Upload, Dex edits on the server, Network
+- **Dev-only tools (framework 0.5.0, `devtools/access.ts`):** Claude, Logs > Upload, Dex edits on the server, Network
   packet blocking and the hot-swap sound work under dev rules (private, reserved and Studio servers on a dev branch)
   for every dev, and on a public server an owner switched to a dev branch (Server > Branch) for owners only. Everywhere
   else the menu is read-only, with a short reason: "Dev branch only", "Owners only on public servers", "Owner-switched
@@ -600,11 +606,11 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   economy are server-authoritative): on the client they warn once and send nothing, and the server refuses them from
   clients.
 - **Options** (all on by default): `sessions` (joins, leaves, device, join source, account age bucket, Premium,
-  country, the player policy, device trust, friends in the server, first-ever vs returning, days since the last visit), `tech` (FPS, ping, memory, load
-  time, client and server errors, swaps and rollbacks, leaves within 60 s of a swap), `zones` (parts or models tagged
-  `TTZone`, named by a `Name` attribute or the instance name), `screens` (ScreenGuis in PlayerGui, GuiObjects tagged
-  `TTScreen`), `recording` (the first-ever session in detail), `fleet` (kernel 0.3.2 heartbeats and deploy reports),
-  `identity` (one `{ pid, uid }` row per session to the dev's own server, below). `settings` (server only) replaces the
+  country, language (`locale`), the player policy, device trust, friends in the server, first-ever vs returning, days
+  since the last visit), `tech` (FPS, ping, memory, load time, client and server errors, swaps and rollbacks, leaves
+  within 60 s of a swap), `zones` (parts or models tagged `TTZone`, named by a `Name` attribute or the instance name),
+  `screens` (ScreenGuis in PlayerGui, GuiObjects tagged `TTScreen`), `recording` (the first-ever session in detail),
+  `fleet` (kernel 0.3.2 heartbeats and deploy reports), `identity` (one `{ pid, uid }` row per session to the dev's own server, below). `settings` (server only) replaces the
   signed settings' `analytics`, for tests, Studio and kernels before 0.3.8.
 - **Positions on events** (for map layers): `px`, `py`, `pz` props (studs, rounded to 0.1) from a character's root
   part. Per call: `track(player, name, props, { position: true })` (the event's player; on the client the local
@@ -667,17 +673,22 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   when the player is alone) intersected with the players there, not a web call per player.
 
 **Settings, framework 0.4.0 / kernel 0.4.0 (plans/21):** the record's `backend` = `{ url, key, analytics?: { flushSeconds,
-recordShare, recordSeconds, positions, joinLaunchPrefix, joinData } }` (`typetorch backend setup`) is the whole sink: DuckDB at `<url>/v1/ingest` with the one key (Basin
-identities to `<url>/v1/identity`). The old `analytics` value below is read while `backend` is missing, and stays the
-way to a Basin sink. The engine also tells the kernel each player's pid (`setAnalyticsId`: the kernel's error reports
-count affected players by pid, never by name) and counts its own DataStore and HTTP requests for the budget view (dev
-menu **Server > Budget**: bars per Roblox limit for the player count, who spends it, the DataStore budget left, memory).
+recordShare, recordSeconds, positions, techEvery, experiments, joinLaunchPrefix, joinData } }` is the whole sink: DuckDB
+at `<url>/v1/ingest` with the one key (Basin identities to `<url>/v1/identity`). `typetorch backend setup` writes it
+(`--flush-seconds`, `--record-share`; `writeBackendSettings()` in `@typetorch/backend` runs it, and `bun run local`
+too), and `typetorch experiment` writes `experiments`. The other dials (`recordSeconds`, `positions`, `techEvery`,
+`joinLaunchPrefix`, `joinData`) have no CLI writer yet: `backend setup` keeps them when the record has them, and
+`positions` can be set in code with the engine option. The old `analytics` value below is read while `backend` is
+missing, and stays the way to a Basin sink. The engine also tells the kernel each player's pid (`setAnalyticsId`: the
+kernel's error reports count affected players by pid, never by name) and counts its own DataStore and HTTP requests
+for the budget view (dev menu **Server > Budget**: bars per Roblox limit for the player count, who spends it, the
+DataStore budget left, memory).
 
 **Settings** (server only, never sent to clients): the signed settings record's `analytics` field (kernel 0.3.8,
-plans/20), derived from `backend` by `typetorch backend setup` (`writeBackendSettings()` in `@typetorch/backend` runs it, and
-`bun run local` too). Every new copy applies live within seconds (the CLI pings servers). A Basin sink has no CLI writer
-since CLI 0.9: `backend setup` replaces it. Before kernel 0.3.8
-there are no settings unless the game passes `new AnalyticsEngine({ settings })`:
+plans/20), which `typetorch backend setup` also writes, derived from `backend`, for frameworks before 0.4. Every new
+copy applies live within seconds (the CLI pings servers). A Basin sink has no CLI writer since CLI 0.9 (`typetorch
+settings set analytics` points to `backend setup`). Before kernel 0.3.8 there are no settings unless the game passes
+`new AnalyticsEngine({ settings })`:
 
 ```json
 { "backend": "basin", "events": "https://<stream-id>.ingest.cloudflare.com",
@@ -746,10 +757,13 @@ bun run build   # rbxtsc --type package -> out/
   `test-explorer-core` (Dex), `test-toolbox-sanitize` (the Creator Store sanitizer), `test-sha256` (SHA-256 / HMAC in util and the
   pairing-code fingerprint), `test-notifications` (the launch token with the contract's shared vector, intent checks,
   the queue: batches of 200, rev order, a swap's handover), `test-notify-server` (the notifications server against
-  mocked services), `test-analytics-join` (the join row's metadata; no other player's UserId) and `test-feedback`
+  mocked services), `test-analytics-join` (the join row's metadata; no other player's UserId), `test-feedback`
   (`feedback()`: the scale config, rating normalisation, text sanitising and caps with multi-byte text, rate limits, the
-  row's shape; run from framework/: `lune run scripts/test-feedback.luau out/`). `node scripts/check-self-calls.mjs out` flags compiled functions that call themselves on their first
-  lines (after `bun run build`).
+  row's shape; run from framework/: `lune run scripts/test-feedback.luau out/`), `test-commands` (the command
+  palette's core and its branch / build rules) and `test-devtools-loader` (who gets the devtools copy and when a client
+  starts it). `node scripts/check-self-calls.mjs out` flags compiled functions that call themselves on their first
+  lines, and `node scripts/check-devtools-split.mjs out` checks that a non-dev client's tree never reaches `devtools`
+  and that a dev's copy holds everything its client imports (both after `bun run build`).
 - **Package contents:** only `out/` (no `.tsbuildinfo`), `README.md` and `LICENSE`; check with `bun pm pack --dry-run`.
 - **Explorer class icons:** `assets/class-icons.png` (kept locally, not in the repo: it is Roblox's own texture) is
   the client's `content/textures/ClassImages.PNG` (a 2352x16 strip) repacked into a 32-column grid, because live
@@ -763,7 +777,7 @@ Publishing is tag-only, from CI (`.github/workflows/publish.yml`), with npm trus
 
 ```sh
 # first commit src/version.ts set to the new version (npm version needs a clean tree)
-npm version 0.5.6 -m "release %s"
+npm version <x.y.z> -m "release %s"
 git push origin main --follow-tags
 ```
 
