@@ -36,6 +36,7 @@ import {
 	CHANNEL,
 	CHUNK_MAX_BYTES,
 	CLIENT_BATCH_MAX,
+	EXT_CHUNK_MAX_BYTES,
 	cleanClientEvent,
 	cleanHello,
 	isEventName,
@@ -48,6 +49,7 @@ import { registerBuiltinRows, registerBuiltinSessions } from "./rows";
 import { readKeys, verifyToken } from "../notifications/token";
 import { classifyStatus, configWaitSeconds, retryAfterSeconds, retryWaitSeconds, newQueueState, RowQueue, takeToken, type BucketState, type QueueState } from "./queue";
 import {
+	EXT_RECORDING_CODEC,
 	PROPS_MAX_BYTES,
 	RECORDING_CODEC,
 	SCHEMA_VERSION,
@@ -70,6 +72,9 @@ import {
 	parseSettings,
 	recordsSupported,
 	sinkSettings,
+	extendedEligible,
+	EXT_EXPERIMENT,
+	EXT_VARIANTS,
 	DEFAULT_RECORD_SECONDS,
 	DEFAULT_TECH_EVERY,
 	type ParsedSettings,
@@ -85,7 +90,10 @@ import { buildRequests, estimateEventBytes, estimateRecordingBytes, type SinkReq
 
 const PERSIST_KEY = "__typetorch/analytics.v1";
 const CLOSE_KEY = "__typetorch/analytics-close";
-/** The DataStore with the UserId -> pid link: key `p/<UserId>` -> { pid, first, last } (unix seconds). */
+/**
+ * The DataStore with the UserId -> pid link: key `p/<UserId>` -> { pid, first, last, play? } (unix seconds; `play` the
+ * total seconds played, framework 0.7.2+, added at every leave).
+ */
 const PLAYER_STORE = "TypeTorchAnalytics";
 
 const EVENTS_CAP = 10000;
@@ -131,6 +139,12 @@ const JOIN_LOOKUP_BUDGET = 20;
 const RECORDING_MAX_BYTES = 262144;
 const RECORDING_MAX_CHUNKS = 80;
 const RECORDING_MAX_SECONDS = 900;
+/** plans/36: an extended recording (tt-ext-1) at most this many chunk bytes and chunks, and its chunks this far apart. */
+const EXT_MAX_BYTES = 2097152;
+const EXT_MAX_CHUNKS = 200;
+const EXT_CHUNK_GAP = 0.25;
+/** One session's seconds added to `play` at most (a server that never saw the leave can't add days). */
+const PLAY_SESSION_MAX = 86400;
 /** The join event waits this long for the client's device info. */
 const DEVICE_WAIT = 8;
 /** The join event waits this long for PolicyService's answer (GetPolicyInfoForPlayerAsync has no timeout of its own). */
@@ -158,6 +172,17 @@ interface RecordingState {
 	bytes: number;
 }
 
+/** plans/36: the session's extended recording (tt-ext-1), decided once at the first hello with settings. */
+interface ExtendedState {
+	decided: boolean;
+	/** The experiment's "on" arm, recorded and eligible. */
+	on: boolean;
+	started: boolean;
+	ended: boolean;
+	chunk: number;
+	bytes: number;
+}
+
 /** One player's session. Plain data (persist), keyed by tostring(UserId). */
 interface PlayerSession {
 	pid: string;
@@ -173,6 +198,10 @@ interface PlayerSession {
 	ret: number;
 	/** Unix seconds of the first visit (the DataStore record). */
 	first: number;
+	/** Total seconds played before this session (the record's `play`; 0 on a first visit; undefined when unknown). */
+	play?: number;
+	/** plans/36 (missing in sessions handed over by older frameworks). */
+	ext?: ExtendedState;
 	/** Unix ms of the join. */
 	joinedAt: number;
 	joined: boolean;
@@ -243,6 +272,12 @@ interface PlayerRecord {
 	pid: string;
 	first: number;
 	last: number;
+	/** Total seconds played (framework 0.7.2+; older records lack it). */
+	play?: number;
+}
+
+function playOf(value: unknown): number | undefined {
+	return typeIs(value, "number") && value === value && value >= 0 ? value : undefined;
 }
 
 function nowMs(): number {
@@ -345,6 +380,7 @@ export class ServerAnalytics {
 	private readonly helloWaiting = new Set<Player>();
 	private readonly clientBudgets = new Map<Player, BucketState>();
 	private readonly lastChunkAt = new Map<Player, number>();
+	private readonly lastExtChunkAt = new Map<Player, number>();
 	private readonly errors = new Map<string, number>();
 	private readonly zones = new Map<Instance, Zone>();
 	private readonly kernel?: ServerKernel;
@@ -637,6 +673,12 @@ export class ServerAnalytics {
 		const deadline = os.clock() + 10;
 		while ((!session.ready || !this.settingsTried) && os.clock() < deadline && !this.stopped) task.wait(0.1);
 		if (!session.ready) return control;
+		return this.assign(player, session, name, variants);
+	}
+
+	/** experiment() once the pid is known: never yields (the hello's built-in experiment calls it directly). */
+	private assign(player: Player, session: PlayerSession, name: string, variants: string[]): string {
+		const control = variants[0] ?? "";
 		if (!session.exp.has(name) && session.exp.size() >= EXPERIMENTS_MAX) {
 			this.warn(`experiment("${name}") not assigned: a session holds at most ${EXPERIMENTS_MAX} experiments`);
 			return control;
@@ -834,15 +876,22 @@ export class ServerAnalytics {
 				if (!typeIs(value, "table")) return [true, undefined];
 				const record = value as Partial<PlayerRecord>;
 				if (!typeIs(record.pid, "string") || record.pid.size() < 8) return [true, undefined];
-				return [true, { pid: record.pid, first: typeIs(record.first, "number") ? record.first : 0, last: typeIs(record.last, "number") ? record.last : 0 }];
+				return [
+					true,
+					{ pid: record.pid, first: typeIs(record.first, "number") ? record.first : 0, last: typeIs(record.last, "number") ? record.last : 0, play: playOf(record.play) },
+				];
 			}
 			task.wait(attempt * 2);
 		}
 		return [false];
 	}
 
-	/** Writes the record (first join, leave). Keeps a pid another server wrote first; returns the stored pid. */
-	private writeRecord(userId: number, pid: string, first: number): string | undefined {
+	/**
+	 * Writes the record (first join, leave). Keeps a pid another server wrote first; returns the stored pid. `played`
+	 * (seconds, at a leave) is added to `play`; a record without `play` (older frameworks) keeps none (unknown), and a
+	 * new record starts it at `played` (0 at the first join).
+	 */
+	private writeRecord(userId: number, pid: string, first: number, played = 0): string | undefined {
 		const store = this.dataStore();
 		if (!store) return undefined;
 		const now = os.time();
@@ -857,10 +906,16 @@ export class ServerAnalytics {
 					const record = typeIs(old, "table") ? (old as Partial<PlayerRecord>) : undefined;
 					if (record && typeIs(record.pid, "string") && record.pid.size() >= 8) {
 						stored = record.pid;
-						return $tuple({ pid: record.pid, first: typeIs(record.first, "number") ? record.first : first, last: now });
+						const play = playOf(record.play);
+						return $tuple({
+							pid: record.pid,
+							first: typeIs(record.first, "number") ? record.first : first,
+							last: now,
+							play: play !== undefined ? play + played : undefined,
+						});
 					}
 					stored = pid;
-					return $tuple({ pid, first, last: now });
+					return $tuple({ pid, first, last: now, play: played });
 				}),
 			);
 			if (ok) return stored;
@@ -883,9 +938,11 @@ export class ServerAnalytics {
 		let temp = false;
 		let first = nowSeconds;
 		let ret = -1;
+		let play: number | undefined;
 		if (ok && record) {
 			pid = record.pid;
 			first = record.first;
+			play = record.play;
 			// Created by this server for this session (a swap restarted the lookup): still the first visit.
 			newp = session.created !== undefined && record.pid === session.created;
 			if (!newp && record.last > 0) ret = math.max(0, math.floor((nowSeconds - record.last) / 86400));
@@ -897,6 +954,7 @@ export class ServerAnalytics {
 			// Another server created the record first (two joins at once): not a first visit here.
 			newp = stored === created;
 			temp = stored === undefined;
+			if (newp) play = 0;
 		} else {
 			// The store can't be read (Studio without API access, an outage): a session-only id, never recorded.
 			pid = `t${newId().sub(2)}`;
@@ -913,6 +971,8 @@ export class ServerAnalytics {
 		session.temp = temp;
 		session.first = first;
 		session.ret = ret;
+		// A first visit (also one a swap restarted) has played nothing before.
+		session.play = newp ? 0 : play;
 		session.ready = true;
 		this.tellKernelPid(player, pid);
 		if (this.options.identity !== false) this.queueIdentity(player.UserId, pid);
@@ -1154,6 +1214,11 @@ export class ServerAnalytics {
 			session.rec.ended = true;
 			this.emit(session, "recording_meta", "end", encodeProps({ chunks: session.rec.chunk, bytes: session.rec.bytes, why: "left" }));
 		}
+		const ext = session.ext;
+		if (ext && ext.started && !ext.ended) {
+			ext.ended = true;
+			this.emit(session, "recording_meta", "ext_end", encodeProps({ chunks: ext.chunk, bytes: ext.bytes, why: "left" }));
+		}
 		if (this.options.sessions !== false) {
 			const lastSwap = this.store.lastSwapAt;
 			this.emit(
@@ -1172,10 +1237,12 @@ export class ServerAnalytics {
 		this.helloWaiting.delete(player);
 		this.clientBudgets.delete(player);
 		this.lastChunkAt.delete(player);
+		this.lastExtChunkAt.delete(player);
 		this.store.players.delete(tostring(player.UserId));
 		if (session.ready && !session.temp) {
 			const userId = player.UserId;
-			task.spawn(() => this.writeRecord(userId, session.pid, session.first > 0 ? session.first : os.time()));
+			const played = math.clamp(math.floor((now - session.joinedAt) / 1000), 0, PLAY_SESSION_MAX);
+			task.spawn(() => this.writeRecord(userId, session.pid, session.first > 0 ? session.first : os.time(), played));
 		}
 	}
 
@@ -1252,6 +1319,19 @@ export class ServerAnalytics {
 		);
 	}
 
+	/**
+	 * plans/36: whether this session also records the extended streams. Only for a recorded session (tt-rec-1's rule)
+	 * of an eligible player (under `extended.maxPlaytime` of total playtime) while the settings configure the built-in
+	 * experiment `tt_extended_recording`; then the player is assigned (and stamped, both arms: the "off" arm is the
+	 * control) and the "on" arm records. No experiment in the settings: nobody, and nobody is stamped.
+	 */
+	private decideExtended(player: Player, session: PlayerSession): boolean {
+		const settings = this.settings;
+		if (settings === undefined || !session.rec.on || !settings.experiments.has(EXT_EXPERIMENT)) return false;
+		if (!extendedEligible(session.newp, session.play, settings.extended.maxPlaytime)) return false;
+		return this.assign(player, session, EXT_EXPERIMENT, EXT_VARIANTS) === "on";
+	}
+
 	private sendHello(player: Player, session: PlayerSession) {
 		const dispatcher = maybeServerDispatcher();
 		if (!dispatcher || this.stopped) return;
@@ -1260,14 +1340,22 @@ export class ServerAnalytics {
 			session.rec.decided = true;
 			session.rec.on = this.recordingAllowed(session);
 		}
+		if (session.ext === undefined && session.rec.decided && this.settings !== undefined) {
+			session.ext = { decided: true, on: false, started: false, ended: false, chunk: 0, bytes: 0 };
+			session.ext.on = this.decideExtended(player, session);
+		}
+		const ext = session.ext;
+		const extended = ext !== undefined && ext.on && !ext.ended && this.options.recording !== false ? this.settings?.extended : undefined;
 		const hello: ServerHello = {
 			pid: session.pid,
 			newp: session.newp,
 			rec: session.rec.on && !session.rec.ended && this.options.recording !== false,
 			tech: this.settings?.techEvery ?? DEFAULT_TECH_EVERY,
 			exps: this.overrides(player, session),
-			rsec: this.settings?.recordSeconds ?? DEFAULT_RECORD_SECONDS,
+			// An extended session's tt-rec-1 stream runs for the extended window (the one change to tt-rec-1, plans/36).
+			rsec: extended !== undefined ? extended.seconds : (this.settings?.recordSeconds ?? DEFAULT_RECORD_SECONDS),
 			pos: this.settings ? [...this.settings.positions] : [],
+			ext: extended,
 		};
 		dispatcher.kernel.send(player, CHANNEL, "hi", hello);
 	}
@@ -1360,7 +1448,7 @@ export class ServerAnalytics {
 		const t = nowMs() - age - math.floor(math.clamp(player.GetNetworkPing(), 0, 2) * 500);
 		if (!rec.started) {
 			rec.started = true;
-			this.emit(session, "recording_meta", "start", encodeProps({ share: settings.recordShare, secs: settings.recordSeconds }), "server", t);
+			this.emit(session, "recording_meta", "start", encodeProps({ share: settings.recordShare, secs: session.ext?.on === true ? settings.extended.seconds : settings.recordSeconds }), "server", t);
 		}
 		rec.chunk = chunk + 1;
 		rec.bytes += size;
@@ -1385,6 +1473,52 @@ export class ServerAnalytics {
 		}
 	}
 
+	/** plans/36: one tt-ext-1 chunk, as onChunk but with its own counter and caps (codec `tt-ext-1`, `n` = records). */
+	private onExtChunk(player: Player, session: PlayerSession, args: unknown[]) {
+		const [chunk, age, n, data, last, why] = args as [unknown, unknown, unknown, unknown, unknown, unknown];
+		const ext = session.ext;
+		if (!session.ready || !ext || !ext.on || ext.ended) return;
+		if (!typeIs(chunk, "number") || chunk % 1 !== 0 || chunk < 0 || chunk > EXT_MAX_CHUNKS) return;
+		if (!typeIs(age, "number") || age !== age || age < 0 || age > 600000) return;
+		if (!typeIs(n, "number") || n % 1 !== 0 || n < 0 || n > 65535) return;
+		if (!typeIs(data, "buffer")) return;
+		const size = buffer.len(data);
+		if (size < 4 || size > EXT_CHUNK_MAX_BYTES || buffer.readu8(data, 0) !== 1) return;
+		if (chunk < ext.chunk) return; // a resend
+		const clock = os.clock();
+		const lastAt = this.lastExtChunkAt.get(player);
+		if (lastAt !== undefined && clock - lastAt < EXT_CHUNK_GAP && last !== true) return;
+		this.lastExtChunkAt.set(player, clock);
+		const settings = this.settings;
+		if (!settings || !recordsSupported(settings)) return;
+		const t = nowMs() - age - math.floor(math.clamp(player.GetNetworkPing(), 0, 2) * 500);
+		if (!ext.started) {
+			ext.started = true;
+			this.emit(session, "recording_meta", "ext_start", encodeProps({ secs: settings.extended.seconds }), "server", t);
+		}
+		ext.chunk = chunk + 1;
+		ext.bytes += size;
+		const id = this.identity;
+		this.recordings.push({
+			v: SCHEMA_VERSION,
+			t,
+			pid: session.pid,
+			sid: session.sid,
+			job: id.job,
+			art: id.art,
+			chunk,
+			codec: EXT_RECORDING_CODEC,
+			data: toBase64(data),
+			n,
+		});
+		const capped = ext.bytes >= EXT_MAX_BYTES || ext.chunk >= EXT_MAX_CHUNKS;
+		if (last === true || capped) {
+			ext.ended = true;
+			const reason = capped ? "cap" : typeIs(why, "string") && isEventName(why) ? why : "end";
+			this.emit(session, "recording_meta", "ext_end", encodeProps({ chunks: ext.chunk, bytes: ext.bytes, why: reason }));
+		}
+	}
+
 	private startIntake() {
 		const dispatcher = maybeServerDispatcher();
 		if (!dispatcher) return;
@@ -1403,6 +1537,8 @@ export class ServerAnalytics {
 					}
 				} else if (op === "rec") {
 					if (this.options.recording !== false) this.onChunk(player, session, args);
+				} else if (op === "xrec") {
+					if (this.options.recording !== false) this.onExtChunk(player, session, args);
 				}
 			});
 			if (!ok) $warn(`[analytics] client message failed: ${tostring(err).sub(1, 200)}`);

@@ -7,7 +7,7 @@
  */
 
 import type { JoinDataMode } from "./join";
-import type { ExperimentOverride, ResolvedSettings } from "./schema";
+import type { ExperimentOverride, ExtendedSettings, ResolvedSettings } from "./schema";
 
 export const DEFAULT_FLUSH_SECONDS = 15;
 export const DEFAULT_TECH_EVERY = 60;
@@ -129,6 +129,78 @@ function parseExperiments(value: unknown, errors: string[]): Map<string, Experim
 	return result;
 }
 
+// Extended recording (plans/36) ---------------------------------------------------------------------------------------
+
+/** The built-in experiment that rolls extended recording out: variant "on" gets it. */
+export const EXT_EXPERIMENT = "tt_extended_recording";
+export const EXT_VARIANTS = ["off", "on"];
+export const EXT_SECONDS_MIN = 10;
+export const EXT_SECONDS_MAX = 600;
+
+/** The defaults of `analytics.extended`. */
+export function defaultExtended(): ExtendedSettings {
+	return {
+		seconds: 300,
+		maxPlaytime: 60,
+		afkSeconds: 30,
+		hz: 3.33,
+		entMax: 24,
+		entRadius: 150,
+		uiBudgetMs: 0.25,
+		uiKeyframeSeconds: 60,
+		dryRun: false,
+		streams: { pose: true, ent: true, ui: true, view: true },
+	};
+}
+
+/**
+ * `analytics.extended` with defaults and clamps; problems go to `errors` as `extended.<field> ...` (a bad field keeps its
+ * default). Also reads the copy the hello carries to the client (the same shape). Unknown fields are ignored.
+ */
+export function parseExtended(value: unknown, errors: string[]): ExtendedSettings {
+	const result = defaultExtended();
+	if (value === undefined) return result;
+	if (!typeIs(value, "table")) {
+		errors.push("extended must be an object");
+		return result;
+	}
+	const entry = value as Record<string, unknown>;
+	result.seconds = clampNumber(entry.seconds, result.seconds, EXT_SECONDS_MIN, EXT_SECONDS_MAX, "extended.seconds", errors);
+	result.maxPlaytime = clampNumber(entry.maxPlaytime, result.maxPlaytime, 0, 86400, "extended.maxPlaytime", errors);
+	result.afkSeconds = clampNumber(entry.afkSeconds, result.afkSeconds, 5, 600, "extended.afkSeconds", errors);
+	result.hz = clampNumber(entry.hz, result.hz, 1, 10, "extended.hz", errors);
+	result.entMax = math.floor(clampNumber(entry.entMax, result.entMax, 0, 255, "extended.entMax", errors));
+	result.entRadius = clampNumber(entry.entRadius, result.entRadius, 10, 2000, "extended.entRadius", errors);
+	result.uiBudgetMs = clampNumber(entry.uiBudgetMs, result.uiBudgetMs, 0.05, 4, "extended.uiBudgetMs", errors);
+	result.uiKeyframeSeconds = clampNumber(entry.uiKeyframeSeconds, result.uiKeyframeSeconds, 10, 600, "extended.uiKeyframeSeconds", errors);
+	if (entry.dryRun !== undefined) {
+		if (typeIs(entry.dryRun, "boolean")) result.dryRun = entry.dryRun;
+		else errors.push("extended.dryRun must be true or false");
+	}
+	if (entry.streams !== undefined) {
+		if (!typeIs(entry.streams, "table")) errors.push("extended.streams must be { pose, ent, ui, view } (each true or false)");
+		else {
+			const streams = entry.streams as Record<string, unknown>;
+			for (const name of ["pose", "ent", "ui", "view"] as const) {
+				const flag = streams[name];
+				if (flag === undefined) continue;
+				if (typeIs(flag, "boolean")) result.streams[name] = flag;
+				else errors.push(`extended.streams.${name} must be true or false`);
+			}
+		}
+	}
+	return result;
+}
+
+/**
+ * Whether a player may get extended recording (plans/36): under `maxPlaytime` seconds of total playtime at the join.
+ * A first visit (`newp`) is 0. A record without `play` (written before framework 0.7.2) is unknown: not eligible.
+ */
+export function extendedEligible(newp: boolean, play: number | undefined, maxPlaytime: number): boolean {
+	if (newp) return true;
+	return play !== undefined && play < maxPlaytime;
+}
+
 /** Problems sinkSettings found while building its value (`sinkErrors`), at most this many are kept. */
 const SINK_ERRORS_MAX = 8;
 
@@ -182,6 +254,7 @@ export function parseSettings(raw: unknown, decode: (text: string) => unknown): 
 	}
 	const techEvery = clampNumber(entry.techEvery, DEFAULT_TECH_EVERY, 15, 3600, "techEvery", errors);
 	const experiments = parseExperiments(entry.experiments, errors);
+	const extended = parseExtended(entry.extended, errors);
 	let joinData: JoinDataMode = "full";
 	if (entry.joinData !== undefined) {
 		if (entry.joinData === "full" || entry.joinData === "summary" || entry.joinData === "off") joinData = entry.joinData;
@@ -221,6 +294,7 @@ export function parseSettings(raw: unknown, decode: (text: string) => unknown): 
 				identityToken,
 				joinLaunchPrefix,
 				joinData,
+				extended,
 			},
 		errors,
 	};
@@ -269,6 +343,7 @@ export function sinkSettings(backend: unknown, analytics: unknown, decode: (text
 		experiments: extra.experiments,
 		joinLaunchPrefix: extra.joinLaunchPrefix,
 		joinData: extra.joinData,
+		extended: extra.extended,
 	};
 }
 

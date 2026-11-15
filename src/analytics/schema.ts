@@ -8,6 +8,8 @@
 export const SCHEMA_VERSION = 1;
 /** The first-session recording codec (column `codec`). */
 export const RECORDING_CODEC = "tt-rec-1";
+/** The extended recording's codec (plans/36; column `codec`, its own `chunk` counter). */
+export const EXT_RECORDING_CODEC = "tt-ext-1";
 /** Most bytes of the `props` JSON text. Larger props become `{"_trunc":<bytes>}`. */
 export const PROPS_MAX_BYTES = 4096;
 
@@ -157,6 +159,46 @@ export interface AnalyticsSettings {
 	 * `jd`), "off" (no `jd` and only the join props from before plans/29). Anything else warns and means "full".
 	 */
 	joinData?: "full" | "summary" | "off";
+	/**
+	 * plans/36: the extended recording's dials (poses, entities, animations, the UI tree; codec tt-ext-1). Who gets it is
+	 * the built-in experiment `tt_extended_recording` (variants `["off", "on"]`) in `experiments`: no experiment, nobody.
+	 */
+	extended?: Partial<Omit<ExtendedSettings, "streams">> & { streams?: Partial<ExtendedStreams> };
+}
+
+/** Which extended streams run (each default true). */
+export interface ExtendedStreams {
+	/** My character's Rig / Pose and my Animator. */
+	pose: boolean;
+	/** Other players' characters and tracked models: Spawn / Look / Move / Gone and their animations. */
+	ent: boolean;
+	/** The PlayerGui tree. */
+	ui: boolean;
+	/** View (viewport, inset, FOV, fps). */
+	view: boolean;
+}
+
+/** plans/36: `analytics.extended`, defaults filled in (settings.ts parseExtended). */
+export interface ExtendedSettings {
+	/** Seconds an extended session records after the first input (300, 10..600); its tt-rec-1 stream runs as long. */
+	seconds: number;
+	/** Eligible while total playtime at the join is under this many seconds (60). */
+	maxPlaytime: number;
+	/** No input and no movement for this long = AFK (30). */
+	afkSeconds: number;
+	/** Pose / Move / UI polls a second (3.33, 1..10). */
+	hz: number;
+	/** The most entities recorded at once, nearest first (24, 0..255). */
+	entMax: number;
+	/** Entities farther from the camera are not recorded (150 studs). */
+	entRadius: number;
+	/** UI poll time per frame, ms (0.25 desktop; phones and tablets 0.6 of it). */
+	uiBudgetMs: number;
+	/** Seconds between Keyframes (60). */
+	uiKeyframeSeconds: number;
+	/** Build everything, send nothing, report the counts (false). */
+	dryRun: boolean;
+	streams: ExtendedStreams;
 }
 
 /** AnalyticsSettings with every default filled in. */
@@ -175,6 +217,7 @@ export interface ResolvedSettings {
 	identityToken?: string;
 	joinLaunchPrefix: boolean;
 	joinData: "full" | "summary" | "off";
+	extended: ExtendedSettings;
 }
 
 export type AnalyticsValue = string | number | boolean;

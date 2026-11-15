@@ -114,6 +114,8 @@ export { bump, isRealFrame, observeElement, popIn, popOut, PopupQueue } from "./
 export { hotAsset } from "./assets/hot-asset";
 // Analytics (plans/16): optional, nothing runs until `new AnalyticsEngine()`.
 export { AnalyticsEngine } from "./analytics/engine";
+export { replay } from "./analytics/replay";
+export type { ReplayApi } from "./analytics/replay";
 export type {
 	AnalyticsEventOptions,
 	AnalyticsOptions,
@@ -127,6 +129,8 @@ export type {
 	EventKind,
 	EventRow,
 	ExperimentOverride,
+	ExtendedSettings,
+	ExtendedStreams,
 	FleetStatus,
 	RecordingRow,
 } from "./analytics/schema";
