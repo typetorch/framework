@@ -1025,6 +1025,117 @@ do
 	check("settings: the engine's listener goes with its trove", #settingsMock.listeners == 0)
 end
 
+-- Extended recording (plans/36): the built-in experiment, eligibility, the hello's dials, tt-ext-1 intake, `play` ------
+do
+	kernelPersist["__typetorch/analytics.v1"] = nil
+	sent = {}
+	local on = makePlayer(301, "ExtOn")
+	local off = makePlayer(302, "ExtOff")
+	local back = makePlayer(303, "ExtBack")
+	local legacy = makePlayer(304, "ExtLegacy")
+	records["p/303"] = { pid = "backpid000000000000000000000303", first = os.time() - 100, last = os.time() - 50, play = 30 }
+	records["p/304"] = { pid = "legacypid0000000000000000000304", first = os.time() - 100, last = os.time() - 50 }
+	PlayersService.list = { on, off, back, legacy }
+	local extOptions = {
+		settings = {
+			backend = "duckdb",
+			events = "https://a.example.com/ingest",
+			token = "TKN-secret",
+			flushSeconds = 300,
+			recordSeconds = 60,
+			experiments = { tt_extended_recording = { weights = { 9, 1 }, players = { ["301"] = "on", ["302"] = "off", ["303"] = "on" } } },
+			extended = { seconds = 120, dryRun = false, hz = 5, streams = { ui = false } },
+		},
+		zones = false,
+		fleet = false,
+	}
+	local troveX = Trove.new()
+	local coreX = ServerAnalytics.new(extOptions, { trove = troveX, server = kernel }, troveX)
+	task.wait(0.3)
+	check("ext: a new record starts play at 0", records["p/301"] ~= nil and records["p/301"].play == 0, records["p/301"] and records["p/301"].play)
+	for _, player in { on, off, back, legacy } do
+		raw["__tt/an"](player, "hello", { dev = "desktop", input = "kbm", w = 1920, h = 1080, kb = true, mouse = true })
+	end
+	local hiOn, hiOff, hiBack, hiLegacy = hiFor(on), hiFor(off), hiFor(back), hiFor(legacy)
+	check("ext: the on arm gets the dials", hiOn and hiOn.rec == true and hiOn.ext ~= nil and hiOn.ext.seconds == 120 and hiOn.ext.hz == 5 and hiOn.ext.streams.ui == false)
+	check("ext: its tt-rec-1 window is the extended one", hiOn and hiOn.rsec == 120, hiOn and hiOn.rsec)
+	check("ext: the off arm: no dials, the usual window", hiOff and hiOff.rec == true and hiOff.ext == nil and hiOff.rsec == 60)
+	check("ext: a returning player is not recorded: no dials", hiBack and hiBack.rec == false and hiBack.ext == nil)
+	check("ext: legacy record: no dials", hiLegacy and hiLegacy.ext == nil)
+	local stamped = {}
+	for _, row in rowsNamed(store().events.rows, "experiment", "tt_extended_recording") do
+		stamped[row.pid] = serde.decode("json", row.props).variant
+	end
+	local onPid, offPid = records["p/301"].pid, records["p/302"].pid
+	check("ext: both arms stamped (the off arm is the control)", stamped[onPid] == "on" and stamped[offPid] == "off")
+	check("ext: players not recorded are not stamped", stamped["backpid000000000000000000000303"] == nil and stamped["legacypid0000000000000000000304"] == nil)
+	-- Later rows carry the variant in `exp`.
+	coreX:track(on, "custom", "after_ext", nil)
+	local laterOn = rowsNamed(store().events.rows, "custom", "after_ext")[1]
+	check("ext: later rows carry the variant", laterOn ~= nil and serde.decode("json", laterOn.exp).tt_extended_recording == "on", laterOn and laterOn.exp)
+
+	-- tt-ext-1 chunks: their own codec and counter; refused from the off arm, too big, or the wrong version.
+	local X = loadAnalytics("ext-codec")
+	local writer = X.ExtWriter.new()
+	writer:keyframe(0)
+	writer:view(1, 1920, 1080, 58, 70, 60)
+	local records0 = writer.records
+	local chunk0 = writer:take(false)
+	raw["__tt/an"](on, "xrec", 0, 1000, records0, chunk0, false, "")
+	raw["__tt/an"](on, "xrec", 0, 1000, records0, chunk0, false, "") -- a resend
+	raw["__tt/an"](off, "xrec", 0, 1000, records0, chunk0, false, "")
+	raw["__tt/an"](on, "xrec", 1, 1000, 1, buffer.create(40000), false, "")
+	local rows = {}
+	for _, row in store().recordings.rows do
+		if row.codec == "tt-ext-1" then
+			table.insert(rows, row)
+		end
+	end
+	check("ext: one tt-ext-1 row", #rows == 1 and rows[1].pid == onPid and rows[1].chunk == 0 and rows[1].n == 2, #rows)
+	check("ext: the row decodes", rows[1] and #X.decodeExtChunk(C.fromBase64(rows[1].data)).records == 2)
+	check("ext: ext_start row", #rowsNamed(store().events.rows, "recording_meta", "ext_start") == 1)
+	task.wait(0.3)
+	raw["__tt/an"](on, "xrec", 1, 500, 0, X.ExtWriter.new():take(true), true, "window")
+	local ends = rowsNamed(store().events.rows, "recording_meta", "ext_end")
+	check("ext: ext_end on the last chunk", #ends == 1 and serde.decode("json", ends[1].props).why == "window" and serde.decode("json", ends[1].props).chunks == 2)
+	raw["__tt/an"](on, "xrec", 2, 500, 0, chunk0, false, "")
+	local after = 0
+	for _, row in store().recordings.rows do
+		if row.codec == "tt-ext-1" then
+			after += 1
+		end
+	end
+	check("ext: nothing after the end", after == 2, after)
+
+	-- `play`: added at the leave inside the same UpdateAsync; a record without it stays unknown.
+	for _, player in { on, back, legacy } do
+		table.remove(PlayersService.list, table.find(PlayersService.list, player))
+		PlayersService.PlayerRemoving:Fire(player)
+	end
+	task.wait(0.2)
+	check("ext: play added at the leave", records["p/301"].play ~= nil and records["p/301"].play >= 0 and records["p/301"].play < 10, records["p/301"].play)
+	check("ext: play adds up", records["p/303"].play ~= nil and records["p/303"].play >= 30 and records["p/303"].play < 40, records["p/303"].play)
+	check("ext: a record without play keeps none", records["p/304"].play == nil and records["p/304"].last ~= nil)
+	troveX:clean()
+
+	-- No experiment in the settings: nobody gets extended recording, nobody is stamped.
+	kernelPersist["__typetorch/analytics.v1"] = nil
+	sent = {}
+	local fresh = makePlayer(305, "ExtNone")
+	PlayersService.list = { fresh }
+	local noExp = table.clone(extOptions)
+	noExp.settings = table.clone(extOptions.settings)
+	noExp.settings.experiments = nil
+	local troveY = Trove.new()
+	ServerAnalytics.new(noExp, { trove = troveY, server = kernel }, troveY)
+	task.wait(0.3)
+	raw["__tt/an"](fresh, "hello", { dev = "desktop", input = "kbm", w = 1920, h = 1080, kb = true, mouse = true })
+	local hiFresh = hiFor(fresh)
+	check("ext: no experiment, no dials", hiFresh and hiFresh.rec == true and hiFresh.ext == nil and hiFresh.rsec == 60)
+	check("ext: no experiment, no stamp", #rowsNamed(store().events.rows, "experiment", "tt_extended_recording") == 0)
+	troveY:clean()
+end
+
 removeGate()
 check("dev: no gate, nobody may", not DC.devOverrideAllowed(regular))
 
