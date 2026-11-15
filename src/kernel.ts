@@ -924,6 +924,25 @@ export interface RemoteDebugCaller {
 	via: "roblox" | "admin token";
 }
 
+/**
+ * Kernel 0.5.7 (plans/34): what a generation declares with `api:debugDeclare` (src/live-debug.ts builds it): custom fleet
+ * columns, read-only commands (the explorer's op `game.<name>`) and streams.
+ */
+export interface DebugDeclarations {
+	columns: { name: string; label?: string; type?: "string" | "number" | "bool" }[];
+	commands: { name: string; label?: string; description?: string }[];
+	streams: { name: string; hz: number; kind?: "points" | "json"; label?: string }[];
+}
+/** Kernel 0.5.7: `api:debugDeclare`'s answer (bad entries are dropped and counted, never an error). */
+export interface DebugDeclareResult {
+	ok: boolean;
+	hash?: string;
+	columns: number;
+	commands: number;
+	streams: number;
+	dropped: number;
+}
+
 /** Kernel 0.5.0: `status().remoteDebug` (counters; never a command's contents, the URL or the key). */
 export interface RemoteDebugStatus {
 	state: "off" | "polling" | "held";
@@ -1091,6 +1110,22 @@ export interface ServerKernel {
 	 * the answer is JSON-encoded and scrubbed of secrets by the kernel. `onRemoteDebug` doubles as the feature test.
 	 */
 	onRemoteDebug?(handler: (op: string, args: unknown, caller: RemoteDebugCaller) => unknown): void;
+
+	/**
+	 * Kernel 0.5.7 (additive; plans/34): LIVE DEBUG. Replaces this generation's declarations (names
+	 * ^[a-z][a-z0-9_]{0,31}$; at most 16 columns, 32 commands, 8 streams). The heartbeat then carries their hash `xh`,
+	 * `x` when the backend needs them and `cv` (the column values). `debugDeclare` doubles as the feature test; the
+	 * framework drives it through `remoteDebug` / `fleet` (src/live-debug.ts).
+	 */
+	debugDeclare?(declarations: DebugDeclarations): DebugDeclareResult;
+	/** Kernel 0.5.7: fn(name, args, caller) answers a declared command (op `game.<name>`) on a kernel thread, owners only. */
+	onDebugCommand?(handler: ((name: string, args: unknown, caller: RemoteDebugCaller) => unknown) | undefined): void;
+	/** Kernel 0.5.7: fn(name) -> a declared column's value (string <= 64 characters, number, boolean; else null). */
+	onDebugColumn?(handler: ((name: string) => unknown) | undefined): void;
+	/** Kernel 0.5.7: fn(name) -> a declared stream's sample, while the explorer watches this server. */
+	onDebugStream?(handler: ((name: string) => unknown) | undefined): void;
+	/** Kernel 0.5.7: the column values changed: a coalesced heartbeat (at most one per 10 s). */
+	debugColumnsChanged?(): boolean;
 
 	/** `typetorch test --cloud`'s stub kernel: true (code that must not run in the gate checks it). */
 	readonly test?: boolean;

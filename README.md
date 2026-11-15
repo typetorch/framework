@@ -389,6 +389,43 @@ TypeTorch.runDetached(() => store.StartSessionAsync(`Player_${userId}`)).then((p
   run at once per server (then it throws); one past 60 s is logged and flagged in Server > Status. Older kernels
   throw "needs kernel 0.3.8; use the DataHost job queue (Player data guide)": the other option, which works on every
   kernel. `features.runDetached` tells which one this server has.
+- **Live debug: `remoteDebug` and `fleet`** (framework 0.7.1, kernel 0.5.7, server only; `src/live-debug.ts`,
+  plans/34): the game's own read-only commands and streams for the backend explorer's server page (`/servers/<JobId>`),
+  and its own columns on the Fleet page. Import them (`import { fleet, remoteDebug } from "@typetorch/framework"`) or
+  use `TypeTorch.remoteDebug` / `TypeTorch.fleet`:
+
+  ```ts
+  // A button on the server page (op `game.round_state`); fn(args, caller) runs for an owner, its return is the answer.
+  remoteDebug.command("round_state", () => ({ kind: "kv", items: { round: this.round, alive: this.alive.size() } }), {
+  	label: "Round",
+  	description: "The current round and who is alive",
+  });
+  // Sampled at hz (0.2..4) only while someone watches the page; "points" values draw as markers on the live map.
+  remoteDebug.stream("loot", () => ({ points: this.chests.map((c) => ({ x: c.X, y: c.Y, z: c.Z, label: "chest" })) }), {
+  	hz: 1,
+  	kind: "points",
+  });
+  // Rides every fleet heartbeat (Fleet page > Columns). Strings at most 64 characters, numbers, booleans.
+  fleet.column("current_map", () => this.mapName, { label: "Map", type: "string" });
+  fleet.columnsChanged(); // after the map changed: a heartbeat soon (the kernel sends at most one per 10 s)
+  ```
+
+  - **Commands must be read-only.** The kernel can't check what a handler does; the explorer labels them
+    "game-defined". They get remote debug's own rules: owners only, 30 a minute, 10 s each, args at most 2 KB, the
+    answer at most 200 KB of JSON and scrubbed of every secret the kernel knows. Answers the explorer renders:
+    `{ kind: "table", columns: [...], rows: [[...]] }`, `{ kind: "kv", items: { k: v } }`, anything else as JSON.
+  - **Columns must never carry player names, UserIds or other personal data**: they are game state (`current_map`,
+    `in_round`, a round number) and the backend stores them with the server row.
+  - Streams are posted with the kernel's built-in `positions` (every player's position, health and state) every
+    second while the page is open; a sample at most 16 KB of JSON (bigger is dropped).
+  - Getters and samplers run on kernel threads under pcall with a short deadline (a column that throws, yields or
+    returns anything else is empty): keep them cheap, don't yield.
+  - Names `^[a-z][a-z0-9_]{0,31}$`; at most 16 columns, 32 commands and 8 streams; labels at most 40 characters,
+    descriptions 200. A bad name or option, a duplicate or one past a limit throws at once; each call returns a
+    function that removes the entry (give it to a trove). Registrations in one frame reach the kernel as one
+    declaration; ones made before the generation is bound (module top level) are sent when it is.
+  - A client throws (server only). Kernels before 0.5.7, places that don't map the kernel's `LiveDebug.luau`, Studio
+    and edit mode accept and check everything and send nothing (`remoteDebug.supported()`, `features.liveDebug`).
 - **`notifications()`** (plans/29): native Roblox experience notifications through the TypeTorch backend (`backend.url`
   / `backend.key`, the launch-token keys in `backend.notify` from `typetorch notify key rotate`; no kernel change).
   The game says why a player should hear from it, the backend decides when and sends, the framework verifies the tap:
@@ -703,7 +740,8 @@ bun run build   # rbxtsc --type package -> out/
   Attention issues.
   The others, each on the compiled `out/`: `test-hot-assets` (manifest parser, AssetSync decisions incl. the backup
   vouch, live-copy rules), `test-messaging` (messaging and the server list), `test-settings` (`liveConfig` and the
-  settings lines), `test-live-events` (scheduled live events on a fake clock), `test-detached` (`runDetached`), `test-dev-access` (the dev-only tools rule and every gate through
+  settings lines), `test-live-events` (scheduled live events on a fake clock), `test-detached` (`runDetached`), `test-live-debug` (`remoteDebug` / `fleet`: names, limits, the client,
+  older kernels, one declaration per frame, the handlers, columnsChanged), `test-dev-access` (the dev-only tools rule and every gate through
   it), `test-remote-debug` (the remote debug ops and their limits), `test-net-inspect` (packet capture),
   `test-explorer-core` (Dex), `test-toolbox-sanitize` (the Creator Store sanitizer), `test-sha256` (SHA-256 / HMAC in util and the
   pairing-code fingerprint), `test-notifications` (the launch token with the contract's shared vector, intent checks,

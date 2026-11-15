@@ -29,6 +29,17 @@ export type { PlayerState } from "./runtime/player-state";
 export { TypeTorch } from "./typetorch";
 export type { BranchChange, TypeTorchApi, TypeTorchFeatures } from "./typetorch";
 export type { MessageSource, MessagingApi, MessagingSubscribeOptions } from "./messaging";
+// Live debug (plans/34): game-defined read-only commands and streams for the explorer, custom Fleet columns.
+export { fleet, remoteDebug } from "./live-debug";
+export type {
+	DebugCommandArgs,
+	DebugCommandOptions,
+	DebugStreamOptions,
+	FleetApi,
+	FleetColumnOptions,
+	FleetColumnValue,
+	RemoteDebugApi,
+} from "./live-debug";
 export type { GameServer, ServerListOptions } from "./servers";
 export type { LiveConfig, LiveConfigOptions, LiveEvent, LiveEvents } from "./settings";
 export type { Notifications, NotifyOpen, OptInResult, WantOptions } from "./notifications/api";
@@ -72,6 +83,8 @@ export type {
 	BranchInfo,
 	Channel,
 	ClientKernel,
+	DebugDeclarations,
+	DebugDeclareResult,
 	DetachedStatus,
 	DevInfo,
 	GameMessageMeta,
@@ -88,6 +101,7 @@ export type {
 	NewServerReport,
 	PendingUpdate,
 	PreviousGeneration,
+	RemoteDebugCaller,
 	Role,
 	SettingsStatus,
 	ServerKernel,
