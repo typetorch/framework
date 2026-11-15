@@ -818,6 +818,11 @@ export interface KernelSettings {
 	backend?: {
 		url: string;
 		key: string;
+		/**
+		 * Framework 0.7.2 (plans/35 C, optional): separate ingest servers. Analytics events go to <ingest>/v1/ingest
+		 * (same key) instead of <url>/v1/ingest; everything else (and the kernel) keeps `url`.
+		 */
+		ingest?: string;
 		analytics?: { flushSeconds?: number; recordShare?: number; recordSeconds?: number; positions?: string[]; techEvery?: number; experiments?: unknown; joinLaunchPrefix?: boolean; joinData?: string };
 		/**
 		 * Plans/29 (no kernel change: the kernel keeps unknown fields of `backend`): the notification launch-token keys

@@ -890,6 +890,29 @@ local recovered = core1:stats()
 check("recovered: the streak is over, the history stays", recovered.failures == 0 and recovered.failed >= 2 and recovered.lastError ~= nil and recovered.lastOkAt >= recovered.lastErrorAt)
 check("recovered: nothing left to fix", recovered.retryIn == nil and recovered.reason == nil and recovered.fix == nil)
 
+-- Framework 0.7.2 (plans/35 D): the backend's "busy" 503 with Retry-After: the rows stay, the wait is at least that long.
+core1:track(newbie, "custom", "busy_probe", nil)
+core1.lastWarnAt = -math.huge
+local requestsBeforeBusy = #requests
+respond = function()
+	return { Success = false, StatusCode = 503, StatusMessage = "Service Unavailable", Headers = { ["retry-after"] = "20", ["content-type"] = "application/json" }, Body = '{"error":"busy: try later","busy":true}' }
+end
+core1:flushSoon()
+task.wait(1.5)
+local busy = core1:stats()
+check("busy 503: one request, rows kept", #requests == requestsBeforeBusy + 1 and #rowsNamed(store().events.rows, "custom", "busy_probe") == 1, #requests)
+check("busy 503: waits at least Retry-After (20-30 s)", busy.retryIn ~= nil and busy.retryIn >= 18 and busy.retryIn <= 31, busy.retryIn)
+check("busy 503: the log line says busy and the wait", said("the server is busy") and said("asked to wait 20 s"), warnings[#warnings])
+respond = function()
+	return { Success = true, StatusCode = 200, StatusMessage = "OK", Body = "" }
+end
+task.wait(7.5)
+check("busy 503: no retry before Retry-After", #requests == requestsBeforeBusy + 1, #requests)
+core1.backoffUntil = 0 -- (skip the rest of the wait)
+core1:flushSoon()
+task.wait(1.5)
+check("busy 503: sent after the wait", #requests == requestsBeforeBusy + 2 and #rowsNamed(store().events.rows, "custom", "busy_probe") == 0 and store().failures == 0, #requests)
+
 -- A refused batch is dropped.
 core1:track(newbie, "custom", "refused_one", nil)
 respond = function()

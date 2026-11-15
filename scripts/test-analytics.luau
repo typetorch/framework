@@ -260,6 +260,26 @@ check("backoff 3", Q.backoffSeconds(3, 0.5) == 20)
 check("backoff capped", Q.backoffSeconds(20, 0.5) == 300)
 check("backoff jitter low", Q.backoffSeconds(2, 0) == 7.5)
 check("config wait: 300 s spread by jitter (0.75-1.25)", Q.configWaitSeconds(0.5) == 300 and Q.configWaitSeconds(0) == 225 and Q.configWaitSeconds(1) == 375 and Q.configWaitSeconds(7) == 375)
+-- Framework 0.7.2 (plans/35 D): Retry-After on 429 / 503 (the backend's "busy" answer) is a floor for the wait.
+check("Retry-After: 503 seconds", Q.retryAfterSeconds(503, { ["Retry-After"] = "20" }) == 20)
+check("Retry-After: 429, any header case, spaces", Q.retryAfterSeconds(429, { ["retry-after"] = " 45 " }) == 45 and Q.retryAfterSeconds(429, { ["RETRY-AFTER"] = "1" }) == 1)
+check("Retry-After: 300 is the top", Q.retryAfterSeconds(503, { ["Retry-After"] = "300" }) == 300)
+check("Retry-After: absent", Q.retryAfterSeconds(503, {}) == nil and Q.retryAfterSeconds(503, nil) == nil and Q.retryAfterSeconds(503, { ["Content-Type"] = "application/json" }) == nil)
+check("Retry-After: out of range", Q.retryAfterSeconds(503, { ["Retry-After"] = "0" }) == nil and Q.retryAfterSeconds(503, { ["Retry-After"] = "301" }) == nil and Q.retryAfterSeconds(503, { ["Retry-After"] = "99999999999999999999" }) == nil)
+check("Retry-After: not whole seconds", Q.retryAfterSeconds(503, { ["Retry-After"] = "Wed, 21 Oct 2015 07:28:00 GMT" }) == nil and Q.retryAfterSeconds(503, { ["Retry-After"] = "abc" }) == nil and Q.retryAfterSeconds(503, { ["Retry-After"] = "-5" }) == nil and Q.retryAfterSeconds(503, { ["Retry-After"] = "2.5" }) == nil and Q.retryAfterSeconds(503, { ["Retry-After"] = 20 }) == nil and Q.retryAfterSeconds(503, { ["Retry-After"] = "" }) == nil)
+check("Retry-After: only on 429 / 503", Q.retryAfterSeconds(500, { ["Retry-After"] = "20" }) == nil and Q.retryAfterSeconds(502, { ["Retry-After"] = "20" }) == nil and Q.retryAfterSeconds(200, { ["Retry-After"] = "20" }) == nil and Q.retryAfterSeconds(0, { ["Retry-After"] = "20" }) == nil)
+check("retry wait: without Retry-After exactly the backoff", Q.retryWaitSeconds(1, 0.5) == Q.backoffSeconds(1, 0.5) and Q.retryWaitSeconds(3, 0.2, nil) == Q.backoffSeconds(3, 0.2) and Q.retryWaitSeconds(20, 1) == Q.backoffSeconds(20, 1))
+check("retry wait: at least Retry-After (jitter 0)", Q.retryWaitSeconds(1, 0, 20) == 20, Q.retryWaitSeconds(1, 0, 20))
+check("retry wait: jitter on top (up to half again)", Q.retryWaitSeconds(1, 1, 20) == 30 and Q.retryWaitSeconds(1, 0.5, 20) == 25 and Q.retryWaitSeconds(1, 7, 20) == 30, Q.retryWaitSeconds(1, 0.5, 20))
+local spread, low, high = {}, math.huge, 0
+for index = 0, 10 do
+	local wait = Q.retryWaitSeconds(1, index / 10, 10)
+	spread[wait] = true
+	low, high = math.min(low, wait), math.max(high, wait)
+end
+check("retry wait: a fleet told 10 s spreads over 10-15 s", low == 10 and high == 15 and spread[12.5] == true, `{low}-{high}`)
+check("retry wait: a longer backoff still wins", Q.retryWaitSeconds(6, 0.5, 10) == Q.backoffSeconds(6, 0.5) and Q.backoffSeconds(6, 0.5) == 160)
+check("retry wait: a 300 s Retry-After at most 450 s", Q.retryWaitSeconds(1, 1, 300) == 450)
 check("status 200", Q.classifyStatus(200) == "sent")
 check("status 204", Q.classifyStatus(204) == "sent")
 check("status 0", Q.classifyStatus(0) == "retry")
@@ -558,6 +578,26 @@ local both = S.sinkSettings({ url = "https://b.example.com", key = "k-0123456789
 check("backend wins over the old duckdb analytics value", both.events == "https://b.example.com/v1/ingest")
 local basin = S.sinkSettings({ url = "https://b.example.com", key = "k-0123456789" }, '{"backend":"basin","events":"https://s.ingest.cloudflare.com"}', decode)
 check("a Basin sink stays on analytics (backend can't describe streams)", basin == '{"backend":"basin","events":"https://s.ingest.cloudflare.com"}')
+-- Framework 0.7.2 (plans/35 C): an optional backend.ingest URL takes the events (same key); the kernel keeps url.
+local function sinkFor(record, analytics)
+	return S.parseSettings(S.sinkSettings(record, analytics, decode), decode)
+end
+local noIngest = sinkFor({ url = "https://b.example.com", key = "k-0123456789" })
+check("ingest: unset, events at <url>/v1/ingest, no error", noIngest.settings.events == "https://b.example.com/v1/ingest" and #noIngest.errors == 0)
+local withIngest = sinkFor({ url = "https://b.example.com", key = "k-0123456789", ingest = "https://ingest.example.com//", analytics = { flushSeconds = 30 } })
+check("ingest: events at <ingest>/v1/ingest, same key, analytics dials kept", withIngest.settings.events == "https://ingest.example.com/v1/ingest" and withIngest.settings.token == "k-0123456789" and withIngest.settings.flushSeconds == 30 and #withIngest.errors == 0, withIngest.settings.events)
+check("ingest: still a duckdb sink (identities ride the batch)", withIngest.settings.backend == "duckdb" and S.identityTarget(withIngest.settings, { url = "https://b.example.com", key = "k" }, decode) == nil)
+for _, bad in { "ftp://ingest.example.com", "ingest.example.com", "https://in gest.example.com", "https://", "https:///", 42, true, { url = "https://x.example.com" }, "" } do
+	local parsed = sinkFor({ url = "https://b.example.com", key = "k-0123456789", ingest = bad })
+	check(`ingest: bad value {tostring(bad)} falls back to <url>/v1/ingest with one error`, parsed.settings ~= nil and parsed.settings.events == "https://b.example.com/v1/ingest" and #parsed.errors == 1 and string.find(parsed.errors[1], "backend.ingest", 1, true) ~= nil, parsed.errors[1])
+end
+local longIngest = sinkFor({ url = "https://b.example.com", key = "k-0123456789", ingest = "https://" .. string.rep("a", 2100) .. ".example.com" })
+check("ingest: over 2048 characters is bad too", longIngest.settings.events == "https://b.example.com/v1/ingest" and #longIngest.errors == 1)
+local badIngest = sinkFor({ url = "https://b.example.com", key = "k-0123456789", ingest = "not a url" })
+check("ingest: the error never echoes the value", not string.find(badIngest.errors[1], "not a url", 1, true))
+local basinIngest = S.sinkSettings({ url = "https://b.example.com", key = "k-0123456789", ingest = "https://ingest.example.com" }, { backend = "basin", events = "https://s.ingest.cloudflare.com" }, decode)
+check("ingest: a Basin analytics sink still wins", basinIngest.backend == "basin" and basinIngest.events == "https://s.ingest.cloudflare.com")
+check("ingest: sinkErrors only from strings, capped", #S.parseSettings({ backend = "duckdb", events = "https://a.example.com/ingest", sinkErrors = { "one", 2, "three" } }, decode).errors == 2)
 local target = S.identityTarget({ backend = "basin", events = "https://s.ingest.cloudflare.com" }, { url = "https://b.example.com/", key = "k-0123456789" }, decode)
 check("Basin identities go to the backend with its key", target ~= nil and target.url == "https://b.example.com/v1/identity" and target.token == "k-0123456789")
 
