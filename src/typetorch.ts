@@ -34,6 +34,7 @@ import { bindMessaging, messaging, messagingSupported, unbindMessaging, type Mes
 import { bindServers, listServers, setServerInfo, unbindServers, type GameServer, type ServerListOptions } from "./servers";
 import { bindSettings, currentSettings, liveConfig, liveEvents, settingsSupported, unbindSettings, type LiveConfig, type LiveConfigOptions, type LiveEvents } from "./settings";
 import { bindDetached, detachedSupported, runDetached, unbindDetached } from "./detached";
+import { bindLiveDebug, fleet, remoteDebug, unbindLiveDebug, type FleetApi, type RemoteDebugApi } from "./live-debug";
 
 /**
  * `TypeTorch`: the runtime API for game code, on the server and the client. It describes the running generation
@@ -72,6 +73,8 @@ export interface TypeTorchFeatures {
 	readonly settings: boolean;
 	/** `runDetached` runs on a kernel thread (kernel 0.3.8+, a server). */
 	readonly runDetached: boolean;
+	/** `remoteDebug.command` / `stream` and `fleet.column` reach the backend (kernel 0.5.7+, a server). */
+	readonly liveDebug: boolean;
 }
 
 export interface TypeTorchApi {
@@ -271,6 +274,19 @@ export interface TypeTorchApi {
 	 */
 	runDetached<T>(fn: () => T): Promise<T>;
 
+	// Live debug (server only, kernel 0.5.7; plans/34) -------------------------------------------------------------------
+	/**
+	 * Game-defined read-only commands and streams for the backend explorer's server page: `command(name, fn, { label?,
+	 * description? })`, `stream(name, fn, { hz, kind?, label? })`. Commands MUST be read-only. Older kernels: accepted
+	 * and checked, nothing is sent. Same object as `import { remoteDebug }`. See src/live-debug.ts.
+	 */
+	readonly remoteDebug: RemoteDebugApi;
+	/**
+	 * Custom Fleet page columns: `column(name, getter, { label?, type? })`, `columnsChanged()`. Never put player names
+	 * or ids in a column. Same object as `import { fleet }`. See src/live-debug.ts.
+	 */
+	readonly fleet: FleetApi;
+
 	// Notifications (plans/29) --------------------------------------------------------------------------------------------
 	/**
 	 * Native Roblox experience notifications through the TypeTorch backend. Server: `want` / `drop` intents (batched,
@@ -327,6 +343,7 @@ const NO_FEATURES: TypeTorchFeatures = {
 	messaging: false,
 	settings: false,
 	runDetached: false,
+	liveDebug: false,
 };
 
 function hasMethod(kernel: object, name: string): boolean {
@@ -551,6 +568,8 @@ class TypeTorchRuntime implements TypeTorchApi {
 	}
 
 	messaging: MessagingApi = messaging;
+	remoteDebug: RemoteDebugApi = remoteDebug;
+	fleet: FleetApi = fleet;
 
 	servers(options?: ServerListOptions): GameServer[] {
 		if (client) error("TypeTorch.servers() is server-only", 2);
@@ -681,6 +700,8 @@ export function bindTypeTorch(
 	bindMessaging(realm, kernel, trove, runtime.branch, runtime.kernelVersion);
 	bindSettings(realm, kernel, trove, runtime.kernelVersion);
 	bindDetached(realm, kernel, trove, runtime.kernelVersion);
+	// Kernel 0.5.7 (plans/34): the game's commands, streams and fleet columns (registered before this are sent now).
+	bindLiveDebug(realm, kernel, trove);
 	if (realm === "server") {
 		server = kernel as ServerKernel;
 		runtime.serverType = server.serverType;
@@ -737,6 +758,7 @@ export function bindTypeTorch(
 		messaging: messagingSupported(),
 		settings: settingsSupported(),
 		runDetached: detachedSupported(),
+		liveDebug: remoteDebug.supported(),
 	};
 }
 
@@ -819,6 +841,7 @@ export function unbindTypeTorch() {
 	unbindServers();
 	unbindSettings();
 	unbindDetached();
+	unbindLiveDebug();
 	swapOutListeners.clear();
 	closeListeners.clear();
 	pendingListeners.clear();
