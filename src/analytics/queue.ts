@@ -113,6 +113,39 @@ export function backoffSeconds(failures: number, jitter: number): number {
 	return base * (0.75 + 0.5 * math.clamp(jitter, 0, 1));
 }
 
+/** The longest `Retry-After` honoured (seconds); a longer or shorter one is ignored (plain backoff instead). */
+export const RETRY_AFTER_MAX = 300;
+
+/**
+ * Framework 0.7.2 (plans/35 D): the `Retry-After` seconds of a 429 / 503 answer (the backend's "busy" 503 sends one),
+ * from the response headers (any case). Undefined for other statuses, without the header, or when it isn't whole
+ * seconds in 1-300 (an HTTP date, "abc", 0, 3600...): then the plain backoff applies, as before.
+ */
+export function retryAfterSeconds(status: number, headers: unknown): number | undefined {
+	if (status !== 429 && status !== 503) return undefined;
+	if (!typeIs(headers, "table")) return undefined;
+	for (const [key, value] of pairs(headers as object)) {
+		if (!typeIs(key, "string") || key.lower() !== "retry-after") continue;
+		if (!typeIs(value, "string") || value.size() > 16) return undefined;
+		const [digits] = value.match("^%s*(%d+)%s*$");
+		if (!typeIs(digits, "string")) return undefined;
+		const seconds = tonumber(digits);
+		if (seconds === undefined || seconds < 1 || seconds > RETRY_AFTER_MAX) return undefined;
+		return seconds;
+	}
+	return undefined;
+}
+
+/**
+ * Seconds to wait after a failed try: the backoff (`backoffSeconds`), and with a `retryAfter` (see retryAfterSeconds)
+ * at least that, spread up to half again by `jitter` (0..1) so a fleet told the same number doesn't retry in step.
+ */
+export function retryWaitSeconds(failures: number, jitter: number, retryAfter?: number): number {
+	const backoff = backoffSeconds(failures, jitter);
+	if (retryAfter === undefined) return backoff;
+	return math.max(backoff, retryAfter * (1 + 0.5 * math.clamp(jitter, 0, 1)));
+}
+
 /**
  * Seconds to wait after a settings problem (401/403/404: wrong token or URL): long, because retrying doesn't help until
  * the settings change (that retries at once), spread by `jitter` (0..1) so a whole fleet of servers doesn't retry in step.
@@ -126,7 +159,8 @@ export type Outcome = "sent" | "retry" | "split" | "drop" | "config";
 
 /**
  * 2xx sent; 413 split the batch; 401/403/404 a settings problem (wrong token or URL: keep the rows, wait long, a
- * settings change retries at once); 408/429/5xx/no response retry with backoff; other 4xx drop the batch.
+ * settings change retries at once); 408/429/5xx/no response retry with backoff (429/503: at least the answer's
+ * Retry-After, see retryWaitSeconds); other 4xx drop the batch.
  */
 export function classifyStatus(status: number): Outcome {
 	if (status >= 200 && status < 300) return "sent";

@@ -653,7 +653,9 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
 - **When uploads fail** (a stale quick-tunnel URL, the dev PC's server or tunnel down, a wrong token, HttpService off;
   Roblox reports most network problems as `HttpError: NetFail`, `DnsResolve` or `ConnectFail`): the server backs off
   with jitter (5, 10, 20 ... 300 s, spread +-25% so a fleet of servers doesn't retry in step; a wrong token or URL waits
-  about 5 minutes, and a settings change retries at once), keeps the rows, and logs at most ONE line a minute: the
+  about 5 minutes, and a settings change retries at once). A `429` or `503` with a `Retry-After` of 1-300 seconds (the
+  backend's "busy" answer) waits at least that long, plus up to half again of jitter (framework 0.7.2; without the
+  header, or with a date or an out-of-range value, the plain backoff). It keeps the rows, and logs at most ONE line a minute: the
   reason and the fix (`analytics upload failed 5 times in a row: NetFail: the connection broke mid-request. ... Retrying
   in 80 s.`, with "(+N more in the last minute)" for the lines it held back) and one line when uploads work again.
   `stats()` also has `failures` (in a row), `failed` (since the server started), `lastError`, `lastStatus`
@@ -672,9 +674,12 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
 - **Friends in the server** (the join's `friends`): one `Players:GetFriendsAsync` per join (at most 10 pages, none
   when the player is alone) intersected with the players there, not a web call per player.
 
-**Settings, framework 0.4.0 / kernel 0.4.0 (plans/21):** the record's `backend` = `{ url, key, analytics?: { flushSeconds,
+**Settings, framework 0.4.0 / kernel 0.4.0 (plans/21):** the record's `backend` = `{ url, key, ingest?, analytics?: { flushSeconds,
 recordShare, recordSeconds, positions, techEvery, experiments, joinLaunchPrefix, joinData } }` is the whole sink: DuckDB
-at `<url>/v1/ingest` with the one key (Basin identities to `<url>/v1/identity`). `typetorch backend setup` writes it
+at `<url>/v1/ingest` with the one key (Basin identities to `<url>/v1/identity`). Framework 0.7.2 (plans/35): an
+optional `backend.ingest` URL (separate ingest servers, `typetorch backend setup --ingest <url>`, CLI 0.19.0) sends the
+events to `<ingest>/v1/ingest` with the same key; the kernel and everything else keep `url`. A bad `ingest` value
+falls back to `<url>/v1/ingest` and the server warns once. `typetorch backend setup` writes it
 (`--flush-seconds`, `--record-share`; `writeBackendSettings()` in `@typetorch/backend` runs it, and `bun run local`
 too), and `typetorch experiment` writes `experiments`. The other dials (`recordSeconds`, `positions`, `techEvery`,
 `joinLaunchPrefix`, `joinData`) have no CLI writer yet: `backend setup` keeps them when the record has them, and

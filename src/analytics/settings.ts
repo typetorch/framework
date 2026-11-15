@@ -129,9 +129,13 @@ function parseExperiments(value: unknown, errors: string[]): Map<string, Experim
 	return result;
 }
 
+/** Problems sinkSettings found while building its value (`sinkErrors`), at most this many are kept. */
+const SINK_ERRORS_MAX = 8;
+
 /**
  * Reads the settings value: a table (the configs API stores JSON objects) or a JSON string. `undefined` (no key) gives
- * no settings and no errors. Unknown fields are ignored.
+ * no settings and no errors. Unknown fields are ignored, except `sinkErrors` (strings sinkSettings found wrong in the
+ * record's `backend`), which join `errors`.
  */
 export function parseSettings(raw: unknown, decode: (text: string) => unknown): ParsedSettings {
 	const errors = new Array<string>();
@@ -144,6 +148,14 @@ export function parseSettings(raw: unknown, decode: (text: string) => unknown): 
 	}
 	if (!typeIs(value, "table")) return { errors: ["the settings must be a JSON object"] };
 	const entry = value as Record<string, unknown>;
+	if (typeIs(entry.sinkErrors, "table")) {
+		let count = 0;
+		for (const problem of entry.sinkErrors as unknown[]) {
+			if (!typeIs(problem, "string") || count >= SINK_ERRORS_MAX) continue;
+			errors.push(problem.sub(1, 200));
+			count += 1;
+		}
+	}
 
 	const backend = entry.backend;
 	if (backend !== "basin" && backend !== "duckdb") errors.push(`backend must be "basin" or "duckdb"`);
@@ -215,10 +227,13 @@ export function parseSettings(raw: unknown, decode: (text: string) => unknown): 
 }
 
 /**
- * Kernel 0.4.0 / plans/21: the raw sink settings from the signed record. `backend` = { url, key, analytics? } is the
- * DuckDB sink at <url>/v1/ingest with the key (flushSeconds, recordShare, recordSeconds, positions, techEvery and experiments from
- * `backend.analytics`). The old `analytics` value is used while `backend` is missing, and whenever it names a Basin sink
- * (`backend` can't describe Basin streams). Returns what parseSettings reads (undefined: no settings).
+ * Kernel 0.4.0 / plans/21: the raw sink settings from the signed record. `backend` = { url, key, ingest?, analytics? } is
+ * the DuckDB sink at <url>/v1/ingest with the key (flushSeconds, recordShare, recordSeconds, positions, techEvery and
+ * experiments from `backend.analytics`). Framework 0.7.2 (plans/35 C): with an `ingest` URL (separate ingest servers)
+ * events go to <ingest>/v1/ingest instead, same key; a bad `ingest` falls back to <url>/v1/ingest and adds a
+ * `sinkErrors` line (parseSettings reports it; the server warns once). The kernel keeps using `url`. The old `analytics`
+ * value is used while `backend` is missing, and whenever it names a Basin sink (`backend` can't describe Basin streams).
+ * Returns what parseSettings reads (undefined: no settings).
  */
 export function sinkSettings(backend: unknown, analytics: unknown, decode: (text: string) => unknown): unknown {
 	if (analytics !== undefined) {
@@ -232,11 +247,19 @@ export function sinkSettings(backend: unknown, analytics: unknown, decode: (text
 	if (!typeIs(backend, "table")) return analytics;
 	const entry = backend as Record<string, unknown>;
 	if (!typeIs(entry.url, "string")) return analytics;
-	const base = entry.url.gsub("/+$", "")[0];
+	let base = entry.url.gsub("/+$", "")[0];
+	const sinkErrors = new Array<string>();
+	if (entry.ingest !== undefined) {
+		const ingest = typeIs(entry.ingest, "string") ? entry.ingest.gsub("/+$", "")[0] : undefined;
+		// The same check parseSettings makes on the events URL; the value is never echoed.
+		if (ingest !== undefined && isUrl(ingest)) base = ingest;
+		else sinkErrors.push("backend.ingest must be an http(s) URL (events go to backend.url instead)");
+	}
 	const extra = typeIs(entry.analytics, "table") ? (entry.analytics as Record<string, unknown>) : {};
 	return {
 		backend: "duckdb",
 		events: `${base}/v1/ingest`,
+		sinkErrors: sinkErrors.size() > 0 ? sinkErrors : undefined,
 		token: entry.key,
 		flushSeconds: extra.flushSeconds,
 		recordShare: extra.recordShare,

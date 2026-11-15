@@ -46,7 +46,7 @@ import { describeFailure } from "./hints";
 import { encodeJoinData, joinDataJson, joinProps, wantedUserIds, type JoinDataLike, type JoinDataMode, type JoinFacts, type LaunchVerdict } from "./join";
 import { registerBuiltinRows, registerBuiltinSessions } from "./rows";
 import { readKeys, verifyToken } from "../notifications/token";
-import { backoffSeconds, classifyStatus, configWaitSeconds, newQueueState, RowQueue, takeToken, type BucketState, type QueueState } from "./queue";
+import { classifyStatus, configWaitSeconds, retryAfterSeconds, retryWaitSeconds, newQueueState, RowQueue, takeToken, type BucketState, type QueueState } from "./queue";
 import {
 	PROPS_MAX_BYTES,
 	RECORDING_CODEC,
@@ -1615,8 +1615,11 @@ export class ServerAnalytics {
 		}
 	}
 
-	/** POST one request. Returns the HTTP status (0: no response). Never logs the token or the body. */
-	private post(request: SinkRequest): number {
+	/**
+	 * POST one request. Returns the HTTP status (0: no response) and, on a 429 / 503, the answer's Retry-After seconds
+	 * (1-300, else undefined). Never logs the token or the body.
+	 */
+	private post(request: SinkRequest): LuaTuple<[number, number | undefined]> {
 		this.countBudget("http", request.table === "identities" ? "identity" : "ingest");
 		const [ok, response] = pcall(() =>
 			HttpService.RequestAsync({
@@ -1629,10 +1632,10 @@ export class ServerAnalytics {
 		);
 		if (!ok) {
 			this.store.lastError = `${request.table}: ${tostring(response).sub(1, 120)}`;
-			return 0;
+			return $tuple(0, undefined);
 		}
 		if (!response.Success) this.store.lastError = `${request.table}: HTTP ${response.StatusCode} ${response.StatusMessage.sub(1, 60)}`;
-		return response.StatusCode;
+		return $tuple(response.StatusCode, retryAfterSeconds(response.StatusCode, response.Headers));
 	}
 
 	/** Sends one batch per table. `final`: shutdown, ignore the budget. */
@@ -1691,7 +1694,7 @@ export class ServerAnalytics {
 				settle(request, true);
 				continue;
 			}
-			const status = this.post(request);
+			const [status, retryAfter] = this.post(request);
 			const outcome = classifyStatus(status);
 			const rows = request.events + request.recordings + request.identities;
 			if (outcome === "sent") {
@@ -1715,12 +1718,17 @@ export class ServerAnalytics {
 				this.store.lastStatus = status;
 				this.store.lastErrorAt = os.time();
 				// Backs off with jitter (so a fleet of servers doesn't retry in step): 5, 10, 20 ... 300 s for a network or
-				// server problem, about 5 minutes for a settings problem (a settings change retries at once).
-				const wait = outcome === "config" ? configWaitSeconds(math.random()) : backoffSeconds(this.store.failures, math.random());
+				// server problem, about 5 minutes for a settings problem (a settings change retries at once). A 429 / 503 with
+				// Retry-After (the backend's "busy" answer) waits at least that long (framework 0.7.2, plans/35 D).
+				const wait = outcome === "config" ? configWaitSeconds(math.random()) : retryWaitSeconds(this.store.failures, math.random(), retryAfter);
 				this.backoffUntil = os.clock() + wait;
 				// "both" = one batch with events and recordings (the DuckDB sink); say "analytics upload" instead.
 				const what = request.table === "both" ? "analytics upload" : `analytics upload (${request.table})`;
-				const help = describeFailure(status, this.store.lastError);
+				// The backend's "busy" 503 isn't a failing server: say so instead of "check the log".
+				const help =
+					status === 503 && retryAfter !== undefined
+						? { reason: "HTTP 503: the server is busy", fix: `it asked to wait ${retryAfter} s; the rows are kept.` }
+						: describeFailure(status, this.store.lastError);
 				const streak = this.store.failures > 1 ? ` ${this.store.failures} times in a row` : "";
 				if (this.warn(`${what} failed${streak}: ${help.reason}. ${help.fix} Retrying in ${math.floor(wait)} s.`)) this.outageLogged = true;
 			}
