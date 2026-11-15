@@ -638,14 +638,18 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   through the server: about 13 KB a minute for an active player (18 KB as stored base64), under 1 KB for an idle one;
   the per-recording caps (256 KB, 80 chunks) still apply, and 10 minutes of an active player fit inside them. Set
   `recordSeconds` to the length of your first round (e.g. 300) to record it whole.
+- **Extended recording** (framework 0.7.2, plans/36): an add-on to the first-session recording, below.
 - **Never collected:** chat or anything typed, usernames and display names (error texts have them replaced). No event
-  row carries a UserId.
+  row carries a UserId. The one exception is the extended recording's UI stream (below, off unless its experiment is
+  configured): it records the game's on-screen UI as drawn, so text in TextBoxes and any names the game's own UI shows
+  are in it (owner decision, plans/36: no privacy filters). Roblox's chat is CoreGui and never visible to it.
 - **Identities** (option `identity`, default on): once the pid is known, one row `{ pid, uid, t }` (the UserId, nothing
   else) per session goes to the dev's own server only, never into the events: duckdb games in the batch body, Basin
   games to the backend (the record's `backend` url + `/v1/identity`, or the `identity` / `identityToken` settings). The
   analytics server keeps pid -> UserId in a deletable table (support lookups, Right to Erasure).
-- **Player ids:** DataStore `TypeTorchAnalytics`, key `p/<UserId>` -> `{ pid, first, last }`: one read per join, a
-  write on the first join and at leave. Deleting the key (Right to Erasure) leaves that player's rows anonymous.
+- **Player ids:** DataStore `TypeTorchAnalytics`, key `p/<UserId>` -> `{ pid, first, last, play }`: one read per join,
+  a write on the first join and at leave (which also adds the session's seconds to `play`, the total playtime; records
+  from before 0.7.2 have none). Deleting the key (Right to Erasure) leaves that player's rows anonymous.
 - **Sending:** one queue on the server (10,000 events; over that the oldest are dropped and counted), a flush every
   `flushSeconds` (15) or at 500 rows, at most ~10 HttpService requests a minute, retries with backoff, and a last
   flush on shutdown (kernel 0.3.2). Delivery is at least once (a swap mid-request sends that batch again).
@@ -674,15 +678,53 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
 - **Friends in the server** (the join's `friends`): one `Players:GetFriendsAsync` per join (at most 10 pages, none
   when the player is alone) intersected with the players there, not a web call per player.
 
+### Extended recording and `replay`
+
+Some recorded sessions (above) also record, as `tt-ext-1` rows next to the tt-rec-1 ones: my character's joints (R6 and
+R15) and animations, other players' characters and the models the game tracks (positions, clothing, the animations
+their Animators play), the camera's FOV and the viewport, and the on-screen UI as drawn (the PlayerGui's GuiObjects
+with their absolute rects, text, images, strokes, corners and gradients). The explorer replays them. Who gets it is the
+built-in experiment `tt_extended_recording` (`["off", "on"]`): a recorded session of a player with under
+`extended.maxPlaytime` (60 s) of total playtime is assigned a variant, both arms are stamped (`off` is the control for
+the FPS comparison: the client `tech` row's `fps` by arm, plus the recorder's own `xb`, `xms`, `xmax`, `xui`), and `on`
+records for `extended.seconds` (300) after the first input. No experiment in the settings: nobody. Paused while the
+player is AFK. The dials are the settings' `extended` (SCHEMA.md "Sink settings"); `"dryRun": true` builds everything
+and sends only the counters. A 10% rollout, in `backend.analytics`:
+
+```json
+{ "experiments": { "tt_extended_recording": { "weights": [9, 1] } }, "extended": { "dryRun": false } }
+```
+
+What it follows besides players is up to the game, through the `replay` namespace (client and server; no tags, a
+list in the framework; each call returns a cleanup for a trove):
+
+```ts
+import { replay } from "@typetorch/framework";
+
+replay.track(bossModel, "boss"); // a Model or BasePart, as a kind (1-32 of letters, digits, _ - .)
+replay.trackChildren(Workspace.Mobs, "zombie"); // every Model with a Humanoid / Animator / AnimationController under it
+replay.setAfk(player, true); // server: the game's own AFK state (a lobby AFK toggle); the extended streams pause
+replay.active(); // client: the extended streams record me now (dry runs too; false while AFK)
+```
+
+- Server calls reach every client through the framework's own replicated list (`ReplicatedStorage.TypeTorchReplay`,
+  ObjectValues: the instance and the kind; models that stream in later still arrive); `trackChildren` mirrors the
+  container once and each client follows its children. Client calls are that client's own (client-drawn mobs).
+- The list belongs to the generation: a hot swap drops it and the game's new code registers again.
+- The recorder keeps the `entMax` (24) nearest within `entRadius` (150 studs) of the camera; animations come from
+  `Animator.AnimationPlayed` and the tracks' `Stopped` (signals, no polling). The UI is polled in time slices of
+  `uiBudgetMs` (0.25 ms a frame; phones and tablets 0.6 of it), halved under 30 fps and paused under 20: the
+  MicroProfiler labels are `TT.ext`, `TT.ext.ui`, `TT.ext.ent`, `TT.ext.pose`.
+
 **Settings, framework 0.4.0 / kernel 0.4.0 (plans/21):** the record's `backend` = `{ url, key, ingest?, analytics?: { flushSeconds,
-recordShare, recordSeconds, positions, techEvery, experiments, joinLaunchPrefix, joinData } }` is the whole sink: DuckDB
+recordShare, recordSeconds, positions, techEvery, experiments, joinLaunchPrefix, joinData, extended } }` is the whole sink: DuckDB
 at `<url>/v1/ingest` with the one key (Basin identities to `<url>/v1/identity`). Framework 0.7.2 (plans/35): an
 optional `backend.ingest` URL (separate ingest servers, `typetorch backend setup --ingest <url>`, CLI 0.19.0) sends the
 events to `<ingest>/v1/ingest` with the same key; the kernel and everything else keep `url`. A bad `ingest` value
 falls back to `<url>/v1/ingest` and the server warns once. `typetorch backend setup` writes it
 (`--flush-seconds`, `--record-share`; `writeBackendSettings()` in `@typetorch/backend` runs it, and `bun run local`
 too), and `typetorch experiment` writes `experiments`. The other dials (`recordSeconds`, `positions`, `techEvery`,
-`joinLaunchPrefix`, `joinData`) have no CLI writer yet: `backend setup` keeps them when the record has them, and
+`joinLaunchPrefix`, `joinData`, `extended`) have no CLI writer yet: `backend setup` keeps them when the record has them, and
 `positions` can be set in code with the engine option. The old `analytics` value below is read while `backend` is
 missing, and stays the way to a Basin sink. The engine also tells the kernel each player's pid (`setAnalyticsId`: the
 kernel's error reports count affected players by pid, never by name) and counts its own DataStore and HTTP requests

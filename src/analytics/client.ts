@@ -29,7 +29,8 @@ import {
 	type ServerHello,
 } from "./protocol";
 import { characterPosition, withPosition } from "./position";
-import { optionPositions, parsePositionNames } from "./settings";
+import { optionPositions, parseExtended, parsePositionNames } from "./settings";
+import { ExtRecorder, type ExtClientState } from "./ext-recorder";
 import { encodeProps, scrubNames } from "./props";
 import type { AnalyticsOptions, DeviceKind, EventKind, ExperimentOverride } from "./schema";
 
@@ -74,6 +75,8 @@ interface ClientStore {
 	loadSent: boolean;
 	errorsSent: number;
 	rec: RecordingClientState;
+	/** plans/36: the extended recording (missing in stores from older frameworks). */
+	ext?: ExtClientState;
 }
 
 type Held = [clock: number, kind: string, name: string, props: string];
@@ -280,6 +283,8 @@ class Recorder {
 	private readonly hovers = new Map<string, number>();
 	private readonly sticks = new Map<Enum.KeyCode, boolean>();
 	private done = false;
+	/** Called once when the recording ends (the extended recording ends with it). */
+	onFinish?: (why: string) => void;
 
 	constructor(
 		parent: Trove,
@@ -321,6 +326,7 @@ class Recorder {
 		this.done = true;
 		this.state.ended = true;
 		this.trove.destroy();
+		this.onFinish?.(why);
 	}
 
 	event(kind: EventKindCode, text?: string) {
@@ -508,6 +514,7 @@ export class ClientAnalytics {
 	private heldBytes = 0;
 	private readonly experimentsSent = new Set<string>();
 	private recorder?: Recorder;
+	private ext?: ExtRecorder;
 	private screens?: ScreenTracker;
 	private activity = "";
 	private manualScreen = "";
@@ -540,6 +547,7 @@ export class ClientAnalytics {
 			TypeTorch.onSwapOut(() => {
 				this.sendHeld();
 				this.recorder?.rotate(false, "swap");
+				this.ext?.swapOut();
 			}),
 		);
 		this.startSending();
@@ -576,6 +584,7 @@ export class ClientAnalytics {
 			tech: typeIs(raw.tech, "number") ? math.clamp(raw.tech, 15, 3600) : 60,
 			exps,
 			rsec: recordWindow(raw.rsec),
+			ext: typeIs(raw.ext, "table") ? parseExtended(raw.ext, []) : undefined,
 		};
 		this.settingsPositions = parsePositionNames(raw.pos) ?? new Set();
 		this.store.loadSent = true;
@@ -589,9 +598,24 @@ export class ClientAnalytics {
 				this.hello.rsec,
 			);
 			this.recorder = recorder;
+			recorder.onFinish = (why) => this.ext?.finish(why);
 			recorder.start(this.playerGui ?? Players.LocalPlayer.FindFirstChildOfClass("PlayerGui"));
 			if (this.screens && this.screens.current !== "") recorder.event(EventKindCode.ScreenOpen, this.screens.current);
 		}
+		this.startExtended();
+	}
+
+	/** plans/36: the extended recording, next to a running tt-rec-1 recording, when the hello carries its dials. */
+	private startExtended() {
+		const dials = this.hello?.ext;
+		if (!dials || !this.recorder || this.ext || this.stopped || this.options.recording === false) return;
+		const state = (this.store.ext ??= { started: false, ended: false, chunk: 0, bytes: 0 });
+		if (state.ended) return;
+		const ext = new ExtRecorder(this.trove, state, dials, deviceInfo().dev, (chunk, age, n, data, last, why) =>
+			this.dispatcher.kernel.send(CHANNEL, "xrec", chunk, age, n, data, last, why),
+		);
+		this.ext = ext;
+		ext.start(this.playerGui ?? Players.LocalPlayer.FindFirstChildOfClass("PlayerGui"));
 	}
 
 	private sendHeld() {
@@ -768,6 +792,8 @@ export class ClientAnalytics {
 					frames = 0;
 					since = os.clock();
 					const [pingOk, ping] = pcall(() => Players.LocalPlayer.GetNetworkPing());
+					// plans/36: the extended recorder's cost while it runs (dry runs too).
+					const ext = this.ext?.takeStats();
 					this.push(
 						"tech",
 						"client",
@@ -775,6 +801,10 @@ export class ClientAnalytics {
 							fps: math.floor(fps + 0.5),
 							mem: math.floor(Stats.GetTotalMemoryUsageMb() / 10 + 0.5) * 10,
 							ping: pingOk ? math.floor(ping * 1000) : undefined,
+							xb: ext?.xb,
+							xms: ext?.xms,
+							xmax: ext?.xmax,
+							xui: ext?.xui,
 						}),
 					);
 				}

@@ -6,14 +6,15 @@
  *                     "ev", ClientEvent[]                       a batch of events (at most CLIENT_BATCH_MAX)
  *                     "exp", name, variants                     the client evaluated an experiment
  *                     "rec", chunk, ageMs, n, data, last, why   one tt-rec-1 chunk of the first-session recording
+ *                     "xrec", chunk, ageMs, n, data, last, why  one tt-ext-1 chunk of the extended recording (plans/36)
  *   server -> client  "hi", ServerHello                         pid, recording on/off and window, tech interval,
- *                                                               experiments, position event names
+ *                                                               experiments, position event names, extended dials
  *
  * Event times travel as ages (ms before the send) and the server subtracts them from its own clock, so client clocks
  * never matter.
  */
 
-import type { DeviceKind, ExperimentOverride } from "./schema";
+import type { DeviceKind, ExperimentOverride, ExtendedSettings } from "./schema";
 
 export const CHANNEL = "__tt/an";
 
@@ -24,6 +25,9 @@ export const CLIENT_BATCH_BYTES = 12000;
 export const CHUNK_TARGET_BYTES = 6000;
 export const CHUNK_MAX_BYTES = 16384;
 export const CHUNK_SECONDS = 10;
+/** tt-ext-1 chunks (plans/36): cut at about this size or every CHUNK_SECONDS; the server refuses larger ones. */
+export const EXT_CHUNK_TARGET_BYTES = 24576;
+export const EXT_CHUNK_MAX_BYTES = 32768;
 
 export interface HelloInfo {
 	dev: DeviceKind;
@@ -87,6 +91,11 @@ export interface ServerHello {
 	rsec?: number;
 	/** The settings' `positions`: event names whose game-code events carry the local player's position. */
 	pos?: string[];
+	/**
+	 * plans/36: present when this session also records the extended streams (tt-ext-1): the `analytics.extended` dials.
+	 * `rsec` is then `ext.seconds`.
+	 */
+	ext?: ExtendedSettings;
 }
 
 const DEVICES = new Set<string>(["desktop", "phone", "tablet", "console", "vr", "unknown"]);

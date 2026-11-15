@@ -36,7 +36,9 @@ Integers are written with every digit (never exponent notation).
 
 ### recordings
 
-First-ever-session detail, one row per packed chunk.
+First-ever-session detail, one row per packed chunk: `tt-rec-1` (always, when the session is recorded) and, for
+extended sessions (plans/36), `tt-ext-1` rows next to them (same `sid`, their own `chunk` counter). Queries that read
+one codec filter on `codec`.
 
 | Column | Type | Meaning |
 |---|---|---|
@@ -46,10 +48,10 @@ First-ever-session detail, one row per packed chunk.
 | `sid` | string | As events |
 | `job` | string | As events |
 | `art` | string | As events |
-| `chunk` | int32 | 0, 1, 2... per session (a gap means a chunk was lost) |
-| `codec` | string | `tt-rec-1` |
-| `data` | string | Standard base64 (padded) of the packed chunk, layout below |
-| `n` | int32 | Position samples in the chunk (`Sample` + `Camera` records) |
+| `chunk` | int32 | 0, 1, 2... per session and codec (a gap means a chunk was lost) |
+| `codec` | string | `tt-rec-1`, or `tt-ext-1` (the extended recording) |
+| `data` | string | Standard base64 (padded) of the packed chunk, layouts below |
+| `n` | int32 | tt-rec-1: position samples in the chunk (`Sample` + `Camera` records); tt-ext-1: records in the chunk |
 
 ## Event catalog
 
@@ -65,7 +67,7 @@ First-ever-session detail, one row per packed chunk.
 | feedback | `submit` | Player feedback (plans/32): `TypeTorch.feedback().submit(player, ...)`, checked and written by the game server (a client never writes this kind; no UserId or username: pid → user through the identity store). `scale` (the configured scale's id, e.g. `faces5`, `stars5`; text-only rows carry it too), `type` (`thumbs`, `stars`, `scale`), `steps` (thumbs 2, stars / scale 2..10), `r?` (thumbs `0` down / `1` up; stars / scale `1..steps`; left out for text-only feedback), `norm?` (`r` on 0..1: thumbs `r`, else `(r-1)/(steps-1)`, 4 decimals; with `r`), `label?` (the step's label from the config, when the scale has labels and `r` is set), `text?` (control and invisible format characters stripped, whitespace runs collapsed to one space, trimmed; at most `maxText` characters (default 1000) and at most 2000 UTF-8 bytes, never half a code point, cut further only if JSON escapes would push the row past 4096 bytes), `len` (the original text's length in characters before sanitising and the cap; `0` when no text is left), `topic?` (1-32 of `[a-z0-9_]`, e.g. `bug`, `idea`), `play_s` (whole seconds since the session's join), `ctx?` (the game's context: at most 8 keys of 1-24 `[a-z0-9_]`, values string (at most 64 characters) / number / boolean). The scale comes from the settings record's `game.feedback` (else the game's `configure`, else `{ id: "stars5", type: "stars", steps: 5 }`). Older `custom` / `feedback` rows (`rating`, `text`, `length`) are read as scale `legacy_faces5` by the backend |
 | session | `leave` | `secs` (session length), `why`: `left`, `shutdown`, `gone` (left while no generation ran the engine), `swap60?` (left within 60 s of a hot swap), `trust?` (Player.DeviceTrustLevel at the leave: `Pending` (never settled; always in Studio), `Unknown`, `None`, `Standard`, `Full`; missing on engines without it) |
 | tech | `server` | Every `techEvery` s: `fps` (physics), `hb` (Heartbeat rate), `mem` (MB, 10s), `players`, `ping50?`, `ping90?` (ms), `q`, `qr` (queued events, recordings), `dropped`, `sent`, `fails`, `health?`, `errors?` (kernel 0.3.2 health) |
-| tech | `client` (src client) | Every `techEvery` s: `fps`, `mem` (MB, 10s), `ping?` (ms) |
+| tech | `client` (src client) | Every `techEvery` s: `fps`, `mem` (MB, 10s), `ping?` (ms); while an extended recording runs (dry runs too, plans/36): `xb` (tt-ext-1 bytes built per second over the period), `xms` (the recorder's ms per second, all streams), `xmax` (its worst single frame, ms), `xui` (visible UI nodes) |
 | tech | `load` (src client) | `secs`: from the client starting to the engine starting (first client generation only) |
 | tech | `error` | Server or client (src). `msg` (first 300 chars, player names replaced by `<player>`), `n` (times in the window). At most 10 per tech tick (server), 5 per 30 s and 100 per session (client) |
 | tech | `start` | First generation of a server that runs the engine: `gen`, `kernel`, `load?` |
@@ -77,7 +79,9 @@ First-ever-session detail, one row per packed chunk.
 | state | `activity` | `to`, `from` (server or client src) |
 | state | `screen` | `to`, `from` (`""` = none). Client: ScreenGuis in PlayerGui (Enabled), GuiObjects tagged `TTScreen` (Visible), `screen()` |
 | experiment | `<experiment>` | `variant`, `variants` (count), `vi` (the variant's 1-based position in the game's list; 0.7.1+), `forced?` (the settings or the player's own dev pick chose it). Once per session when assigned or changed, and again when the same variant becomes or stops being forced. At most 32 experiments per session: a 33rd `experiment()` returns the control (the first variant) and warns. A client's experiment calls count against its event budget (below) |
-| recording_meta | `start` | `share` (the recorded share then), `secs?` (the window then: `recordSeconds`; frameworks before it leave it out and used 60) |
+| recording_meta | `start` | `share` (the recorded share then), `secs?` (the window then: `recordSeconds`, or `extended.seconds` for an extended session; frameworks before it leave it out and used 60) |
+| recording_meta | `ext_start` | plans/36, the first tt-ext-1 chunk arrived: `secs` (`extended.seconds`) |
+| recording_meta | `ext_end` | `chunks`, `bytes`, `why`: as `end`'s (`window`, `left`, `cap` = 2 MB or 200 chunks, `end`) |
 | recording_meta | `end` | `chunks`, `bytes`, `why`: `window` (`recordSeconds`, default 60 s, after the first input), `cap` (10 min, or the recording's 256 KB / 80 chunks), `left`, `end` |
 | fleet | `heartbeat` | The kernel's `fleetStatus()` (kernel 0.3.2+), every 60 ± 10 s and once at each generation start. pid `""` |
 | fleet | `deploy_report` | One kernel deploy report `{s, b, a, j, r, e?, d?, t, g, k, p}` (r: `swapped`, `failed`, `rolled_back`, `skipped`, `booted`), once per (s, j, r) per server, across generations. pid `""` |
@@ -147,6 +151,96 @@ start, i.e. the row's `t`). Time is the running sum of `dt`.
   recorded player (the time before the first input adds to it), 300 about 55-70 KB, and 600 about 110-135 KB of
   chunk bytes, inside the 256 KB cap (the cap counts chunk bytes, not base64).
 
+## tt-ext-1
+
+The extended recording (plans/36): poses, other players and tracked models, their animations, and the UI tree, in
+rows next to tt-rec-1. tt-rec-1 itself is unchanged (an extended session's tt-rec-1 window is `extended.seconds`).
+
+Row: as tt-rec-1 (`v` 1, `t` chunk start unix ms, `pid`, `sid`, `job`, `art`, `chunk`, `codec` = `tt-ext-1`, `data`
+base64, `n` = number of records in the chunk, String and Wait records included). `chunk` is tt-ext-1's own counter (0, 1,
+2... per session). Little-endian throughout. Reference encoder and decoder: `ext-codec.ts` (`ExtWriter`,
+`decodeExtChunk`); tests: `scripts/test-analytics.luau` (every record type) and `scripts/test-analytics-ext.luau` (the
+recorder in a mock world).
+
+Header (4 bytes): `u8 version` (1), `u8 flags` (bit 0: last chunk; bit 1: the chunk starts with a Keyframe), `u16 0`.
+
+Records: `u8 tag, u16 dt` (ms since the previous record; the first since the row's `t`; a gap over 65535 ms is a Wait
+record), `u16 length` (payload bytes: a decoder skips unknown tags by it), then the payload.
+
+**Segments**: a Keyframe record (tag 2) starts a segment: the string table, the Anchor, the entities (with their rigs
+and playing animations) and the UI tree are cleared, and the full state follows (View, Anchor, every Rig with a full
+Pose, Spawn, Look, playing Anim, the whole UI tree, the UI tree possibly over several frames). A Keyframe at the start,
+then every `uiKeyframeSeconds` (60), when an AFK pause ends, and at a hot swap (the new client generation starts with
+one; the old one writes a Gone for every entity first). A Keyframe is always the first record of its chunk (the
+recorder cuts the chunk before it), so a decoder can start at any chunk whose flag bit 1 is set. Chunks are cut about
+every 10 s or 24 KB (at most 32 KB: the server refuses larger ones).
+
+| Tag | Record | Payload |
+|---|---|---|
+| 0 | Wait | none (`dt` 65535, `length` 0) |
+| 1 | String | `u16 id`, UTF-8 bytes (the rest of the payload; at most 1000 bytes, cut at a character boundary). Ids count from 0 per segment; a string is defined once per segment, before the first record that uses it. String id 65535 = none |
+| 2 | Keyframe | `u16 0` (reserved) |
+| 3 | View | `u16 viewport w, u16 h` (px), `u16 inset top` (GuiService:GetGuiInset() top-left Y, px), `u8 fov` (degrees), `u8 fps` (the client's fps over the last second, max 255). Written at a Keyframe, on any change, and once a second for fps |
+| 4 | Afk | `u8 1` = AFK from here (every other stream pauses), `u8 0` = back (a Keyframe follows at once, in the next chunk) |
+| 5 | Anchor | `f32 x, y, z`: origin for Move positions in this segment (whole studs: the camera's position at the Keyframe; a new Anchor at the camera when a position leaves ±4095 studs) |
+| 6 | Rig | `u8 entity` (0 = the recorded player), `u8 rig` (0 none, 1 R6, 2 R15: the Humanoid's RigType; 3 other: no Humanoid), `u8 n` (at most 32), `n × u16` string ids: the Motor6D names in the order Pose uses: the standard ones first (R6: RootJoint, Neck, Left Shoulder, Right Shoulder, Left Hip, Right Hip; R15: Root, Waist, Neck, LeftShoulder, LeftElbow, LeftWrist, RightShoulder, RightElbow, RightWrist, LeftHip, LeftKnee, LeftAnkle, RightHip, RightKnee, RightAnkle; those present), then any other Motor6D (a weapon's joint). Re-sent (with a full Pose) when the character's Motor6Ds change |
+| 7 | Pose | `u8 entity`, `u32 mask` (bit i = joint i of the Rig), per set bit 4 bytes: the joint's `Motor6D.Transform` rotation as smallest-three: `u32 = idx \| (a << 2) \| (b << 12) \| (c << 22)`, `idx` (0..3) the dropped (largest-magnitude) component of (x, y, z, w) with the quaternion's sign flipped so it is positive, `a, b, c` the other three in order, each `round((v / 0.70710678 + 1) / 2 × 1023)` (round half up; decode `v = (q / 1023 × 2 - 1) × 0.70710678`, the dropped one `sqrt(1 - a² - b² - c²)`; ~0.25° worst error). Only joints that moved over ~2° since the last Pose (all of them after a Rig or Keyframe); every tick (`hz`) |
+| 8 | Spawn | `u8 entity` (1..255; reused only after a Gone), `u16 kind` string id (`player` for another player's character, else the game's `replay.track` kind), `u8 flags` (bit 0 has a Humanoid, bit 1 another player's character), `f32 x, y, z` (pivot), `u8 yaw`, `u16 size x, y, z` (the model's extents, 1/8 stud) |
+| 9 | Look | `u8 entity`, `u8 flags` (bit 0 body colours follow), [`18 bytes`: BodyColors RGB head, torso, left arm, right arm, left leg, right leg], `u8 n`, `n × (u8 slot, u16 string id)`: slot 1 Shirt template, 2 Pants template, 3 ShirtGraphic (T-shirt) graphic, 4 face texture. Only for tracked models with a Humanoid (never other players: they stay the default avatar), and only when there is something to say |
+| 10 | Move | `u8 count`, `count × (u8 entity, i16 x, i16 y, i16 z, u8 yaw)`: positions 1/8 stud from the Anchor; only entities that moved over 1/8 stud or turned, every tick; at least every 5 s |
+| 11 | Gone | `u8 entity` (left the radius or the `entMax` nearest, destroyed, untracked, or a hot swap) |
+| 12 | AnimPlay | `u8 entity`, `u16 track` (the recorder's id for this AnimationTrack, per entity, from 0; a track played again after it stopped gets a new id), `u16 animation` string id (the Animation's AnimationId, e.g. `rbxassetid://180426354`), `i16 speed × 100`, `u8 weight × 255` (WeightTarget, 0..1), `u8 flags` (bit 0 looped), `u16 time position × 100` (s, capped at 655.35). From Animator.AnimationPlayed, and for every track still playing at a Spawn or a Keyframe |
+| 13 | AnimStop | `u8 entity`, `u16 track` (the track's Stopped) |
+| 14 | AnimAdjust | `u8 entity`, `u16 track`, `i16 speed × 100`, `u8 weight × 255` (AdjustSpeed / AdjustWeight, seen at the next tick) |
+| 20 | UiNode | a node becomes visible (or is re-sent after a Keyframe): `u16 id`, `u16 parent` (65535 = none: a ScreenGui), `u8 class`, `u16 mask`, then the fields below for every set bit, in bit order |
+| 21 | UiProps | `u16 id`, `u16 mask`, the changed fields in bit order |
+| 22 | UiGone | `u16 id` (removed, or no longer visible: Visible false, an ancestor hidden, the ScreenGui disabled). A node that goes hidden gets one, and so does each of its descendants that was visible |
+
+Yaw bytes as tt-rec-1: `b / 256 × 2π - π` radians, 0 = facing -Z.
+
+UI classes: 0 ScreenGui (its `order` field = DisplayOrder; rect = the screen), 1 Frame, 2 TextLabel, 3 TextButton, 4
+TextBox, 5 ImageLabel, 6 ImageButton, 7 ScrollingFrame, 8 ViewportFrame (drawn as an empty box), 9 CanvasGroup, 10
+VideoFrame (empty box). Other GuiObjects as 1. Recorded: every enabled ScreenGui in PlayerGui except the framework's own
+(`TypeTorch*`) and Roblox's `Freecam`, `BubbleChat`, `Chat`, `ProximityPrompts`, `RbxCameraUI`; GuiObjects inside
+Folders count as children of the nearest GuiObject above. At most 4000 nodes; ids are reused after a UiGone.
+
+UI fields (mask bits). A UiNode sends the fields of its class: a ScreenGui `rect` and `order`; every GuiObject
+`rect`, `order`, `background`; text classes `text` and `textStyle`; image classes `image` and `imageStyle`. The rest
+only when not at their default, which a decoder assumes when they are missing: `rotation` 0, `imageRect` all 0,
+`stroke` none, `corner` 0, `clip` 0, `gradient` none. A UiNode never sets bit 11 (its parent is in the header).
+
+| Bit | Field | Bytes |
+|---|---|---|
+| 0 | rect | `i16 x, i16 y, u16 w, u16 h`: AbsolutePosition / AbsoluteSize (px) |
+| 1 | rotation | `i16` AbsoluteRotation × 10 |
+| 2 | order | `u16` draw order: a rank in the recorder's depth-first draw order over all recorded nodes (ScreenGuis by DisplayOrder, children by ZIndex then child order under ZIndexBehavior Sibling; under Global the ScreenGui's GuiObjects by ZIndex then tree order). Compare ranks only: they have gaps (hidden nodes keep theirs). A ScreenGui: its DisplayOrder |
+| 3 | background | `u8 r, g, b, u8 transparency × 255` |
+| 4 | text | `u16` string id (Text as set; RichText markup kept) |
+| 5 | textStyle | `u8 r, g, b, u8 transparency × 255, u8 size` (TextSize; TextBounds.Y when TextScaled), `u16 family` string id (FontFace.Family), `u16 weight` (FontFace.Weight value), `u8 xAlign` (0 left, 1 centre, 2 right), `u8 yAlign` (0 top, 1 centre, 2 bottom), `u8 flags` (bit 0 scaled, bit 1 wrapped, bit 2 rich text), `u8 stroke transparency × 255` (TextStrokeTransparency), `u8 stroke r, g, b` |
+| 6 | image | `u16` string id (Image as set, e.g. `rbxassetid://123`) |
+| 7 | imageStyle | `u8 r, g, b` (ImageColor3), `u8 transparency × 255`, `u8 scaleType` (Enum.ScaleType value) |
+| 8 | imageRect | `u16 offset x, y, size x, y`, `u16 slice x0, y0, x1, y1` (SliceCenter; all 0 = none) |
+| 9 | stroke | the border: `u8 r, g, b, u8 transparency × 255, u8 thickness × 4`. A UIStroke (enabled; on a text object only with ApplyStrokeMode Border), else the classic border when BorderSizePixel > 0 (BorderColor3, BackgroundTransparency, BorderSizePixel). Thickness 0 = none |
+| 10 | corner | `u8` UICorner radius in px (Scale × min(w, h) + Offset) |
+| 11 | parent | `u16` (UiProps only: reparented) |
+| 12 | clip | `u8` ClipsDescendants (ScrollingFrame / CanvasGroup always clip) |
+| 13 | gradient | UIGradient (enabled): `u8 n` keypoints (at most 20) × (`u8 time × 255, u8 r, g, b`), `i16 rotation` (whole degrees). n 0 = none (drawn as a CSS gradient) |
+
+How the UI is read (the cost): structure from one DescendantAdded / DescendantRemoving pair per ScreenGui (no
+per-instance Changed connections); properties polled at `hz` and diffed, time-sliced to `uiBudgetMs` per frame (0.6 of
+it on phones and tablets); rect, rotation, background, text, text colour and size, image and image colour every pass,
+the rest (fonts, alignment, flags, text stroke, scale type, slices, stroke, corner, clip, gradient, ZIndex) every 4th
+pass per node, so such a change can show up ~1 s late. Under 30 fps the UI passes halve, under 20 they pause.
+
+Who and when: sessions recorded by tt-rec-1 whose player is eligible (total playtime under `maxPlaytime` at the join:
+the player record's `play`; a first visit is 0; a record without `play` is unknown and not eligible) and whose variant
+of the built-in experiment `tt_extended_recording` (variants `["off", "on"]`, set in the settings' `experiments`) is
+`on`. Both arms are stamped in `exp`, so `off` is the control. No `tt_extended_recording` in `experiments`: nobody.
+The extended recording runs from the hello until `extended.seconds` after the first input (its tt-rec-1 stream runs as
+long), and ends with tt-rec-1 (`why` as tt-rec-1's) or at 2 MB / 200 chunks (`cap`). AFK (no key, click, tap, gamepad
+button or stick for `afkSeconds` and the character not moving over 0.5 studs, or the game's `replay.setAfk`): one Afk
+record and nothing else until the player is back; a session AFK from the start writes nothing until then.
+
 ## Sink settings
 
 Server-only, from the signed settings record (kernel 0.3.8, plans/20; before 0.3.8 the ConfigService key
@@ -161,7 +255,7 @@ Server-only, from the signed settings record (kernel 0.3.8, plans/20; before 0.3
   (`backend` can't describe Basin streams). `backend setup` also derives a `duckdb` copy of it for frameworks before
   0.4. CLI 0.9 removed `typetorch settings set analytics` (it now points to `backend setup`), so a Basin sink has no CLI
   writer.
-- **No CLI writer yet** for `recordSeconds`, `positions`, `techEvery`, `joinData` and `joinLaunchPrefix`: they keep
+- **No CLI writer yet** for `recordSeconds`, `positions`, `techEvery`, `joinData`, `joinLaunchPrefix` and `extended`: they keep
   their defaults unless the record already holds them (`backend setup` keeps the existing `backend.analytics` fields),
   or the game passes `new AnalyticsEngine({ settings })`. `positions` can also be set in code with the engine option of
   the same name. `identity` and `identityToken` (Basin only) live in the old `analytics` value, which has no CLI writer
@@ -178,7 +272,8 @@ Server-only, from the signed settings record (kernel 0.3.8, plans/20; before 0.3
   "recordSeconds": 60,
   "positions": ["down", "death_final", "round_result"],
   "techEvery": 60,
-  "experiments": { "onboarding": { "active": true, "weights": [1, 1], "variant": "short", "players": { "123456": "long" } } }
+  "experiments": { "onboarding": { "active": true, "weights": [1, 1], "variant": "short", "players": { "123456": "long" } } },
+  "extended": { "seconds": 300, "dryRun": true }
 }
 ```
 
@@ -197,6 +292,7 @@ Server-only, from the signed settings record (kernel 0.3.8, plans/20; before 0.3
 | `identity` | the settings' `fleet` url + `/v1/identity` | basin: where identity rows go (below); none and no `fleet` in the settings: not sent. duckdb: unused |
 | `identityToken` | the settings' `fleet` token | basin: the token for `identity`. Never logged |
 | `joinData` | `"full"` | `"full"`: the join row carries `jd` (below); `"summary"`: no `jd`; `"off"`: no `jd` and only the pre-plans/29 join props (no pid lookups). Anything else is an error line (warned) and means `"full"`. In `backend.analytics` (or the old `analytics` value) |
+| `extended` | defaults | plans/36, framework 0.7.2: the extended recording's dials (tt-ext-1 above); every field optional, a bad one is an error line and keeps its default: `seconds` (300, 10..600: after the first input; the session's tt-rec-1 window too), `maxPlaytime` (60 s of total playtime at the join), `afkSeconds` (30, 5..600), `hz` (3.33, 1..10: Pose / Move / UI polls a second), `entMax` (24, 0..255), `entRadius` (150 studs, 10..2000), `uiBudgetMs` (0.25 ms a frame, 0.05..4; phones and tablets 0.6 of it), `uiKeyframeSeconds` (60, 10..600), `dryRun` (false: true builds everything and sends nothing but the `tech` counters), `streams` (`{ pose, ent, ui, view }`, each true / false, default true). Who records: the experiment `tt_extended_recording` (`["off", "on"]`) in `experiments`, e.g. `"tt_extended_recording": { "weights": [9, 1] }`; without it nobody does. Sent to the client in the hello |
 | `joinLaunchPrefix` | false | true: the join row's `launch` keeps the first 32 characters of the game's own launch data (off: only `launch_len`). Set it in `backend.analytics` (or the old `analytics` value) |
 
 Unknown fields are ignored. Settings errors are warned once (never with the token).
@@ -254,9 +350,11 @@ No other player's UserId is ever in `jd`. Example (Roblox dropped a notification
 
 ## Player ids
 
-DataStore `TypeTorchAnalytics`, key `p/<UserId>` -> `{ "pid": "<32 hex>", "first": <unix s>, "last": <unix s> }`.
-One read per join (with retries), a write on the first join (UpdateAsync, keeps a pid another server wrote first) and
-one at leave (`last`). A Right to Erasure request deletes the key, which leaves the player's rows anonymous. The
+DataStore `TypeTorchAnalytics`, key `p/<UserId>` -> `{ "pid": "<32 hex>", "first": <unix s>, "last": <unix s>, "play":
+<s> }`. One read per join (with retries), a write on the first join (UpdateAsync, keeps a pid another server wrote
+first) and one at leave (`last`, and the session's seconds added to `play` in the same UpdateAsync). `play` (framework
+0.7.2) is the total playtime: a new record starts at 0; a record from an older framework has none and gets none
+(unknown, never guessed). A Right to Erasure request deletes the key, which leaves the player's rows anonymous. The
 analytics server also keeps pid -> UserId from identity rows (above), which its erasure webhook uses and deletes.
 
 ## Suggested Basin stream schemas

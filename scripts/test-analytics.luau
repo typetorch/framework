@@ -680,6 +680,237 @@ local badNames = S.parseSettings({ backend = "duckdb", events = "https://a.examp
 check("settings positions: bad list is an error, none used", isEmpty(badNames.settings.positions) and #badNames.errors == 1)
 check("settings positions: none by default", isEmpty(window(nil).settings.positions))
 
+-- tt-ext-1 (plans/36): every record type through the writer and the reference decoder ---------------------------------
+local X = load("analytics/ext-codec.luau")
+do
+	local w = X.ExtWriter.new(64) -- small: the buffer must grow
+	w:keyframe(0)
+	w:view(5, 1920, 1080, 58, 70, 61)
+	w:afk(10, true)
+	w:afk(20, false)
+	w:anchor(25, 100.25, -20.5, 3000.75)
+	w:rig(30, 0, 1, { "RootJoint", "Neck", "Left Shoulder", "Right Shoulder", "Left Hip", "Right Hip" }, 6)
+	local qa = X.packQuat(0, 0, 0, 1)
+	local half = math.sqrt(0.5)
+	local qb = X.packQuat(0, half, 0, half) -- 90 degrees about Y
+	w:pose(40, 0, 2 ^ 1 + 2 ^ 4, { qa, qb }, 2)
+	w:spawn(50, 7, "zombie", 1, 110.5, -18, 3010, math.pi / 2, 4, 5.5, 2)
+	w:look(55, 7, { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18 }, { 1, 4 }, { "rbxassetid://111", "rbxassetid://222" }, 2)
+	w:look(56, 8, nil, {}, {}, 0)
+	w:moveBegin(60, 2)
+	w:moveEntry(7, 101.25, -20.5, 3001, 0)
+	w:moveEntry(8, 100.25 - 4000, -20.5, 3000.75 + 4000, -math.pi / 2)
+	w:gone(65, 8)
+	w:animPlay(70, 7, 3, "rbxassetid://180426354", 1.5, 0.5, true, 2.25)
+	w:animAdjust(80, 7, 3, -0.75, 1)
+	w:animStop(90, 7, 3)
+	local v = X.newUiValues()
+	v.x, v.y, v.w, v.h = -10, 20, 300, 40
+	v.rot, v.order = 455, 12
+	v.bgR, v.bgG, v.bgB, v.bgT = 10, 20, 30, 128
+	v.text = "Coins: <b>100</b>"
+	v.tR, v.tG, v.tB, v.tT, v.tSize = 255, 254, 253, 0, 24
+	v.family, v.weight, v.xAlign, v.yAlign, v.tFlags = "rbxasset://fonts/families/GothamSSm.json", 700, 0, 2, 5
+	v.sT, v.sR, v.sG, v.sB = 255, 1, 2, 3
+	v.image = "rbxassetid://123"
+	v.iR, v.iG, v.iB, v.iT, v.scaleType = 9, 8, 7, 6, 1
+	v.ioX, v.ioY, v.isX, v.isY, v.sx0, v.sy0, v.sx1, v.sy1 = 1, 2, 3, 4, 5, 6, 7, 8
+	v.kR, v.kG, v.kB, v.kT, v.kW = 50, 60, 70, 0, 6
+	v.corner, v.clip = 8, 1
+	v.grad, v.gradN, v.gradRot = { 0, 255, 0, 0, 255, 0, 0, 255 }, 2, -45
+	w:uiNode(100, 0, 65535, 0, 1 + 4, v)
+	w:uiNode(110, 1, 0, 5, 16383, v) -- every field (the Parent bit is dropped from a UiNode)
+	v.text = "Coins: 101"
+	v.parent = 3
+	w:uiProps(120, 1, 16 + 2048, v)
+	w:uiGone(130, 1)
+	w:afk(130 + 70000, true) -- a gap over 65535 ms: a Wait first
+	local chunk0 = w:take(false)
+	-- The next chunk: same segment (strings and anchor carry on), not a Keyframe.
+	w:animPlay(5, 7, 4, "rbxassetid://180426354", 1, 1, false, 0)
+	w:moveBegin(6, 1)
+	w:moveEntry(7, 100.25, -20.5, 3000.75, 0)
+	local chunk1 = w:take(true)
+	check("ext header", buffer.readu8(chunk0, 0) == 1 and buffer.readu8(chunk0, 1) == 2 and buffer.readu16(chunk0, 2) == 0, buffer.readu8(chunk0, 1))
+	check("ext header: last, no keyframe", buffer.readu8(chunk1, 1) == 1, buffer.readu8(chunk1, 1))
+	-- Byte layout by hand (little-endian, u8 tag, u16 dt, u16 length): the Keyframe and the View.
+	check("ext keyframe bytes", buffer.readu8(chunk0, 4) == 2 and buffer.readu16(chunk0, 5) == 0 and buffer.readu16(chunk0, 7) == 2 and buffer.readu16(chunk0, 9) == 0)
+	check(
+		"ext view bytes",
+		buffer.readu8(chunk0, 11) == 3 and buffer.readu16(chunk0, 12) == 5 and buffer.readu16(chunk0, 14) == 8 and buffer.readu16(chunk0, 16) == 1920 and buffer.readu16(chunk0, 18) == 1080
+			and buffer.readu16(chunk0, 20) == 58 and buffer.readu8(chunk0, 22) == 70 and buffer.readu8(chunk0, 23) == 61
+	)
+	check("smallest-three identity", qa == 3 + 512 * 4 + 512 * 4096 + 512 * 4194304, qa)
+	local state = X.newExtDecodeState()
+	local d0 = X.decodeExtChunk(chunk0, state)
+	local d1 = X.decodeExtChunk(chunk1, state)
+	check("ext decode flags", d0.keyframe == true and d0.last == false and d1.last == true and d1.keyframe == false)
+	local byTag = {}
+	for _, record in d0.records do
+		byTag[record.tag] = byTag[record.tag] or {}
+		table.insert(byTag[record.tag], record)
+	end
+	local function first(tag)
+		return byTag[tag] and byTag[tag][1]
+	end
+	local view = first(3)
+	check("ext View", view and view.at == 5 and view.w == 1920 and view.h == 1080 and view.inset == 58 and view.fov == 70 and view.fps == 61)
+	check("ext Afk", byTag[4] and #byTag[4] == 3 and byTag[4][1].afk == true and byTag[4][2].afk == false and byTag[4][3].at == 130 + 70000)
+	check("ext Wait before a long gap", first(0) ~= nil and first(0).at == 130 + 65535)
+	local anchor = first(5)
+	check("ext Anchor", anchor and near(anchor.position[1], 100.25, 1e-4) and near(anchor.position[2], -20.5, 1e-4) and near(anchor.position[3], 3000.75, 1e-3))
+	local rig = first(6)
+	check("ext Rig", rig and rig.entity == 0 and rig.rig == 1 and #rig.names == 6 and rig.names[1] == "RootJoint" and rig.names[6] == "Right Hip")
+	local pose = first(7)
+	check("ext Pose mask", pose and pose.mask == 18 and #pose.joints == 2 and pose.joints[1][1] == 1 and pose.joints[2][1] == 4)
+	check("ext Pose identity", pose and near(pose.joints[1][5], 1, 0.002) and near(pose.joints[1][2], 0, 0.002))
+	check("ext Pose 90 about Y", pose and near(pose.joints[2][3], half, 0.002) and near(pose.joints[2][5], half, 0.002))
+	local spawn = first(8)
+	check(
+		"ext Spawn",
+		spawn and spawn.entity == 7 and spawn.kind == "zombie" and spawn.flags == 1 and near(spawn.position[1], 110.5, 1e-4) and near(spawn.position[3], 3010, 1e-3)
+			and near(spawn.yaw, math.pi / 2, 0.03) and near(spawn.size[2], 5.5, 1e-6) and near(spawn.size[1], 4, 1e-6)
+	)
+	local look = first(9)
+	check("ext Look", look and look.entity == 7 and #look.colors == 18 and look.colors[18] == 18 and #look.slots == 2 and look.slots[1][1] == 1 and look.slots[1][2] == "rbxassetid://111" and look.slots[2][1] == 4)
+	check("ext Look without colours", byTag[9] and byTag[9][2].colors == nil and #byTag[9][2].slots == 0)
+	local move = first(10)
+	check("ext Move", move and #move.moves == 2 and move.moves[1][1] == 7 and near(move.moves[1][2], 101.25, 0.07) and near(move.moves[1][4], 3001, 0.07))
+	check("ext Move: far entity (within 4095)", move and near(move.moves[2][2], 100.25 - 4000, 0.07) and near(move.moves[2][4], 3000.75 + 4000, 0.07) and near(move.moves[2][5], -math.pi / 2, 0.03))
+	check("ext Gone", first(11) and first(11).entity == 8)
+	local play = first(12)
+	check("ext AnimPlay", play and play.entity == 7 and play.track == 3 and play.animation == "rbxassetid://180426354" and play.speed == 1.5 and near(play.weight, 0.5, 0.003) and play.looped == true and play.time == 2.25)
+	check("ext AnimAdjust", first(14) and first(14).speed == -0.75 and first(14).weight == 1)
+	check("ext AnimStop", first(13) and first(13).entity == 7 and first(13).track == 3)
+	local screen = byTag[20] and byTag[20][1]
+	check("ext UiNode screen", screen and screen.id == 0 and screen.parent == 65535 and screen.class == 0 and screen.mask == 5 and screen.rect[1] == -10 and screen.order == 12 and screen.background == nil)
+	local node = byTag[20] and byTag[20][2]
+	check("ext UiNode mask (no parent bit)", node and node.mask == 16383 - 2048, node and node.mask)
+	check("ext UiNode rect / rotation / order", node and node.rect[1] == -10 and node.rect[2] == 20 and node.rect[3] == 300 and node.rect[4] == 40 and node.rotation == 45.5 and node.order == 12)
+	check("ext UiNode background", node and node.background[1] == 10 and node.background[4] == 128)
+	check("ext UiNode text", node and node.text == "Coins: <b>100</b>" and node.textSize == 24 and node.family == "rbxasset://fonts/families/GothamSSm.json" and node.weight == 700 and node.yAlign == 2 and node.textFlags == 5 and node.stroke[2] == 1)
+	check("ext UiNode image", node and node.image == "rbxassetid://123" and node.imageColor[1] == 9 and node.scaleType == 1 and node.imageRect[4] == 4 and node.slice[4] == 8)
+	check("ext UiNode border / corner / clip", node and node.border[1] == 50 and node.border[5] == 1.5 and node.corner == 8 and node.clip == 1)
+	check("ext UiNode gradient", node and #node.gradient == 2 and node.gradient[1][1] == 0 and node.gradient[1][2] == 255 and node.gradient[2][1] == 1 and node.gradient[2][4] == 255 and node.gradientRotation == -45)
+	local props = first(21)
+	check("ext UiProps", props and props.id == 1 and props.mask == 16 + 2048 and props.text == "Coins: 101" and props.parent == 3)
+	check("ext UiGone", first(22) and first(22).id == 1)
+	-- Strings: defined once per segment, before their first use, ids from 0.
+	local strings = byTag[1]
+	check("ext strings once each", strings and strings[1].id == 0 and strings[1].text == "RootJoint")
+	local animSeen = 0
+	for _, record in strings do
+		if record.text == "rbxassetid://180426354" then
+			animSeen += 1
+		end
+	end
+	check("ext a repeated string is defined once", animSeen == 1)
+	-- Chunk 1: the segment's strings carry over (no String record for the repeated animation id).
+	check("ext next chunk reuses strings", #d1.records == 2 and d1.records[1].tag == 12 and d1.records[1].animation == "rbxassetid://180426354" and d1.records[1].at == 5)
+	check("ext next chunk keeps the anchor", near(d1.records[2].moves[1][2], 100.25, 0.07))
+	-- A Keyframe starts a new segment: strings again from id 0.
+	w:keyframe(0)
+	w:animPlay(1, 7, 4, "rbxassetid://180426354", 1, 1, false, 0)
+	local chunk2 = w:take(false)
+	local d2 = X.decodeExtChunk(chunk2, state)
+	check("ext keyframe resets strings", d2.keyframe and d2.records[2].tag == 1 and d2.records[2].id == 0 and d2.records[3].animation == "rbxassetid://180426354")
+	-- Unknown tags are skipped by their length.
+	local unknown = buffer.create(4 + 5 + 3 + 5 + 1)
+	buffer.writeu8(unknown, 0, 1)
+	buffer.writeu8(unknown, 4, 99)
+	buffer.writeu16(unknown, 7, 3)
+	buffer.writeu8(unknown, 12, 11)
+	buffer.writeu16(unknown, 15, 1)
+	buffer.writeu8(unknown, 17, 9)
+	local du = X.decodeExtChunk(unknown)
+	check("ext unknown tag skipped", #du.records == 2 and du.records[1].unknown == true and du.records[2].entity == 9)
+	local bad = buffer.create(4 + 5 + 1)
+	buffer.writeu8(bad, 0, 1)
+	buffer.writeu8(bad, 4, 11)
+	buffer.writeu16(bad, 7, 3) -- says 3 bytes, only 1 left
+	check("ext bad length refused", not pcall(X.decodeExtChunk, bad))
+end
+do
+	-- Smallest-three over many rotations: 10 bits a component is within ~0.25 degrees, any sign.
+	local worst = 0
+	local fits = true
+	local seed = 12345
+	local function rand()
+		seed = (seed * 1103515245 + 12345) % 2147483648
+		return seed / 2147483648
+	end
+	for _ = 1, 2000 do
+		local x, y, z, w = rand() * 2 - 1, rand() * 2 - 1, rand() * 2 - 1, rand() * 2 - 1
+		local length = math.sqrt(x * x + y * y + z * z + w * w)
+		x, y, z, w = x / length, y / length, z / length, w / length
+		local packed = X.packQuat(x, y, z, w)
+		if not (packed >= 0 and packed < 2 ^ 32 and packed % 1 == 0) then
+			fits = false
+		end
+		local a, b, c, d = X.unpackQuat(packed)
+		local dot = math.abs(a * x + b * y + c * z + d * w)
+		local angle = 2 * math.deg(math.acos(math.min(1, dot)))
+		worst = math.max(worst, angle)
+	end
+	check("packed fits u32", fits)
+	check("smallest-three error under 0.3 degrees", worst < 0.3, worst)
+	-- quatOf: a CFrame matrix (row-major) to the same rotation.
+	local angle = math.rad(70)
+	local c, s = math.cos(angle), math.sin(angle)
+	local qx, qy, qz, qw = X.quatOf(c, 0, s, 0, 1, 0, -s, 0, c) -- about Y
+	check("quatOf about Y", near(math.abs(qy), math.sin(angle / 2), 1e-6) and near(math.abs(qw), math.cos(angle / 2), 1e-6) and near(qx, 0, 1e-9) and near(qz, 0, 1e-9))
+	local rx, ry, rz, rw = X.quatOf(1, 0, 0, 0, -1, 0, 0, 0, -1) -- 180 about X (trace < 0)
+	check("quatOf 180 about X", near(math.abs(rx), 1, 1e-6) and near(ry, 0, 1e-6) and near(rz, 0, 1e-6) and near(rw, 0, 1e-6))
+	local ix, iy, iz, iw = X.quatOf(1, 0, 0, 0, 1, 0, 0, 0, 1)
+	check("quatOf identity", ix == 0 and iy == 0 and iz == 0 and iw == 1)
+	check("cutUtf8 keeps characters whole", X.cutUtf8("ab\u{e9}cd", 3) == "ab" and X.cutUtf8("ab\u{e9}cd", 4) == "ab\u{e9}" and X.cutUtf8("abc", 10) == "abc")
+	local long = X.ExtWriter.new()
+	local id = long:stringId(0, string.rep("x", 5000))
+	local decoded = X.decodeExtChunk(long:take(false))
+	check("strings cut to 1000 bytes", id == 0 and #decoded.records[1].text == 1000)
+end
+
+-- analytics.extended (plans/36): defaults, clamps, errors; eligibility -------------------------------------------------
+do
+	local defaults = S.parseExtended(nil, {})
+	check(
+		"extended defaults",
+		defaults.seconds == 300 and defaults.maxPlaytime == 60 and defaults.afkSeconds == 30 and defaults.hz == 3.33 and defaults.entMax == 24 and defaults.entRadius == 150
+			and defaults.uiBudgetMs == 0.25 and defaults.uiKeyframeSeconds == 60 and defaults.dryRun == false
+			and defaults.streams.pose and defaults.streams.ent and defaults.streams.ui and defaults.streams.view
+	)
+	local errors = {}
+	local parsed = S.parseExtended({ seconds = 5000, hz = 0, entMax = 300.7, dryRun = true, streams = { ui = false, view = "no" }, on = true, share = 0.25 }, errors)
+	check("extended clamps", parsed.seconds == 600 and parsed.hz == 1 and parsed.entMax == 255 and parsed.dryRun == true)
+	check("extended streams", parsed.streams.ui == false and parsed.streams.view == true and parsed.streams.pose == true)
+	check("extended errors", #errors == 1 and errors[1] == "extended.streams.view must be true or false", table.concat(errors, "; "))
+	local errors2 = {}
+	S.parseExtended({ afkSeconds = "x", dryRun = 1 }, errors2)
+	check("extended type errors", #errors2 == 2, table.concat(errors2, "; "))
+	local errors3 = {}
+	S.parseExtended("on", errors3)
+	check("extended must be an object", #errors3 == 1 and errors3[1] == "extended must be an object")
+	local viaBackend = S.parseSettings(S.sinkSettings({ url = "https://b.example.com", key = "k", analytics = { extended = { seconds = 120, dryRun = true } } }, nil, decode), decode)
+	check("extended from backend.analytics", viaBackend.settings.extended.seconds == 120 and viaBackend.settings.extended.dryRun == true and #viaBackend.errors == 0)
+	local viaOld = S.parseSettings({ backend = "duckdb", events = "https://a.example.com/ingest", extended = { hz = 5 } }, decode)
+	check("extended in the old analytics value", viaOld.settings.extended.hz == 5)
+	local badOld = S.parseSettings({ backend = "duckdb", events = "https://a.example.com/ingest", extended = { hz = "fast" } }, decode)
+	check("extended error keeps the settings usable", badOld.settings ~= nil and badOld.settings.extended.hz == 3.33 and #badOld.errors == 1)
+	check("eligible: a first visit", S.extendedEligible(true, nil, 60) == true)
+	check("eligible: 40 s played", S.extendedEligible(false, 40, 60) == true)
+	check("not eligible: 60 s played", S.extendedEligible(false, 60, 60) == false)
+	check("not eligible: unknown playtime (old record)", S.extendedEligible(false, nil, 60) == false)
+	check("experiment name valid", E.isExperimentName(S.EXT_EXPERIMENT) and E.isVariantList(S.EXT_VARIANTS) and S.EXT_VARIANTS[2] == "on")
+	-- weights [9, 1]: about 10% "on".
+	local on = 0
+	for _, pid in pids do
+		if E.assignVariant(pid, S.EXT_EXPERIMENT, S.EXT_VARIANTS, { weights = { 9, 1 } }).variant == "on" then
+			on += 1
+		end
+	end
+	check("tt_extended_recording 9:1 ~10% on", near(on / #pids, 0.1, 0.02), on / #pids)
+end
+
 print(`analytics: {passed} passed, {failed} failed`)
 if failed > 0 then
 	process.exit(1)
