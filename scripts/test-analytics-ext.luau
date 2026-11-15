@@ -295,6 +295,8 @@ local function character(name, at)
 end
 
 local me, _, myAnimator, myRoot, myMotors = character("Me", Vector3.new(0, 3, 0))
+-- A weapon's joint: listed after the six R6 joints; the rig stays R6.
+new("Motor6D", "KnifeGrip", myMotors["Right Shoulder"].Parent, { Transform = CFrame.new() })
 local other = character("Other", Vector3.new(20, 3, 0))
 local zombie = new("Model", "Zombie", workspace, { Pivot = CFrame.new(10, 3, 10), Extents = Vector3.new(4, 6, 2) })
 new("Humanoid", "Humanoid", zombie)
@@ -619,9 +621,9 @@ check("View", view and view.w == 1920 and view.h == 1080 and view.inset == 58 an
 check("View about once a second (fps)", #find(3) >= 8 and #find(3) <= 14, #find(3))
 check("Anchor at the keyframe", #find(5) >= 1)
 local rig = find(6)[1]
-check("Rig: R6 with the six joints in order", rig and rig.entity == 0 and rig.rig == 1 and #rig.names == 6 and rig.names[1] == "RootJoint" and rig.names[3] == "Left Shoulder")
+check("Rig: R6, the six joints in order, then extras", rig and rig.entity == 0 and rig.rig == 1 and #rig.names == 7 and rig.names[1] == "RootJoint" and rig.names[3] == "Left Shoulder" and rig.names[7] == "KnifeGrip")
 local poses = find(7)
-check("Pose: the keyframe's full pose", poses[1] and #poses[1].joints == 6)
+check("Pose: the keyframe's full pose", poses[1] and #poses[1].joints == 7)
 local moved = nil
 for _, pose in poses do
 	if #pose.joints == 1 and pose.joints[1][1] == 2 then

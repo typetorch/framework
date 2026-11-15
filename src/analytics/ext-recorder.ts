@@ -512,7 +512,10 @@ export class ExtRecorder {
 		});
 	}
 
-	/** Re-reads the Motor6Ds: the standard R6 / R15 names first (in their order), then the rest (at most 32). */
+	/**
+	 * Re-reads the Motor6Ds: the standard R6 / R15 names first (in their order), then the rest (a weapon's joint; at most
+	 * 32 in all). The Humanoid's RigType says R6 or R15; no Humanoid is "other".
+	 */
 	private scanRig() {
 		this.rigDirty = false;
 		this.rigSent = false;
@@ -550,12 +553,10 @@ export class ExtRecorder {
 					}
 				}
 			}
-			if (this.joints.size() < standard.size()) this.rigKind = RigKind.Other;
 		} else this.rigKind = RigKind.Other;
 		for (const motor of motors) {
 			if (this.joints.size() >= 32) break;
 			if (used.has(motor)) continue;
-			if (standard) this.rigKind = RigKind.Other;
 			this.joints.push(motor);
 		}
 		for (const motor of this.joints) {
