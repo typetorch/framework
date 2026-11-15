@@ -139,10 +139,12 @@ const JOIN_LOOKUP_BUDGET = 20;
 const RECORDING_MAX_BYTES = 262144;
 const RECORDING_MAX_CHUNKS = 80;
 const RECORDING_MAX_SECONDS = 900;
-/** plans/36: an extended recording (tt-ext-1) at most this many chunk bytes and chunks, and its chunks this far apart. */
+/**
+ * plans/36: an extended recording (tt-ext-1) at most this many chunk bytes and chunks. No time gap between chunks (as
+ * tt-rec-1 has): a dropped chunk could hold a Keyframe; the caps bound what one client can send.
+ */
 const EXT_MAX_BYTES = 2097152;
 const EXT_MAX_CHUNKS = 200;
-const EXT_CHUNK_GAP = 0.25;
 /** One session's seconds added to `play` at most (a server that never saw the leave can't add days). */
 const PLAY_SESSION_MAX = 86400;
 /** The join event waits this long for the client's device info. */
@@ -380,7 +382,6 @@ export class ServerAnalytics {
 	private readonly helloWaiting = new Set<Player>();
 	private readonly clientBudgets = new Map<Player, BucketState>();
 	private readonly lastChunkAt = new Map<Player, number>();
-	private readonly lastExtChunkAt = new Map<Player, number>();
 	private readonly errors = new Map<string, number>();
 	private readonly zones = new Map<Instance, Zone>();
 	private readonly kernel?: ServerKernel;
@@ -1237,7 +1238,6 @@ export class ServerAnalytics {
 		this.helloWaiting.delete(player);
 		this.clientBudgets.delete(player);
 		this.lastChunkAt.delete(player);
-		this.lastExtChunkAt.delete(player);
 		this.store.players.delete(tostring(player.UserId));
 		if (session.ready && !session.temp) {
 			const userId = player.UserId;
@@ -1485,10 +1485,6 @@ export class ServerAnalytics {
 		const size = buffer.len(data);
 		if (size < 4 || size > EXT_CHUNK_MAX_BYTES || buffer.readu8(data, 0) !== 1) return;
 		if (chunk < ext.chunk) return; // a resend
-		const clock = os.clock();
-		const lastAt = this.lastExtChunkAt.get(player);
-		if (lastAt !== undefined && clock - lastAt < EXT_CHUNK_GAP && last !== true) return;
-		this.lastExtChunkAt.set(player, clock);
 		const settings = this.settings;
 		if (!settings || !recordsSupported(settings)) return;
 		const t = nowMs() - age - math.floor(math.clamp(player.GetNetworkPing(), 0, 2) * 500);

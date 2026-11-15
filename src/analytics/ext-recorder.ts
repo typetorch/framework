@@ -334,8 +334,9 @@ export class ExtRecorder {
 		this.rotate(false, "swap");
 	}
 
-	/** Counters since the last call (the client tech row). */
-	takeStats(): ExtStats {
+	/** Counters since the last call (the client tech row); undefined once it ended and the period after is empty. */
+	takeStats(): ExtStats | undefined {
+		if (this.done && this.statBytes === 0 && this.statMs === 0) return undefined;
 		const now = os.clock();
 		const elapsed = math.max(now - this.statSince, 0.001);
 		const stats: ExtStats = {

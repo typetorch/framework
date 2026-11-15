@@ -640,7 +640,9 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   `recordSeconds` to the length of your first round (e.g. 300) to record it whole.
 - **Extended recording** (framework 0.7.2, plans/36): an add-on to the first-session recording, below.
 - **Never collected:** chat or anything typed, usernames and display names (error texts have them replaced). No event
-  row carries a UserId.
+  row carries a UserId. The one exception is the extended recording's UI stream (below, off unless its experiment is
+  configured): it records the game's on-screen UI as drawn, so text in TextBoxes and any names the game's own UI shows
+  are in it (owner decision, plans/36: no privacy filters). Roblox's chat is CoreGui and never visible to it.
 - **Identities** (option `identity`, default on): once the pid is known, one row `{ pid, uid, t }` (the UserId, nothing
   else) per session goes to the dev's own server only, never into the events: duckdb games in the batch body, Basin
   games to the backend (the record's `backend` url + `/v1/identity`, or the `identity` / `identityToken` settings). The

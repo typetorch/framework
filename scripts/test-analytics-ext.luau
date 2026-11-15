@@ -772,6 +772,8 @@ check("swap sends the chunk", chunks[#chunks].why == "swap")
 recorder:finish("window")
 check("finish: the last chunk", chunks[#chunks].last == true and chunks[#chunks].why == "window" and state.ended == true)
 check("replay: inactive after the end", R.replay:active() == false)
+recorder:takeStats()
+check("stats: none once ended", recorder:takeStats() == nil)
 check("finish disconnects everything", hud.DescendantAdded.count == 0 and services.RunService.Heartbeat.count == 0, services.RunService.Heartbeat.count)
 local total = 0
 for _, chunk in chunks do
