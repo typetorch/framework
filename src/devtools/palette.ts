@@ -307,12 +307,23 @@ export function createPalette<C>(options: PaletteOptions<C>): Palette {
 		}
 	};
 
+	// The query the list shows. Enter's own "\r" can land in the box when the confirm step refocuses it in the same
+	// key press; stripped here, it must not count as an edit (that would disarm the confirm, and Enter never runs it).
+	let query = "";
 	trove.connect(box.GetPropertyChangedSignal("Text"), () => {
 		if (!shown) return;
 		if (os.clock() - openedAt < 0.25 && box.Text.lower() === "k") {
 			box.Text = "";
 			return;
 		}
+		const [clean] = box.Text.gsub("[%c]", "");
+		if (clean !== box.Text) {
+			box.Text = clean; // fires again with the clean text
+			box.CursorPosition = clean.size() + 1;
+			return;
+		}
+		if (clean === query) return;
+		query = clean;
 		selected = 0;
 		armed.id = undefined;
 		list.CanvasPosition = Vector2.zero;
@@ -342,7 +353,7 @@ export function createPalette<C>(options: PaletteOptions<C>): Palette {
 	trove.connect(backdrop.Activated, close);
 
 	return {
-		open: (query) => {
+		open: (initial) => {
 			if (!shown) {
 				shown = true;
 				openedAt = os.clock();
@@ -354,7 +365,8 @@ export function createPalette<C>(options: PaletteOptions<C>): Palette {
 				idleStatus();
 				popIn(panel);
 			}
-			box.Text = query ?? "";
+			query = initial ?? "";
+			box.Text = query;
 			list.CanvasPosition = Vector2.zero;
 			render();
 			box.CaptureFocus();
