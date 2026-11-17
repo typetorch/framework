@@ -639,17 +639,24 @@ const variant = analytics.experiment("onboarding", ["short", "long"]); // same a
   the per-recording caps (256 KB, 80 chunks) still apply, and 10 minutes of an active player fit inside them. Set
   `recordSeconds` to the length of your first round (e.g. 300) to record it whole.
 - **Extended recording** (framework 0.7.2, plans/36): an add-on to the first-session recording, below.
-- **Never collected:** chat or anything typed, usernames and display names (error texts have them replaced). No event
-  row carries a UserId. The one exception is the extended recording's UI stream (below, off unless its experiment is
-  configured): it records the game's on-screen UI as drawn, so text in TextBoxes and any names the game's own UI shows
-  are in it (owner decision, plans/36: no privacy filters). Roblox's chat is CoreGui and never visible to it.
+- **Player data collected:** the analytics are about identifiable players. Rows carry the pid, and the pid maps to the
+  UserId (the DataStore record below, and the identity rows the dev's server keeps), so every row, recording and
+  feedback text can be traced to a Roblox account. The join row has the player's country, locale, account age,
+  membership, policy flags, friends in the server and join data; the device row their device and screen. The extended
+  recording's UI stream (below) stores the game's on-screen UI as drawn: usernames and display names (the player's and
+  other players') wherever the game's UI shows them, and the text typed into TextBoxes (owner decision, plans/36: no
+  privacy filters). Feedback rows keep the text the player wrote. Not collected: Roblox chat messages (CoreGui, not
+  visible to the recorder); the first-session recording logs no keys while a TextBox or the chat has focus, and
+  `tech` error texts have player names replaced by `<player>`.
 - **Identities** (option `identity`, default on): once the pid is known, one row `{ pid, uid, t }` (the UserId, nothing
   else) per session goes to the dev's own server only, never into the events: duckdb games in the batch body, Basin
   games to the backend (the record's `backend` url + `/v1/identity`, or the `identity` / `identityToken` settings). The
   analytics server keeps pid -> UserId in a deletable table (support lookups, Right to Erasure).
 - **Player ids:** DataStore `TypeTorchAnalytics`, key `p/<UserId>` -> `{ pid, first, last, play }`: one read per join,
   a write on the first join and at leave (which also adds the session's seconds to `play`, the total playtime; records
-  from before 0.7.2 have none). Deleting the key (Right to Erasure) leaves that player's rows anonymous.
+  from before 0.7.2 have none). Deleting the key (Right to Erasure) removes the pid <-> UserId link (and, on duckdb, the
+  backend's erasure deletes the rows); rows left behind are unlinked, not anonymous: an extended recording still shows
+  any names that were on screen.
 - **Sending:** one queue on the server (10,000 events; over that the oldest are dropped and counted), a flush every
   `flushSeconds` (15) or at 500 rows, at most ~10 HttpService requests a minute, retries with backoff, and a last
   flush on shutdown (kernel 0.3.2). Delivery is at least once (a swap mid-request sends that batch again).
@@ -703,7 +710,7 @@ import { replay } from "@typetorch/framework";
 
 replay.track(bossModel, "boss"); // a Model or BasePart, as a kind (1-32 of letters, digits, _ - .)
 replay.trackChildren(Workspace.Mobs, "zombie"); // every Model with a Humanoid / Animator / AnimationController under it
-replay.setAfk(player, true); // server: the game's own AFK state (a lobby AFK toggle); the extended streams pause
+replay.setAfk(player, true); // server: the game's AFK flag; the extended streams pause until the player's next input
 replay.active(); // client: the extended streams record me now (dry runs too; false while AFK)
 ```
 

@@ -190,6 +190,11 @@ export class ExtRecorder {
 	private paused = false;
 	private keyframeAt = 0;
 	private lastActive = os.clock();
+	/** The player's last key / click / tap / gamepad button / stick input (motion doesn't count). */
+	private lastInput = -math.huge;
+	/** The game's AFK flag at the last tick, and when it last turned on. */
+	private flagWas = false;
+	private flagAt = 0;
 	private rootX = 0;
 	private rootY = 0;
 	private rootZ = 0;
@@ -285,10 +290,14 @@ export class ExtRecorder {
 		if (this.dials.streams.ent) watchServerTracks(trove.extend());
 		trove.connect(UserInputService.InputBegan, () => {
 			this.lastActive = os.clock();
+			this.lastInput = this.lastActive;
 		});
 		trove.connect(UserInputService.InputChanged, (input) => {
 			const code = input.KeyCode;
-			if ((code === Enum.KeyCode.Thumbstick1 || code === Enum.KeyCode.Thumbstick2) && input.Position.Magnitude > 0.25) this.lastActive = os.clock();
+			if ((code === Enum.KeyCode.Thumbstick1 || code === Enum.KeyCode.Thumbstick2) && input.Position.Magnitude > 0.25) {
+				this.lastActive = os.clock();
+				this.lastInput = this.lastActive;
+			}
 		});
 		trove.connect(player.CharacterAdded, (character) => this.watchCharacter(character));
 		if (player.Character) this.watchCharacter(player.Character);
@@ -406,7 +415,11 @@ export class ExtRecorder {
 		}
 	}
 
-	/** AFK: the game's flag, or no input for afkSeconds and the character not moving. */
+	/**
+	 * AFK: no input for afkSeconds and the character not moving, or the game's flag from when it turned on until the
+	 * player's next input. The flag pauses, input resumes (plans/36), so a toggle the player left on while they play
+	 * (gnome's AFK button, pressed by a console's first gamepad A) doesn't end the recording; setting it again pauses again.
+	 */
 	private checkAfk(now: number) {
 		const root = this.character?.FindFirstChild("HumanoidRootPart");
 		if (root && root.IsA("BasePart")) {
@@ -421,7 +434,10 @@ export class ExtRecorder {
 				this.lastActive = now;
 			}
 		}
-		const afk = replayAfkFlag() || now - this.lastActive >= this.dials.afkSeconds;
+		const flag = replayAfkFlag();
+		if (flag && !this.flagWas) this.flagAt = now;
+		this.flagWas = flag;
+		const afk = (flag && this.lastInput <= this.flagAt) || now - this.lastActive >= this.dials.afkSeconds;
 		if (!this.begun) {
 			if (afk) return;
 			this.begun = true;
