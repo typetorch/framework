@@ -416,6 +416,11 @@ new("UIGradient", "UIGradient", highlight, {
 	Enabled = true,
 })
 local fade = gui("CanvasGroup", "Fade", hud, { ZIndex = 6, GroupTransparency = 0.5, GroupColor3 = Color3.new(1, 1, 1) })
+local zoomed = new("ScreenGui", "Zoomed", playerGui, { Enabled = true, DisplayOrder = 7, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, AbsolutePosition = Vector2.new(0, 0), AbsoluteSize = Vector2.new(1920, 1080) })
+new("UIScale", "UIScale", zoomed, { Scale = 1.5 })
+local zoomProps = table.clone(textProps)
+zoomProps.Text, zoomProps.TextSize = "Zoom", 10
+gui("TextLabel", "Zoom", zoomed, zoomProps)
 local shop = new("ScreenGui", "Shop", playerGui, { Enabled = false, DisplayOrder = 5, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, AbsolutePosition = Vector2.new(0, 0), AbsoluteSize = Vector2.new(1920, 1080) })
 gui("Frame", "ShopPanel", shop)
 local dev = new("ScreenGui", "TypeTorchDev", playerGui, { Enabled = true, DisplayOrder = 99, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, AbsolutePosition = Vector2.new(0, 0), AbsoluteSize = Vector2.new(1920, 1080) })
@@ -720,9 +725,9 @@ end
 check("UiNode: the HUD ScreenGui", #find(20, function(r)
 	return r.class == 0 and r.parent == 65535 and r.order == 2
 end) == 1)
-check("UiNode: no disabled ScreenGui, no TypeTorch dev UI", #find(20, function(r)
+check("UiNode: no disabled ScreenGui, no TypeTorch dev UI (HUD + Zoomed)", #find(20, function(r)
 	return r.class == 0
-end) == 1)
+end) == 2)
 check("UiNode: text node", textNode and textNode.class == 2 and textNode.textSize == 24 and textNode.family == "rbxasset://fonts/families/GothamSSm.json" and textNode.weight == 700 and textNode.xAlign == 0)
 local panelNode = textNode and byId[textNode.parent]
 check("UiNode: panel corner and stroke", panelNode and panelNode.corner == 8 and panelNode.border and panelNode.border[5] == 2)
@@ -752,6 +757,7 @@ local dollar = nodeNamed("$")
 check("UIScale: TextSize 16 under a 2x UIScale is drawn at 32", dollar and dollar.textSize == 32 and dollar.textScale == 2, dollar and dollar.textSize)
 check("UIScale: nested scales multiply (2 x 0.5 = 1: no textScale)", nodeNamed("Half") and nodeNamed("Half").textSize == 20 and nodeNamed("Half").textScale == nil)
 check("UIScale: unscaled text sends no textScale", textNode and textNode.textScale == nil and textNode.more == nil)
+check("UIScale under a ScreenGui scales the whole screen (10 x 1.5 = 15)", nodeNamed("Zoom") and nodeNamed("Zoom").textSize == 15 and nodeNamed("Zoom").textScale == 1.5)
 check("UIScale 0: hidden HUD text has size 0", nodeNamed("Ghost") and nodeNamed("Ghost").textSize == 0 and nodeNamed("Ghost").textScale == 0)
 local scaledNode = dollar and byId[dollar.parent]
 check("UIScale: corner offset and stroke thickness scale", scaledNode and scaledNode.corner == 8 and scaledNode.border and scaledNode.border[5] == 2, scaledNode and scaledNode.corner)
@@ -837,7 +843,7 @@ check("every Keyframe starts a chunk flagged as one", keyframesFirst and keyfram
 local stats = recorder:takeStats()
 check("stats: bytes per second", stats.xb > 0, stats.xb)
 check("stats: ms numbers", stats.xms >= 0 and stats.xmax >= 0)
-check("stats: visible UI nodes (HUD, Back, Scaled + 3, HiddenHud + Ghost, Highlight, Fade)", stats.xui == 10, stats.xui)
+check("stats: visible UI nodes (HUD, Back, Scaled + 3, HiddenHud + Ghost, Highlight, Fade, Zoomed + Zoom)", stats.xui == 12, stats.xui)
 recorder:swapOut()
 check("swap sends the chunk", chunks[#chunks].why == "swap")
 recorder:finish("window")

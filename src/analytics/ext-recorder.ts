@@ -145,7 +145,7 @@ interface UiNodeState {
 	corner?: UICorner;
 	gradient?: UIGradient;
 	uiScale?: UIScale;
-	/** The product of every UIScale on this node and its GuiObject ancestors (this pass's; 1 for a ScreenGui). */
+	/** The product of every UIScale on this node, its GuiObject ancestors and its ScreenGui (this pass's). */
 	scale: number;
 	/** Sent (a UiNode) in this segment and not gone since. */
 	sent: boolean;
@@ -1023,6 +1023,7 @@ export class ExtRecorder {
 				node.parentNode = undefined;
 				node.order = this.uiOrder;
 				node.zIndex = gui.DisplayOrder;
+				node.uiScale = undefined; // a UIScale directly under the ScreenGui scales the whole screen (visit picks it up)
 				this.uiOrder += 1;
 				const first = this.uiNodes.size();
 				this.uiNodes.push(node);
@@ -1103,9 +1104,9 @@ export class ExtRecorder {
 				if (!node.screen) {
 					const parent = node.parentNode;
 					if (parent) scale = parent.scale;
-					const uiScale = node.uiScale;
-					if (uiScale && uiScale.Parent === instance) scale *= math.max(0, uiScale.Scale);
 				}
+				const uiScale = node.uiScale;
+				if (uiScale && uiScale.Parent === instance) scale *= math.max(0, uiScale.Scale);
 				node.scale = scale;
 				const slow = !node.sent || (this.uiPasses + node.id) % SLOW_PASSES === 0;
 				let mask = this.readFast(node);
