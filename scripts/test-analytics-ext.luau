@@ -109,6 +109,8 @@ local CLASSES = {
 	UICorner = { "UIComponent" },
 	UIStroke = { "UIComponent" },
 	UIGradient = { "UIComponent" },
+	UIScale = { "UIComponent" },
+	CanvasGroup = { "GuiObject", "GuiBase2d" },
 	Shirt = { "Clothing" },
 	Pants = { "Clothing" },
 	BodyColors = {},
@@ -380,7 +382,40 @@ local icon = gui("ImageLabel", "Icon", panel, {
 	ZIndex = 1,
 })
 local back = gui("Frame", "Back", hud, { ZIndex = 1 })
-new("UIGradient", "UIGradient", back, { Color = roblox.ColorSequence.new(Color3.new(1, 0, 0), Color3.new(0, 0, 1)), Rotation = 90, Enabled = true })
+new("UIGradient", "UIGradient", back, {
+	Color = roblox.ColorSequence.new(Color3.new(1, 0, 0), Color3.new(0, 0, 1)),
+	Transparency = roblox.NumberSequence.new(0),
+	Offset = Vector2.new(0, 0),
+	Rotation = 90,
+	Enabled = true,
+})
+-- 0.7.3: a HUD scaled by UIScale (gnome: ~2x at 1080p), one hidden by UIScale 0, gnome's modal sheen, a CanvasGroup.
+local scaled = gui("Frame", "Scaled", hud, { ZIndex = 3, AbsoluteSize = Vector2.new(64, 64) })
+local scaledBy = new("UIScale", "UIScale", scaled, { Scale = 2 })
+new("UICorner", "UICorner", scaled, { CornerRadius = roblox.UDim.new(0, 4) })
+new("UIStroke", "UIStroke", scaled, { Color = Color3.new(0, 0, 0), Transparency = 0, Thickness = 1, Enabled = true, ApplyStrokeMode = Enum.ApplyStrokeMode.Border })
+local dollarProps = table.clone(textProps)
+dollarProps.Text, dollarProps.TextSize, dollarProps.TextBounds, dollarProps.AbsoluteSize = "$", 16, Vector2.new(9, 16), Vector2.new(32, 32)
+gui("TextLabel", "Dollar", scaled, dollarProps)
+local inner = gui("Frame", "Inner", scaled)
+new("UIScale", "UIScale", inner, { Scale = 0.5 })
+local halfProps = table.clone(textProps)
+halfProps.Text, halfProps.TextSize = "Half", 20
+gui("TextLabel", "Half", inner, halfProps)
+local hiddenHud = gui("Frame", "HiddenHud", hud, { ZIndex = 4, AbsoluteSize = Vector2.new(0, 0) })
+new("UIScale", "UIScale", hiddenHud, { Scale = 0 })
+local ghostProps = table.clone(textProps)
+ghostProps.Text, ghostProps.TextSize, ghostProps.AbsoluteSize = "Ghost", 18, Vector2.new(0, 0)
+gui("TextLabel", "Ghost", hiddenHud, ghostProps)
+local highlight = gui("Frame", "Highlight", hud, { ZIndex = 5, AbsoluteSize = Vector2.new(400, 300) })
+new("UIGradient", "UIGradient", highlight, {
+	Color = roblox.ColorSequence.new(Color3.new(1, 1, 1)),
+	Transparency = roblox.NumberSequence.new({ roblox.NumberSequenceKeypoint.new(0, 0.9), roblox.NumberSequenceKeypoint.new(0.7, 1), roblox.NumberSequenceKeypoint.new(1, 1) }),
+	Offset = Vector2.new(0, 0.5),
+	Rotation = 90,
+	Enabled = true,
+})
+local fade = gui("CanvasGroup", "Fade", hud, { ZIndex = 6, GroupTransparency = 0.5, GroupColor3 = Color3.new(1, 1, 1) })
 local shop = new("ScreenGui", "Shop", playerGui, { Enabled = false, DisplayOrder = 5, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, AbsolutePosition = Vector2.new(0, 0), AbsoluteSize = Vector2.new(1920, 1080) })
 gui("Frame", "ShopPanel", shop)
 local dev = new("ScreenGui", "TypeTorchDev", playerGui, { Enabled = true, DisplayOrder = 99, ZIndexBehavior = Enum.ZIndexBehavior.Sibling, AbsolutePosition = Vector2.new(0, 0), AbsoluteSize = Vector2.new(1920, 1080) })
@@ -573,6 +608,8 @@ check("one DescendantAdded per ScreenGui", hud.DescendantAdded.count == 1 and sh
 
 -- Changes: text, motion, joints, animations.
 coins:Set("Text", "Coins: 11")
+scaledBy.Scale = 1.5 -- a UIScale tween: text sizes follow on the next pass
+fade.GroupTransparency = 0.25
 zombie.Pivot = CFrame.new(12, 3, 10) * CFrame.Angles(0, math.pi / 2, 0)
 myMotors["Left Shoulder"].Transform = CFrame.Angles(math.rad(40), 0, 0)
 local mySwing = Track("rbxassetid://2002", { Looped = false })
@@ -693,14 +730,48 @@ check("UiNode: image with a 9-slice", #find(20, function(r)
 	return r.image == "rbxassetid://777" and r.scaleType == 1 and r.slice and r.slice[3] == 12
 end) == 1)
 check("UiNode: gradient", #find(20, function(r)
-	return r.gradient ~= nil and #r.gradient == 2 and r.gradientRotation == 90
+	return r.gradient ~= nil and #r.gradient == 2 and r.gradientRotation == 90 and r.gradientAlpha == nil
 end) == 1)
 local backNode = find(20, function(r)
-	return r.gradient ~= nil
+	return r.gradient ~= nil and r.gradientAlpha == nil
 end)[1]
 check("UiNode: draw order honours ZIndex (Back z1 under Panel z2)", backNode and panelNode and backNode.order < panelNode.order)
 check("UiProps: the text change", #find(21, function(r)
 	return r.text == "Coins: 11"
+end) == 1)
+-- 0.7.3: UIScale, the gradient's transparency / offset, CanvasGroup.
+local function nodeNamed(text)
+	return find(20, function(r)
+		return r.text == text
+	end)[1]
+end
+local function near(a, b, tolerance)
+	return type(a) == "number" and math.abs(a - b) <= tolerance
+end
+local dollar = nodeNamed("$")
+check("UIScale: TextSize 16 under a 2x UIScale is drawn at 32", dollar and dollar.textSize == 32 and dollar.textScale == 2, dollar and dollar.textSize)
+check("UIScale: nested scales multiply (2 x 0.5 = 1: no textScale)", nodeNamed("Half") and nodeNamed("Half").textSize == 20 and nodeNamed("Half").textScale == nil)
+check("UIScale: unscaled text sends no textScale", textNode and textNode.textScale == nil and textNode.more == nil)
+check("UIScale 0: hidden HUD text has size 0", nodeNamed("Ghost") and nodeNamed("Ghost").textSize == 0 and nodeNamed("Ghost").textScale == 0)
+local scaledNode = dollar and byId[dollar.parent]
+check("UIScale: corner offset and stroke thickness scale", scaledNode and scaledNode.corner == 8 and scaledNode.border and scaledNode.border[5] == 2, scaledNode and scaledNode.corner)
+check("UIScale tween: UiProps with the new size and scale", #find(21, function(r)
+	return dollar ~= nil and r.id == dollar.id and r.textSize == 24 and r.textScale == 1.5
+end) == 1)
+local sheen = find(20, function(r)
+	return r.gradientAlpha ~= nil
+end)[1]
+check(
+	"UIGradient transparency + offset (gnome's Highlight)",
+	sheen and #sheen.gradientAlpha == 3 and near(sheen.gradientAlpha[1][2], 0.9, 0.003) and near(sheen.gradientAlpha[2][1], 0.7, 0.003)
+		and sheen.gradientAlpha[3][2] == 1 and sheen.gradientOffset[1] == 0 and sheen.gradientOffset[2] == 0.5 and #sheen.gradient == 2 and sheen.gradientRotation == 90
+)
+local fadeNode = find(20, function(r)
+	return r.class == 9
+end)[1]
+check("CanvasGroup: GroupTransparency and GroupColor3", fadeNode and fadeNode.group and fadeNode.group[1] == 128 and fadeNode.group[2] == 255 and fadeNode.textScale == nil)
+check("CanvasGroup: a GroupTransparency change is seen on the next pass", #find(21, function(r)
+	return fadeNode ~= nil and r.id == fadeNode.id and r.group ~= nil and r.group[1] == 64
 end) == 1)
 local gone = {}
 for _, record in find(22) do
@@ -766,7 +837,7 @@ check("every Keyframe starts a chunk flagged as one", keyframesFirst and keyfram
 local stats = recorder:takeStats()
 check("stats: bytes per second", stats.xb > 0, stats.xb)
 check("stats: ms numbers", stats.xms >= 0 and stats.xmax >= 0)
-check("stats: visible UI nodes (HUD, Back)", stats.xui == 2, stats.xui)
+check("stats: visible UI nodes (HUD, Back, Scaled + 3, HiddenHud + Ghost, Highlight, Fade)", stats.xui == 10, stats.xui)
 recorder:swapOut()
 check("swap sends the chunk", chunks[#chunks].why == "swap")
 recorder:finish("window")

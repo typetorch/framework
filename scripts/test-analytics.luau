@@ -831,6 +831,87 @@ do
 	check("ext bad length refused", not pcall(X.decodeExtChunk, bad))
 end
 do
+	-- 0.7.3: UIGradient transparency + offset (bit 14), the second mask (bit 15: CanvasGroup group, text UIScale).
+	local w = X.ExtWriter.new(64)
+	w:keyframe(0)
+	local v = X.newUiValues()
+	v.x, v.y, v.w, v.h = 0, 0, 400, 300
+	v.bgR, v.bgG, v.bgB, v.bgT = 255, 255, 255, 0
+	-- gnome's modal "Highlight": white -> white, transparency 0.9 -> 1 (0.7) -> 1, rotation 90, offset (0, -0.25)
+	v.grad, v.gradN, v.gradRot = { 0, 255, 255, 255, 255, 255, 255, 255 }, 2, 90
+	v.ga, v.gaN = { 0, 230, 179, 255, 255, 255 }, 3
+	v.gOffX, v.gOffY = 0, -250
+	v.grT, v.grR, v.grG, v.grB = 128, 255, 0, 0
+	v.tScale = 2000
+	local GRAD, ALPHA, GROUP, SCALE = 8192, 16384, 65536, 131072
+	w:uiNode(10, 5, 65535, 9, 1 + 4 + 8 + GRAD + ALPHA + GROUP + SCALE, v)
+	w:uiProps(20, 5, GROUP, v) -- only a second-mask field
+	w:uiProps(30, 5, ALPHA, v)
+	v.gaN, v.gOffX, v.gOffY = 0, 0, 0
+	w:uiProps(40, 5, ALPHA, v) -- back to none
+	local chunk = w:take(false)
+	-- Byte layout: Keyframe (5 + 2), then the UiNode head: tag, dt, length, id, parent, class, wire mask.
+	local at = 4 + 7
+	check("ext 0.7.3 UiNode tag", buffer.readu8(chunk, at) == 20)
+	check("ext 0.7.3 wire mask: bits 0..14 as set, bit 15 for the second mask", buffer.readu16(chunk, at + 10) == 1 + 4 + 8 + GRAD + ALPHA + 32768, buffer.readu16(chunk, at + 10))
+	local length = buffer.readu16(chunk, at + 3)
+	-- 7 head + rect 8 + order 2 + background 4 + gradient 3 + 2 × 4 + alpha 5 + 3 × 2 + more 2 + group 4 + scale 2
+	check("ext 0.7.3 UiNode length", length == 7 + 8 + 2 + 4 + 11 + 11 + 2 + 4 + 2, length)
+	check("ext 0.7.3 second mask bytes", buffer.readu16(chunk, at + 5 + length - 8) == 3, buffer.readu16(chunk, at + 5 + length - 8))
+	local d = X.decodeExtChunk(chunk)
+	local node = d.records[2]
+	check("ext 0.7.3 gradient colour unchanged", node and #node.gradient == 2 and node.gradient[2][2] == 255 and node.gradientRotation == 90)
+	check(
+		"ext 0.7.3 gradient transparency keypoints",
+		node and node.gradientAlpha and #node.gradientAlpha == 3 and node.gradientAlpha[1][1] == 0 and near(node.gradientAlpha[1][2], 0.9, 0.003)
+			and near(node.gradientAlpha[2][1], 0.7, 0.003) and node.gradientAlpha[2][2] == 1 and node.gradientAlpha[3][1] == 1
+	)
+	check("ext 0.7.3 gradient offset", node and node.gradientOffset[1] == 0 and node.gradientOffset[2] == -0.25)
+	check("ext 0.7.3 group", node and node.more == 3 and node.group[1] == 128 and node.group[2] == 255 and node.group[3] == 0 and node.group[4] == 0)
+	check("ext 0.7.3 text scale", node and node.textScale == 2)
+	local onlyGroup = d.records[3]
+	check("ext 0.7.3 UiProps: group only", onlyGroup and onlyGroup.mask == 32768 and onlyGroup.more == 1 and onlyGroup.group[1] == 128 and onlyGroup.textScale == nil and onlyGroup.length == 4 + 2 + 4)
+	local alpha = d.records[4]
+	check("ext 0.7.3 UiProps: alpha", alpha and alpha.mask == ALPHA and #alpha.gradientAlpha == 3 and alpha.more == nil)
+	local none = d.records[5]
+	check("ext 0.7.3 UiProps: alpha back to none", none and #none.gradientAlpha == 0 and none.gradientOffset[1] == 0 and none.gradientOffset[2] == 0 and none.length == 4 + 5)
+	-- An old-format (0.7.2) UiNode, by hand: mask bits 0 and 3 only.
+	local old = buffer.create(4 + 5 + 7 + 8 + 4)
+	buffer.writeu8(old, 0, 1)
+	buffer.writeu8(old, 4, 20)
+	buffer.writeu16(old, 7, 7 + 8 + 4)
+	buffer.writeu16(old, 9, 3)
+	buffer.writeu16(old, 11, 65535)
+	buffer.writeu8(old, 13, 1)
+	buffer.writeu16(old, 14, 1 + 8)
+	buffer.writei16(old, 16, -5)
+	buffer.writeu16(old, 20, 100)
+	buffer.writeu16(old, 22, 50)
+	buffer.writeu8(old, 24, 200)
+	buffer.writeu8(old, 27, 255)
+	local dOld = X.decodeExtChunk(old)
+	local oldNode = dOld.records[1]
+	check("ext 0.7.2 chunk still decodes", oldNode and oldNode.id == 3 and oldNode.rect[1] == -5 and oldNode.rect[3] == 100 and oldNode.background[1] == 200 and oldNode.background[4] == 255 and oldNode.gradientAlpha == nil and oldNode.group == nil)
+	-- A newer recorder's unknown second-mask bit (bit 2, two bytes) after a known one: skipped by the record's length.
+	local newer = buffer.create(4 + (5 + 4 + 2 + 4 + 2) + (5 + 2))
+	buffer.writeu8(newer, 0, 1)
+	buffer.writeu8(newer, 4, 21)
+	buffer.writeu16(newer, 7, 4 + 2 + 4 + 2)
+	buffer.writeu16(newer, 9, 7)
+	buffer.writeu16(newer, 11, 32768)
+	buffer.writeu16(newer, 13, 1 + 4)
+	buffer.writeu8(newer, 15, 51)
+	buffer.writeu8(newer, 16, 255)
+	buffer.writeu8(newer, 17, 255)
+	buffer.writeu8(newer, 18, 255)
+	buffer.writeu16(newer, 19, 1234)
+	buffer.writeu8(newer, 21, 22)
+	buffer.writeu16(newer, 24, 2)
+	buffer.writeu16(newer, 26, 7)
+	local ok, dNewer = pcall(X.decodeExtChunk, newer)
+	check("ext unknown trailing UI bits skipped", ok and #dNewer.records == 2 and dNewer.records[1].group[1] == 51 and dNewer.records[2].tag == 22 and dNewer.records[2].id == 7, dNewer)
+end
+do
 	-- Smallest-three over many rotations: 10 bits a component is within ~0.25 degrees, any sign.
 	local worst = 0
 	local fits = true

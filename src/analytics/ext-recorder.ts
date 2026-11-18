@@ -9,6 +9,7 @@ import {
 	packQuat,
 	quatOf,
 	RigKind,
+	UI_GRADIENT_KEYS,
 	UiClass,
 	UiField,
 	yawByte,
@@ -60,7 +61,7 @@ const MOVE_EPSILON = 1 / 8;
 const POSE_DOT = 0.99985;
 const AFK_MOVE = 0.5;
 const UI_NODES_MAX = 4000;
-/** UI fields read only on every SLOW_PASSES-th pass per node (fonts, alignment, slices, strokes, corners, gradients). */
+/** UI fields read only on every SLOW_PASSES-th pass per node (fonts, alignment, slices, strokes, corners). */
 const SLOW_PASSES = 4;
 const IGNORED_GUIS = new Set(["Freecam", "BubbleChat", "Chat", "ProximityPrompts", "RbxCameraUI"]);
 
@@ -143,6 +144,9 @@ interface UiNodeState {
 	stroke?: UIStroke;
 	corner?: UICorner;
 	gradient?: UIGradient;
+	uiScale?: UIScale;
+	/** The product of every UIScale on this node and its GuiObject ancestors (this pass's; 1 for a ScreenGui). */
+	scale: number;
 	/** Sent (a UiNode) in this segment and not gone since. */
 	sent: boolean;
 	visibleNow: boolean;
@@ -953,6 +957,7 @@ export class ExtRecorder {
 			last: 0,
 			zIndex: 0,
 			sortKey: 0,
+			scale: 1,
 			sent: false,
 			visibleNow: false,
 			seen: 0,
@@ -977,6 +982,7 @@ export class ExtRecorder {
 			} else if (child.IsA("UIStroke")) parent.stroke = child;
 			else if (child.IsA("UICorner")) parent.corner = child;
 			else if (child.IsA("UIGradient")) parent.gradient = child;
+			else if (child.IsA("UIScale")) parent.uiScale = child;
 			else if (child.IsA("Folder") || child.IsA("Configuration")) this.visit(child, parent, global);
 		}
 		if (!global) guis.sort((a, b) => a.sortKey < b.sortKey);
@@ -987,6 +993,7 @@ export class ExtRecorder {
 			node.stroke = undefined;
 			node.corner = undefined;
 			node.gradient = undefined;
+			node.uiScale = undefined;
 			this.uiNodes.push(node);
 			if (!global) {
 				node.order = this.uiOrder;
@@ -1091,6 +1098,15 @@ export class ExtRecorder {
 				this.uiCursor = math.max(node.last, this.uiCursor) + 1;
 			} else {
 				this.uiVisibleCounting += 1;
+				// UIScale: GuiObject ancestors multiply (the parent comes earlier in the list, so its scale is this pass's).
+				let scale = 1;
+				if (!node.screen) {
+					const parent = node.parentNode;
+					if (parent) scale = parent.scale;
+					const uiScale = node.uiScale;
+					if (uiScale && uiScale.Parent === instance) scale *= math.max(0, uiScale.Scale);
+				}
+				node.scale = scale;
 				const slow = !node.sent || (this.uiPasses + node.id) % SLOW_PASSES === 0;
 				let mask = this.readFast(node);
 				if (slow) mask = mask | this.readSlow(node);
@@ -1119,7 +1135,10 @@ export class ExtRecorder {
 		this.uiVisible = this.uiVisibleCounting;
 	}
 
-	/** The fields a UiNode carries: those of its class; rotation, clip, stroke, corner, gradient, slices only when set. */
+	/**
+	 * The fields a UiNode carries: those of its class; rotation, clip, stroke, corner, gradient (colour, transparency /
+	 * offset), slices, a CanvasGroup's group, a text node's UIScale only when not at their default.
+	 */
 	private nodeMask(node: UiNodeState): number {
 		const v = node.v;
 		if (node.screen) return UiField.Rect | UiField.Order;
@@ -1134,10 +1153,16 @@ export class ExtRecorder {
 		if (v.corner !== 0) mask = mask | UiField.Corner;
 		if (v.clip !== 0) mask = mask | UiField.Clip;
 		if (v.gradN !== 0) mask = mask | UiField.Gradient;
+		if (v.gaN !== 0 || v.gOffX !== 0 || v.gOffY !== 0) mask = mask | UiField.GradientAlpha;
+		if (node.cls === UiClass.CanvasGroup && (v.grT !== 0 || v.grR !== 255 || v.grG !== 255 || v.grB !== 255)) mask = mask | UiField.Group;
+		if (node.text && v.tScale !== 1000) mask = mask | UiField.TextScale;
 		return mask;
 	}
 
-	/** Every pass: rect, rotation, background, text and its colour / size, image and its colour. Returns changed bits. */
+	/**
+	 * Every pass: rect, rotation, background, text and its colour / size (× UIScale) and UIScale, image and its colour,
+	 * the UIGradient (animated sheens and gauges), a CanvasGroup's group transparency / colour. Returns changed bits.
+	 */
 	private readFast(node: UiNodeState): number {
 		const v = node.v;
 		let mask = 0;
@@ -1194,7 +1219,9 @@ export class ExtRecorder {
 			const tG = quant(color.G, 255);
 			const tB = quant(color.B, 255);
 			const tT = quant(label.TextTransparency, 255);
-			const tSize = math.clamp(math.floor((label.TextScaled ? label.TextBounds.Y : label.TextSize) + 0.5), 0, 255);
+			// Drawn size: TextSize (TextBounds.Y when TextScaled; neither includes UIScale) × the UIScales above. Clamped to
+			// the u8 (255 px); the renderer has textScale for rich text sizes.
+			const tSize = math.clamp(math.floor((label.TextScaled ? label.TextBounds.Y : label.TextSize) * node.scale + 0.5), 0, 255);
 			if (tR !== v.tR || tG !== v.tG || tB !== v.tB || tT !== v.tT || tSize !== v.tSize) {
 				v.tR = tR;
 				v.tG = tG;
@@ -1202,6 +1229,11 @@ export class ExtRecorder {
 				v.tT = tT;
 				v.tSize = tSize;
 				mask = mask | UiField.TextStyle;
+			}
+			const tScale = math.clamp(quant(node.scale, 1000), 0, 65535);
+			if (tScale !== v.tScale) {
+				v.tScale = tScale;
+				mask = mask | UiField.TextScale;
 			}
 		} else if (node.image) {
 			const image = instance as ImageLabel;
@@ -1223,10 +1255,106 @@ export class ExtRecorder {
 				mask = mask | UiField.ImageStyle;
 			}
 		}
+		if (node.gradient || v.gradN !== 0 || v.gaN !== 0 || v.gOffX !== 0 || v.gOffY !== 0) mask = mask | this.readGradient(node, gui);
+		if (node.cls === UiClass.CanvasGroup) {
+			const group = gui as CanvasGroup;
+			const color = group.GroupColor3;
+			const grT = quant(group.GroupTransparency, 255);
+			const grR = quant(color.R, 255);
+			const grG = quant(color.G, 255);
+			const grB = quant(color.B, 255);
+			if (grT !== v.grT || grR !== v.grR || grG !== v.grG || grB !== v.grB) {
+				v.grT = grT;
+				v.grR = grR;
+				v.grG = grG;
+				v.grB = grB;
+				mask = mask | UiField.Group;
+			}
+		}
 		return mask;
 	}
 
-	/** Every SLOW_PASSES-th pass (and for a new node): fonts, alignment, slices, stroke, corner, clip, gradient, ZIndex. */
+	/** The UIGradient: colour keypoints + rotation (bit 13), transparency keypoints + offset (bit 14). Changed bits. */
+	private readGradient(node: UiNodeState, gui: GuiObject): number {
+		const v = node.v;
+		let mask = 0;
+		const gradient = node.gradient;
+		if (gradient && gradient.Parent === gui && gradient.Enabled) {
+			const keypoints = gradient.Color.Keypoints;
+			const n = math.min(keypoints.size(), UI_GRADIENT_KEYS);
+			const rotation = math.floor(gradient.Rotation + 0.5);
+			let changed = n !== v.gradN || rotation !== v.gradRot;
+			const grad = v.grad;
+			for (let index = 0; index < n; index++) {
+				const point = keypoints[index];
+				const t = quant(point.Time, 255);
+				const r = quant(point.Value.R, 255);
+				const g = quant(point.Value.G, 255);
+				const b = quant(point.Value.B, 255);
+				const base = index * 4;
+				if (grad[base] !== t || grad[base + 1] !== r || grad[base + 2] !== g || grad[base + 3] !== b) {
+					changed = true;
+					grad[base] = t;
+					grad[base + 1] = r;
+					grad[base + 2] = g;
+					grad[base + 3] = b;
+				}
+			}
+			if (changed) {
+				v.gradN = n;
+				v.gradRot = rotation;
+				mask = mask | UiField.Gradient;
+			}
+			// Transparency: all keypoints opaque = none (n 0); the offset moves the colour too, so it is sent alone.
+			const alphas = gradient.Transparency.Keypoints;
+			const an = math.min(alphas.size(), UI_GRADIENT_KEYS);
+			let opaque = true;
+			for (let index = 0; index < an; index++) {
+				if (quant(alphas[index].Value, 255) !== 0) {
+					opaque = false;
+					break;
+				}
+			}
+			const gaN = opaque ? 0 : an;
+			const offset = gradient.Offset;
+			const gOffX = math.clamp(quant(offset.X, 1000), -32767, 32767);
+			const gOffY = math.clamp(quant(offset.Y, 1000), -32767, 32767);
+			let alphaChanged = gaN !== v.gaN || gOffX !== v.gOffX || gOffY !== v.gOffY;
+			const ga = v.ga;
+			for (let index = 0; index < gaN; index++) {
+				const point = alphas[index];
+				const t = quant(point.Time, 255);
+				const a = quant(point.Value, 255);
+				const base = index * 2;
+				if (ga[base] !== t || ga[base + 1] !== a) {
+					alphaChanged = true;
+					ga[base] = t;
+					ga[base + 1] = a;
+				}
+			}
+			if (alphaChanged) {
+				v.gaN = gaN;
+				v.gOffX = gOffX;
+				v.gOffY = gOffY;
+				mask = mask | UiField.GradientAlpha;
+			}
+			return mask;
+		}
+		if (v.gradN !== 0) {
+			v.gradN = 0;
+			v.gradRot = 0;
+			mask = mask | UiField.Gradient;
+		}
+		if (v.gaN !== 0 || v.gOffX !== 0 || v.gOffY !== 0) {
+			v.gaN = 0;
+			v.gOffX = 0;
+			v.gOffY = 0;
+			mask = mask | UiField.GradientAlpha;
+		}
+		return mask;
+	}
+
+	/** Every SLOW_PASSES-th pass (and for a new node): fonts, alignment, slices, stroke, corner, clip, ZIndex. */
 	private readSlow(node: UiNodeState): number {
 		if (node.screen) {
 			const order = (node.instance as ScreenGui).DisplayOrder;
@@ -1305,14 +1433,14 @@ export class ExtRecorder {
 			kG = quant(color.G, 255);
 			kB = quant(color.B, 255);
 			kT = quant(stroke.Transparency, 255);
-			kW = math.clamp(quant(stroke.Thickness, 4), 0, 255);
+			kW = math.clamp(quant(stroke.Thickness * node.scale, 4), 0, 255);
 		} else if (gui.BorderSizePixel > 0) {
 			const color = gui.BorderColor3;
 			kR = quant(color.R, 255);
 			kG = quant(color.G, 255);
 			kB = quant(color.B, 255);
 			kT = quant(gui.BackgroundTransparency, 255);
-			kW = math.clamp(gui.BorderSizePixel * 4, 0, 255);
+			kW = math.clamp(quant(gui.BorderSizePixel * node.scale, 4), 0, 255);
 		}
 		if (kR !== v.kR || kG !== v.kG || kB !== v.kB || kT !== v.kT || kW !== v.kW) {
 			v.kR = kR;
@@ -1326,7 +1454,8 @@ export class ExtRecorder {
 		let radius = 0;
 		if (corner && corner.Parent === gui) {
 			const udim = corner.CornerRadius;
-			radius = math.clamp(math.floor(udim.Scale * math.min(v.w, v.h) + udim.Offset + 0.5), 0, 255);
+			// v.w / v.h are AbsoluteSize (UIScale included); the Offset scales too.
+			radius = math.clamp(math.floor(udim.Scale * math.min(v.w, v.h) + udim.Offset * node.scale + 0.5), 0, 255);
 		}
 		if (radius !== v.corner) {
 			v.corner = radius;
@@ -1336,38 +1465,6 @@ export class ExtRecorder {
 		if (clip !== v.clip) {
 			v.clip = clip;
 			mask = mask | UiField.Clip;
-		}
-		const gradient = node.gradient;
-		if (gradient && gradient.Parent === gui && gradient.Enabled) {
-			const keypoints = gradient.Color.Keypoints;
-			const n = math.min(keypoints.size(), 20);
-			const rotation = math.floor(gradient.Rotation + 0.5);
-			let changed = n !== v.gradN || rotation !== v.gradRot;
-			const grad = v.grad;
-			for (let index = 0; index < n; index++) {
-				const point = keypoints[index];
-				const t = quant(point.Time, 255);
-				const r = quant(point.Value.R, 255);
-				const g = quant(point.Value.G, 255);
-				const b = quant(point.Value.B, 255);
-				const base = index * 4;
-				if (grad[base] !== t || grad[base + 1] !== r || grad[base + 2] !== g || grad[base + 3] !== b) {
-					changed = true;
-					grad[base] = t;
-					grad[base + 1] = r;
-					grad[base + 2] = g;
-					grad[base + 3] = b;
-				}
-			}
-			if (changed) {
-				v.gradN = n;
-				v.gradRot = rotation;
-				mask = mask | UiField.Gradient;
-			}
-		} else if (v.gradN !== 0) {
-			v.gradN = 0;
-			v.gradRot = 0;
-			mask = mask | UiField.Gradient;
 		}
 		return mask;
 	}

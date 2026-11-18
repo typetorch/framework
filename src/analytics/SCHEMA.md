@@ -207,7 +207,13 @@ Folders count as children of the nearest GuiObject above. At most 4000 nodes; id
 UI fields (mask bits). A UiNode sends the fields of its class: a ScreenGui `rect` and `order`; every GuiObject
 `rect`, `order`, `background`; text classes `text` and `textStyle`; image classes `image` and `imageStyle`. The rest
 only when not at their default, which a decoder assumes when they are missing: `rotation` 0, `imageRect` all 0,
-`stroke` none, `corner` 0, `clip` 0, `gradient` none. A UiNode never sets bit 11 (its parent is in the header).
+`stroke` none, `corner` 0, `clip` 0, `gradient` none, `gradientAlpha` none (opaque, offset 0), `group` (transparency 0,
+white), `textScale` 1. A UiNode never sets bit 11 (its parent is in the header).
+
+Fields come in bit order and newer fields only ever take higher bits, so a decoder reads the bits it knows and skips the
+rest of the record by its `length` (a newer recorder's trailing fields). Bits 14 and 15 came with framework 0.7.3; the
+backend's decoder from before them stops at bit 13 (the framework's own test-only reference decoder before 0.7.3
+refused a record with bytes left over). The u16 mask is now full: later fields go into the second mask (bit 15).
 
 | Bit | Field | Bytes |
 |---|---|---|
@@ -216,20 +222,23 @@ only when not at their default, which a decoder assumes when they are missing: `
 | 2 | order | `u16` draw order: a rank in the recorder's depth-first draw order over all recorded nodes (ScreenGuis by DisplayOrder, children by ZIndex then child order under ZIndexBehavior Sibling; under Global the ScreenGui's GuiObjects by ZIndex then tree order). Compare ranks only: they have gaps (hidden nodes keep theirs). A ScreenGui: its DisplayOrder |
 | 3 | background | `u8 r, g, b, u8 transparency × 255` |
 | 4 | text | `u16` string id (Text as set; RichText markup kept) |
-| 5 | textStyle | `u8 r, g, b, u8 transparency × 255, u8 size` (TextSize; TextBounds.Y when TextScaled), `u16 family` string id (FontFace.Family), `u16 weight` (FontFace.Weight value), `u8 xAlign` (0 left, 1 centre, 2 right), `u8 yAlign` (0 top, 1 centre, 2 bottom), `u8 flags` (bit 0 scaled, bit 1 wrapped, bit 2 rich text), `u8 stroke transparency × 255` (TextStrokeTransparency), `u8 stroke r, g, b` |
+| 5 | textStyle | `u8 r, g, b, u8 transparency × 255, u8 size` (the drawn size: TextSize, TextBounds.Y when TextScaled, × the product of every UIScale on the node and its GuiObject ancestors, rounded, clamped to 255; before 0.7.3 without the UIScales), `u16 family` string id (FontFace.Family), `u16 weight` (FontFace.Weight value), `u8 xAlign` (0 left, 1 centre, 2 right), `u8 yAlign` (0 top, 1 centre, 2 bottom), `u8 flags` (bit 0 scaled, bit 1 wrapped, bit 2 rich text), `u8 stroke transparency × 255` (TextStrokeTransparency), `u8 stroke r, g, b` |
 | 6 | image | `u16` string id (Image as set, e.g. `rbxassetid://123`) |
 | 7 | imageStyle | `u8 r, g, b` (ImageColor3), `u8 transparency × 255`, `u8 scaleType` (Enum.ScaleType value) |
 | 8 | imageRect | `u16 offset x, y, size x, y`, `u16 slice x0, y0, x1, y1` (SliceCenter; all 0 = none) |
-| 9 | stroke | the border: `u8 r, g, b, u8 transparency × 255, u8 thickness × 4`. A UIStroke (enabled; on a text object only with ApplyStrokeMode Border), else the classic border when BorderSizePixel > 0 (BorderColor3, BackgroundTransparency, BorderSizePixel). Thickness 0 = none |
-| 10 | corner | `u8` UICorner radius in px (Scale × min(w, h) + Offset) |
+| 9 | stroke | the border: `u8 r, g, b, u8 transparency × 255, u8 thickness × 4`. A UIStroke (enabled; on a text object only with ApplyStrokeMode Border), else the classic border when BorderSizePixel > 0 (BorderColor3, BackgroundTransparency, BorderSizePixel). Thickness 0 = none. × the UIScales above (0.7.3) |
+| 10 | corner | `u8` UICorner radius in px (Scale × min(w, h) + Offset; the Offset × the UIScales above from 0.7.3) |
 | 11 | parent | `u16` (UiProps only: reparented) |
 | 12 | clip | `u8` ClipsDescendants (ScrollingFrame / CanvasGroup always clip) |
-| 13 | gradient | UIGradient (enabled): `u8 n` keypoints (at most 20) × (`u8 time × 255, u8 r, g, b`), `i16 rotation` (whole degrees). n 0 = none (drawn as a CSS gradient) |
+| 13 | gradient | UIGradient (enabled): `u8 n` keypoints (at most 20) × (`u8 time × 255, u8 r, g, b`), `i16 rotation` (whole degrees). n 0 = none (drawn as a CSS gradient). Colour only: transparency and offset are bit 14 |
+| 14 | gradientAlpha | (0.7.3) the same UIGradient's `u8 n` Transparency keypoints (at most 20) × (`u8 time × 255, u8 transparency × 255`), `i16 offset x × 1000, i16 offset y × 1000` (Offset). n 0 = opaque (every keypoint 0); sent when n > 0 or the offset isn't 0, and as n 0, offset 0 when the gradient goes. A renderer merges both keypoint sets onto one stop list (each interpolated linearly at the other's times), multiplies the alpha with the object's own transparency, and shifts the stops by the offset projected on the gradient's direction |
+| 15 | more | (0.7.3) `u16` second mask, then its fields in bit order. Bit 0 `group`: a CanvasGroup's `u8 GroupTransparency × 255, u8 GroupColor3 r, g, b` (multiplies into the group and every descendant). Bit 1 `textScale`: `u16` × 1000, the product of the UIScales on a text node and its GuiObject ancestors (text nodes only, when not 1: for rich text `<font size>` and the text stroke). Higher bits: skipped by the record's length |
 
 How the UI is read (the cost): structure from one DescendantAdded / DescendantRemoving pair per ScreenGui (no
 per-instance Changed connections); properties polled at `hz` and diffed, time-sliced to `uiBudgetMs` per frame (0.6 of
-it on phones and tablets); rect, rotation, background, text, text colour and size, image and image colour every pass,
-the rest (fonts, alignment, flags, text stroke, scale type, slices, stroke, corner, clip, gradient, ZIndex) every 4th
+it on phones and tablets); rect, rotation, background, text, text colour and size, the UIScales, image and image colour,
+the UIGradient (colour, transparency, offset, rotation: sheens and gauges animate) and a CanvasGroup's group every pass,
+the rest (fonts, alignment, flags, text stroke, scale type, slices, stroke, corner, clip, ZIndex) every 4th
 pass per node, so such a change can show up ~1 s late. Under 30 fps the UI passes halve, under 20 they pause.
 
 Who and when: sessions recorded by tt-rec-1 whose player is eligible (total playtime under `maxPlaytime` at the join:

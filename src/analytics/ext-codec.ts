@@ -57,7 +57,20 @@ export const enum UiField {
 	Parent = 2048,
 	Clip = 4096,
 	Gradient = 8192,
+	/** UIGradient Transparency keypoints + Offset (0.7.3). */
+	GradientAlpha = 16384,
+	/** Wire only: a `u16` second mask follows (its bits are UiField values ÷ 65536: Group, TextScale). */
+	More = 32768,
+	/** CanvasGroup GroupTransparency + GroupColor3 (second mask bit 0, 0.7.3). */
+	Group = 65536,
+	/** Cumulative UIScale on a text node (second mask bit 1, 0.7.3). */
+	TextScale = 131072,
 }
+
+/** The fields carried by the second mask (UiField.More). */
+export const UI_FIELDS_MORE = UiField.Group | UiField.TextScale;
+/** UIGradient keypoints recorded at most (colour and transparency each). */
+export const UI_GRADIENT_KEYS = 20;
 
 /** UI classes (UiNode `class`). */
 export const enum UiClass {
@@ -151,6 +164,19 @@ export interface UiValues {
 	gradN: number;
 	/** Rotation in whole degrees. */
 	gradRot: number;
+	/** Transparency keypoints: 2 numbers each (time × 255, transparency × 255); gaN of them (0 = all opaque). */
+	ga: number[];
+	gaN: number;
+	/** UIGradient.Offset × 1000. */
+	gOffX: number;
+	gOffY: number;
+	/** CanvasGroup GroupTransparency × 255 and GroupColor3 (defaults 0 and white). */
+	grT: number;
+	grR: number;
+	grG: number;
+	grB: number;
+	/** The product of every UIScale on the node and its GuiObject ancestors × 1000 (text nodes; default 1000). */
+	tScale: number;
 }
 
 /** A UiValues with every field at its default (rotation 0, no stroke, corner or gradient). */
@@ -206,6 +232,15 @@ export function newUiValues(): UiValues {
 		grad: [],
 		gradN: 0,
 		gradRot: 0,
+		ga: [],
+		gaN: 0,
+		gOffX: 0,
+		gOffY: 0,
+		grT: 0,
+		grR: 255,
+		grG: 255,
+		grB: 255,
+		tScale: 1000,
 	};
 }
 
@@ -357,6 +392,11 @@ export function unpackQuat(packed: number): LuaTuple<[number, number, number, nu
 	return $tuple(a, b, c, d);
 }
 
+/** The u16 mask on the wire for an internal mask (bit 15 set when any second-mask field is in it). */
+export function uiWireMask(mask: number): number {
+	return (mask % UiField.More) + ((mask & UI_FIELDS_MORE) !== 0 ? UiField.More : 0);
+}
+
 /** Payload bytes of the UI fields in `mask` for these values. */
 export function uiFieldsSize(mask: number, v: UiValues): number {
 	let size = 0;
@@ -374,6 +414,12 @@ export function uiFieldsSize(mask: number, v: UiValues): number {
 	if ((mask & UiField.Parent) !== 0) size += 2;
 	if ((mask & UiField.Clip) !== 0) size += 1;
 	if ((mask & UiField.Gradient) !== 0) size += 3 + v.gradN * 4;
+	if ((mask & UiField.GradientAlpha) !== 0) size += 5 + v.gaN * 2;
+	if ((mask & UI_FIELDS_MORE) !== 0) {
+		size += 2;
+		if ((mask & UiField.Group) !== 0) size += 4;
+		if ((mask & UiField.TextScale) !== 0) size += 2;
+	}
 	return size;
 }
 
@@ -697,6 +743,23 @@ export class ExtWriter {
 			for (let index = 0; index < v.gradN * 4; index++) this.u8(grad[index]);
 			this.i16(v.gradRot);
 		}
+		if ((mask & UiField.GradientAlpha) !== 0) {
+			this.u8(v.gaN);
+			const ga = v.ga;
+			for (let index = 0; index < v.gaN * 2; index++) this.u8(ga[index]);
+			this.i16(v.gOffX);
+			this.i16(v.gOffY);
+		}
+		if ((mask & UI_FIELDS_MORE) !== 0) {
+			this.u16(math.floor(mask / 65536));
+			if ((mask & UiField.Group) !== 0) {
+				this.u8(v.grT);
+				this.u8(v.grR);
+				this.u8(v.grG);
+				this.u8(v.grB);
+			}
+			if ((mask & UiField.TextScale) !== 0) this.u16(v.tScale);
+		}
 	}
 
 	private uiStrings(atMs: number, mask: number, v: UiValues): LuaTuple<[number, number, number]> {
@@ -714,7 +777,7 @@ export class ExtWriter {
 		this.u16(id);
 		this.u16(parent);
 		this.u8(cls);
-		this.u16(fields);
+		this.u16(uiWireMask(fields));
 		this.uiFields(fields, v, textId, familyId, imageId);
 	}
 
@@ -722,7 +785,7 @@ export class ExtWriter {
 		const [textId, familyId, imageId] = this.uiStrings(atMs, mask, v);
 		this.begin(ExtTag.UiProps, atMs, 4 + uiFieldsSize(mask, v));
 		this.u16(id);
-		this.u16(mask);
+		this.u16(uiWireMask(mask));
 		this.uiFields(mask, v, textId, familyId, imageId);
 	}
 
@@ -775,6 +838,10 @@ function unwrapYaw(byte: number): number {
 	return (byte / 256) * TAU - math.pi;
 }
 
+/**
+ * Reads the UI fields of a wire `mask`. Returns where they end, or -1 when the mask names fields this decoder doesn't
+ * know (a newer recorder's trailing bits): the caller skips the rest of the record by its length.
+ */
 function readUiFields(data: buffer, start: number, mask: number, strings: Map<number, string>, out: Record<string, unknown>): number {
 	let at = start;
 	const r8 = () => {
@@ -827,6 +894,21 @@ function readUiFields(data: buffer, start: number, mask: number, strings: Map<nu
 		for (let index = 0; index < n; index++) keys.push([r8() / 255, r8(), r8(), r8()]);
 		out.gradient = keys;
 		out.gradientRotation = ri16();
+	}
+	if ((mask & UiField.GradientAlpha) !== 0) {
+		const n = r8();
+		const keys = new Array<number[]>();
+		for (let index = 0; index < n; index++) keys.push([r8() / 255, r8() / 255]);
+		out.gradientAlpha = keys;
+		out.gradientOffset = [ri16() / 1000, ri16() / 1000];
+	}
+	if ((mask & UiField.More) !== 0) {
+		const more = r16();
+		out.more = more;
+		if ((more & 1) !== 0) out.group = [r8(), r8(), r8(), r8()];
+		if ((more & 2) !== 0) out.textScale = r16() / 1000;
+		// Second-mask bits this decoder doesn't know: newer fields at the end, skipped by the record's length.
+		if (more >= 4) return -1;
 	}
 	return at;
 }
@@ -981,11 +1063,13 @@ export function decodeExtChunk(data: buffer, state: ExtDecodeState = newExtDecod
 			const mask = r16();
 			record.mask = mask;
 			p = readUiFields(data, p, mask, strings, record);
+			if (p < 0) p = finish;
 		} else if (tag === ExtTag.UiProps) {
 			record.id = r16();
 			const mask = r16();
 			record.mask = mask;
 			p = readUiFields(data, p, mask, strings, record);
+			if (p < 0) p = finish;
 		} else if (tag === ExtTag.UiGone) {
 			record.id = r16();
 		} else {
