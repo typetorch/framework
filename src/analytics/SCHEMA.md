@@ -238,8 +238,10 @@ of the built-in experiment `tt_extended_recording` (variants `["off", "on"]`, se
 `on`. Both arms are stamped in `exp`, so `off` is the control. No `tt_extended_recording` in `experiments`: nobody.
 The extended recording runs from the hello until `extended.seconds` after the first input (its tt-rec-1 stream runs as
 long), and ends with tt-rec-1 (`why` as tt-rec-1's) or at 2 MB / 200 chunks (`cap`). AFK (no key, click, tap, gamepad
-button or stick for `afkSeconds` and the character not moving over 0.5 studs, or the game's `replay.setAfk`): one Afk
-record and nothing else until the player is back; a session AFK from the start writes nothing until then.
+button or stick for `afkSeconds` and the character not moving over 0.5 studs, or the game's `replay.setAfk` turning on):
+one Afk record and nothing else until the player is back. The game's flag pauses only until the player's next key,
+click, tap, gamepad button or stick input after it turned on (a flag left on while the player plays doesn't stop the
+recording); setting it again pauses again. A session AFK from the start writes nothing until then.
 
 ## Sink settings
 
@@ -354,8 +356,9 @@ DataStore `TypeTorchAnalytics`, key `p/<UserId>` -> `{ "pid": "<32 hex>", "first
 <s> }`. One read per join (with retries), a write on the first join (UpdateAsync, keeps a pid another server wrote
 first) and one at leave (`last`, and the session's seconds added to `play` in the same UpdateAsync). `play` (framework
 0.7.2) is the total playtime: a new record starts at 0; a record from an older framework has none and gets none
-(unknown, never guessed). A Right to Erasure request deletes the key, which leaves the player's rows anonymous. The
-analytics server also keeps pid -> UserId from identity rows (above), which its erasure webhook uses and deletes.
+(unknown, never guessed). A Right to Erasure request deletes the key, which removes this pid <-> UserId link; rows left
+behind are unlinked, not anonymous (an extended recording still shows any names that were on screen). The analytics
+server also keeps pid -> UserId from identity rows (above), which its erasure webhook uses and deletes.
 
 ## Suggested Basin stream schemas
 

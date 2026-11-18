@@ -8,7 +8,7 @@ import { generationScope } from "../typetorch";
  *
  *   replay.track(boss, "boss");                 // one model (or part); returns a cleanup
  *   replay.trackChildren(workspace.Mobs, "zombie"); // every Model with a Humanoid / Animator added under it
- *   replay.setAfk(player, true);                // server: the game's own AFK flag (extended streams pause)
+ *   replay.setAfk(player, true);                // server: the game's own AFK flag (extended streams pause until the next input)
  *   replay.active();                            // client: whether the extended streams record me now
  *
  * Client tracks are the client's own (client-drawn mobs). Server tracks reach every client through the framework's own
@@ -23,7 +23,10 @@ export interface ReplayApi {
 	track(instance: Instance, kind: string): () => void;
 	/** Follow every Model with a Humanoid, Animator or AnimationController under `container`, until it leaves. */
 	trackChildren(container: Instance, kind: string): () => void;
-	/** Server (or the client for its own player): the game's AFK flag; extended streams pause while it is set. */
+	/**
+	 * Server (or the client for its own player): the game's AFK flag. Turning it on pauses the extended streams until the
+	 * player's next input (a flag left on while they play doesn't stop the recording); turning it on again pauses again.
+	 */
 	setAfk(player: Player, afk: boolean): void;
 	/** Client: the extended streams record this player now (dry runs included). The server: always false. */
 	active(): boolean;
