@@ -34,6 +34,7 @@ import {
 } from "./build-actions";
 import type { ClientDispatcher, LeafStats } from "../net/runtime";
 import { DEV_GUI_GENERATION, DEV_GUI_NAME, sweepStaleMenus } from "../runtime/dev-gui";
+import { FRAMEWORK_VERSION } from "../version";
 import { runningModules } from "../runtime/registry";
 import { bump, popIn, popOut } from "../ui";
 import { ExplorerPersist, mountExplorer } from "./explorer";
@@ -840,6 +841,7 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 		page.field("Branch", str(kernel.branch));
 		page.field("Channel", channelText(kernel));
 		page.field("Kernel", `${kernel.kernelVersion} (API ${kernel.kernelApi})`);
+		page.field("Framework", FRAMEWORK_VERSION);
 		/** The server's times as of the status reply (os.clock() then); the loop below adds the time since. */
 		let serverTimes: { at: number; generation?: number; server?: number; builtAt?: number; running: TextBox; up: TextBox; built: TextBox } | undefined;
 		/** "2026-10-05 17:51:37 UTC (8m ago)". */
@@ -977,6 +979,8 @@ export function startDevtoolsClient(kernel: ClientKernel, dispatcher: ClientDisp
 			// Kernel 0.3.8: TypeTorch.runDetached jobs ("2 running (oldest 4 s), 1 failed").
 			if (status.detached !== undefined) body.field("Detached jobs", detachedText(status.detached), status.detached.failed > 0 ? COLORS.warn : COLORS.text);
 			body.field("Kernel", `${status.kernelVersion}${status.kernelBuild !== undefined ? `@${status.kernelBuild}` : ""} (API ${status.kernelApi})`);
+			// Framework 0.7.4: the server's framework ("-" before 0.7.4).
+			body.field("Framework", (reply as StatusReply).facts?.framework ?? "-");
 			if (status.registryError !== undefined) body.field("Registry error", status.registryError, COLORS.bad);
 
 			body.section("Last deploy message");

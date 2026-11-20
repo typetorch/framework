@@ -6,6 +6,7 @@ import { countBudget } from "../budget";
 import { normalRole } from "../kernel";
 import type { ServerDispatcher } from "../net/runtime";
 import { runningModules } from "../runtime/registry";
+import { FRAMEWORK_VERSION } from "../version";
 import { DevAccess } from "./access";
 import { registerRemoteClaude } from "./claude";
 import { registerExplorerOps } from "./explorer-server";
@@ -58,7 +59,7 @@ function serverFacts(kernel: ServerKernel): ServerFacts {
 	if (loadstringWorks === undefined) {
 		loadstringWorks = loadstringAvailable();
 	}
-	return { loadstring: loadstringWorks, http: HttpService.HttpEnabled, experiments: kernelHasExperiments(kernel), assets: assetFacts(), analytics: analyticsStatus() };
+	return { loadstring: loadstringWorks, http: HttpService.HttpEnabled, experiments: kernelHasExperiments(kernel), assets: assetFacts(), analytics: analyticsStatus(), framework: FRAMEWORK_VERSION };
 }
 
 const LOG_KINDS = new Set(["output", "info", "warning", "error"]);

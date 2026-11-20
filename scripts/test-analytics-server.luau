@@ -373,8 +373,8 @@ function TS.import(_, parent, ...)
 	end
 	if parent == outFolder then
 		-- The real launch-token code (pure) for the join row's verdict.
-		if internals[path] == nil and (path == "notifications/token" or path == "util/sha256") then
-			local folder = { Name = path:match("^[^/]+"), Parent = outFolder }
+		if internals[path] == nil and (path == "notifications/token" or path == "util/sha256" or path == "version") then
+			local folder = if path:find("/") then { Name = path:match("^[^/]+"), Parent = outFolder } else outFolder
 			local script = { Name = path:match("[^/]+$"), Parent = folder }
 			G[script] = TS
 			internals[path] = luau.load(fs.readFile(base .. path .. ".luau"), {
@@ -1094,6 +1094,9 @@ do
 	check("ext: one tt-ext-1 row", #rows == 1 and rows[1].pid == onPid and rows[1].chunk == 0 and rows[1].n == 2, #rows)
 	check("ext: the row decodes", rows[1] and #X.decodeExtChunk(C.fromBase64(rows[1].data)).records == 2)
 	check("ext: ext_start row", #rowsNamed(store().events.rows, "recording_meta", "ext_start") == 1)
+	local starts = rowsNamed(store().events.rows, "recording_meta", "ext_start")
+	local fw = starts[1] and serde.decode("json", starts[1].props).fw
+	check("ext: ext_start names the framework version (0.7.4, fw)", type(fw) == "string" and fw:match("^%d+%.%d+%.%d+") ~= nil, fw)
 	task.wait(0.3)
 	raw["__tt/an"](on, "xrec", 1, 500, 0, X.ExtWriter.new():take(true), true, "window")
 	local ends = rowsNamed(store().events.rows, "recording_meta", "ext_end")

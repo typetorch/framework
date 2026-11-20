@@ -1,5 +1,6 @@
 import type { Trove } from "@rbxts/trove";
 import type { DebugDeclarations, RemoteDebugCaller, ServerKernel } from "./kernel";
+import { FRAMEWORK_VERSION } from "./version";
 
 /**
  * Framework 0.7.1 (plans/34): LIVE DEBUG, the game's half. A game declares, for the backend explorer's server page and
@@ -22,7 +23,11 @@ import type { DebugDeclarations, RemoteDebugCaller, ServerKernel } from "./kerne
  *   game state stored with the server row: NEVER put player names, UserIds or other personal data in a column.
  * - Getters and samplers run on kernel threads under pcall with a short deadline: keep them cheap and don't yield.
  *
- * Names: `^[a-z][a-z0-9_]{0,31}$`; at most 16 columns, 32 commands and 8 streams; labels at most 40 characters,
+ * Framework 0.7.4: every server also declares the built-in column `tt_framework` ("Framework", this framework's version),
+ * first, so the Fleet page shows which framework each server runs. It takes one of the kernel's 16 column slots: a game
+ * declares at most 15, and names starting with `tt_` are reserved.
+ *
+ * Names: `^[a-z][a-z0-9_]{0,31}$`; at most 15 game columns, 32 commands and 8 streams; labels at most 40 characters,
  * descriptions 200. A bad name or option, a duplicate or one past a limit throws at once. Each call returns a function
  * that removes the entry (for a trove). Server only (a client throws). Needs kernel 0.5.7 (`api:debugDeclare`); on older
  * kernels and in edit mode everything is accepted and checked, and nothing reaches the backend.
@@ -30,7 +35,12 @@ import type { DebugDeclarations, RemoteDebugCaller, ServerKernel } from "./kerne
 
 /** The first kernel with `api:debugDeclare`. */
 export const LIVE_DEBUG_KERNEL = "0.5.7";
-export const LIVE_DEBUG_LIMITS = { columns: 16, commands: 32, streams: 8, label: 40, description: 200, hzMin: 0.2, hzMax: 4 };
+/** Framework 0.7.4: the built-in Fleet column with this framework's version (declared first, before the game's). */
+export const FRAMEWORK_COLUMN = "tt_framework";
+/** Column names a game can't use (the framework's own). */
+export const RESERVED_COLUMN_PREFIX = "tt_";
+/** `columns` counts the game's; the kernel's limit is one more (the built-in column). */
+export const LIVE_DEBUG_LIMITS = { columns: 15, commands: 32, streams: 8, label: 40, description: 200, hzMin: 0.2, hzMax: 4 };
 
 export interface DebugCommandOptions {
 	/** The button's text (at most 40 characters; default: the name). */
@@ -138,10 +148,13 @@ function remove<T>(map: Map<string, T>, list: string[], name: string, entry: T) 
 /** The kernel's view of the current declarations. */
 export function debugDeclarations(): DebugDeclarations {
 	return {
-		columns: order.columns.map((name) => {
-			const column = columns.get(name)!;
-			return { name, label: column.label, type: column.type };
-		}),
+		columns: [
+			{ name: FRAMEWORK_COLUMN, label: "Framework", type: "string" as const },
+			...order.columns.map((name) => {
+				const column = columns.get(name)!;
+				return { name, label: column.label, type: column.type };
+			}),
+		],
 		commands: order.commands.map((name) => {
 			const command = commands.get(name)!;
 			return { name, label: command.label, description: command.description };
@@ -224,6 +237,7 @@ export const fleet: FleetApi = {
 		const what = "fleet.column";
 		checkServer(what);
 		checkName(what, name);
+		if (name.sub(1, RESERVED_COLUMN_PREFIX.size()) === RESERVED_COLUMN_PREFIX) error(`${what}: names starting with ${RESERVED_COLUMN_PREFIX} are reserved (got ${name})`, 2);
 		if (!typeIs(getter, "function")) error(`${what}: pass a getter function`, 2);
 		if (options !== undefined && !typeIs(options, "table")) error(`${what}: options must be a table`, 2);
 		const label = checkText(what, "label", options?.label, LIVE_DEBUG_LIMITS.label);
@@ -265,6 +279,7 @@ export function bindLiveDebug(realm: "server" | "client", kernel: unknown, _trov
 	}
 	if (typeIs(methods.onDebugColumn, "function")) {
 		api.onDebugColumn!((name) => {
+			if (name === FRAMEWORK_COLUMN) return FRAMEWORK_VERSION;
 			const column = columns.get(name);
 			return column ? column.getter() : undefined;
 		});

@@ -71,6 +71,8 @@ export interface ServerFacts {
 	 * "owner_switch_only", "owners_only"). Absent from older frameworks (go by the rules).
 	 */
 	access?: string;
+	/** Framework 0.7.4: the server's framework version (FRAMEWORK_VERSION). Absent from older frameworks. */
+	framework?: string;
 }
 
 /** "0.2.0" < "0.2.1"; missing parts count as 0, non-numbers as 0. */

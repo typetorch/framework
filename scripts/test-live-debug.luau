@@ -31,7 +31,20 @@ local function settle()
 	end
 end
 
-local env = setmetatable({ task = task, script = {} }, { __index = _G })
+-- 0.7.4: live-debug imports version.luau (FRAMEWORK_VERSION, the built-in column) through roblox-ts's TS.import.
+local VERSION = luau.load(fs.readFile(`{root}out/version.luau`), { debugName = "version" })()
+local liveScript = { Name = "live-debug", Parent = {} }
+local env = setmetatable({
+	task = task,
+	script = liveScript,
+	_G = { [liveScript] = {
+		import = function(_, _, ...)
+			local names = { ... }
+			assert(names[#names] == "version", "unexpected import " .. tostring(names[#names]))
+			return VERSION
+		end,
+	} },
+}, { __index = _G })
 local L = luau.load(fs.readFile(`{root}out/live-debug.luau`), { debugName = "live-debug", environment = env })()
 local remoteDebug, fleet = L.remoteDebug, L.fleet
 
@@ -79,12 +92,15 @@ end, "type must be"))
 -- Limits and duplicates
 do
 	local removers = {}
-	for index = 1, 16 do
+	for index = 1, 15 do
 		table.insert(removers, fleet:column(`c{index}`, function() end))
 	end
-	check("limit: a 17th column throws", throws(function()
-		fleet:column("c17", function() end)
-	end, "at most 16 columns"))
+	check("limit: a 16th game column throws (the built-in tt_framework takes the kernel's 16th slot)", throws(function()
+		fleet:column("c16", function() end)
+	end, "at most 15 columns"))
+	check("reserved: a tt_ column throws", throws(function()
+		fleet:column("tt_framework", function() end)
+	end, "reserved"))
 	check("duplicate: throws", throws(function()
 		fleet:column("c1", function() end)
 	end, "already registered"))
@@ -162,7 +178,8 @@ fleet:column("current_map", function()
 	return mapName
 end, { label = "Map", type = "string" })
 L.bindLiveDebug("server", kernel)
-check("bind: handlers installed and the early registration declared at once", typeof(kernel.command) == "function" and typeof(kernel.column) == "function" and typeof(kernel.stream) == "function" and #kernel.declared == 1 and kernel.declared[1].columns[1].name == "current_map")
+check("bind: handlers installed and the early registration declared at once", typeof(kernel.command) == "function" and typeof(kernel.column) == "function" and typeof(kernel.stream) == "function" and #kernel.declared == 1 and kernel.declared[1].columns[2].name == "current_map")
+check("bind: the built-in tt_framework column is declared first", kernel.declared[1].columns[1].name == "tt_framework" and kernel.declared[1].columns[1].label == "Framework" and kernel.declared[1].columns[1].type == "string")
 check("supported on 0.5.7", remoteDebug:supported() == true)
 
 local calls = {}
@@ -183,7 +200,7 @@ check("registrations in one frame are declared once, deferred", #kernel.declared
 settle()
 check("...then one declaration", #kernel.declared == 2, #kernel.declared)
 local decl = kernel.declared[2]
-check("declaration: columns in order with label and type", #decl.columns == 2 and decl.columns[1].name == "current_map" and decl.columns[1].label == "Map" and decl.columns[1].type == "string" and decl.columns[2].name == "in_round" and decl.columns[2].type == "bool")
+check("declaration: columns in order with label and type", #decl.columns == 3 and decl.columns[2].name == "current_map" and decl.columns[2].label == "Map" and decl.columns[2].type == "string" and decl.columns[3].name == "in_round" and decl.columns[3].type == "bool")
 check("declaration: commands with label and description", #decl.commands == 1 and decl.commands[1].name == "round_state" and decl.commands[1].label == "Round" and decl.commands[1].description == "The current round")
 check("declaration: streams with hz, kind (json by default) and label", #decl.streams == 2 and decl.streams[1].hz == 2 and decl.streams[1].kind == "points" and decl.streams[1].label == "Loot" and decl.streams[2].kind == "json")
 
@@ -196,6 +213,7 @@ check("command handler: an unknown name throws", throws(function()
 	kernel.command("nope", {}, caller)
 end, "unknown command"))
 check("column handler: the getter's value", kernel.column("current_map") == "Lobby" and kernel.column("in_round") == true and kernel.column("nope") == nil)
+check("column handler: tt_framework is this framework's version", kernel.column("tt_framework") == VERSION.FRAMEWORK_VERSION and #VERSION.FRAMEWORK_VERSION > 0)
 mapName = "HedgeMaze"
 check("column handler: read live", kernel.column("current_map") == "HedgeMaze")
 check("stream handler: the sampler's value", kernel.stream("loot").points[1].x == 1 and kernel.stream("state").phase == "intermission" and kernel.stream("nope") == nil)
@@ -208,7 +226,7 @@ fleet:column("score", function()
 	return 5
 end)
 fleet:columnsChanged()
-check("columnsChanged: pending declarations go first", #kernel.declared == before + 1 and kernel.changed == 2 and #kernel.declared[#kernel.declared].columns == 3)
+check("columnsChanged: pending declarations go first", #kernel.declared == before + 1 and kernel.changed == 2 and #kernel.declared[#kernel.declared].columns == 4)
 settle()
 check("...and not twice", #kernel.declared == before + 1)
 

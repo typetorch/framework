@@ -81,6 +81,7 @@ import {
 } from "./settings";
 import { registerAnalyticsStatus } from "./status";
 import { buildRequests, estimateEventBytes, estimateRecordingBytes, type SinkRequest } from "./sinks";
+import { FRAMEWORK_VERSION } from "../version";
 
 /**
  * The server half of the analytics engine (plans/16): player ids, sessions, the automatic collectors (joins, tech
@@ -1490,7 +1491,7 @@ export class ServerAnalytics {
 		const t = nowMs() - age - math.floor(math.clamp(player.GetNetworkPing(), 0, 2) * 500);
 		if (!ext.started) {
 			ext.started = true;
-			this.emit(session, "recording_meta", "ext_start", encodeProps({ secs: settings.extended.seconds }), "server", t);
+			this.emit(session, "recording_meta", "ext_start", encodeProps({ secs: settings.extended.seconds, fw: FRAMEWORK_VERSION }), "server", t);
 		}
 		ext.chunk = chunk + 1;
 		ext.bytes += size;

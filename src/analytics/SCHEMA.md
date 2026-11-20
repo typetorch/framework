@@ -80,7 +80,7 @@ one codec filter on `codec`.
 | state | `screen` | `to`, `from` (`""` = none). Client: ScreenGuis in PlayerGui (Enabled), GuiObjects tagged `TTScreen` (Visible), `screen()` |
 | experiment | `<experiment>` | `variant`, `variants` (count), `vi` (the variant's 1-based position in the game's list; 0.7.1+), `forced?` (the settings or the player's own dev pick chose it). Once per session when assigned or changed, and again when the same variant becomes or stops being forced. At most 32 experiments per session: a 33rd `experiment()` returns the control (the first variant) and warns. A client's experiment calls count against its event budget (below) |
 | recording_meta | `start` | `share` (the recorded share then), `secs?` (the window then: `recordSeconds`, or `extended.seconds` for an extended session; frameworks before it leave it out and used 60) |
-| recording_meta | `ext_start` | plans/36, the first tt-ext-1 chunk arrived: `secs` (`extended.seconds`) |
+| recording_meta | `ext_start` | plans/36, the first tt-ext-1 chunk arrived: `secs` (`extended.seconds`), `fw` (the framework version, 0.7.4+) |
 | recording_meta | `ext_end` | `chunks`, `bytes`, `why`: as `end`'s (`window`, `left`, `cap` = 2 MB or 200 chunks, `end`) |
 | recording_meta | `end` | `chunks`, `bytes`, `why`: `window` (`recordSeconds`, default 60 s, after the first input), `cap` (10 min, or the recording's 256 KB / 80 chunks), `left`, `end` |
 | fleet | `heartbeat` | The kernel's `fleetStatus()` (kernel 0.3.2+), every 60 ± 10 s and once at each generation start. pid `""` |

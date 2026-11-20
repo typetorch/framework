@@ -426,7 +426,9 @@ TypeTorch.runDetached(() => store.StartSessionAsync(`Player_${userId}`)).then((p
     second while the page is open; a sample at most 16 KB of JSON (bigger is dropped).
   - Getters and samplers run on kernel threads under pcall with a short deadline (a column that throws, yields or
     returns anything else is empty): keep them cheap, don't yield.
-  - Names `^[a-z][a-z0-9_]{0,31}$`; at most 16 columns, 32 commands and 8 streams; labels at most 40 characters,
+  - Framework 0.7.4: every server also has the built-in column `tt_framework` (**Framework**, its TypeTorch framework
+    version, shown on the Fleet page by default). It takes one of the kernel's 16 slots, and `tt_` names are reserved.
+  - Names `^[a-z][a-z0-9_]{0,31}$`; at most 15 columns, 32 commands and 8 streams; labels at most 40 characters,
     descriptions 200. A bad name or option, a duplicate or one past a limit throws at once; each call returns a
     function that removes the entry (give it to a trove). Registrations in one frame reach the kernel as one
     declaration; ones made before the generation is bound (module top level) are sent when it is.
